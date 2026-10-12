@@ -156,6 +156,15 @@ NPM_LATEST=$(curl -fsSL --connect-timeout 5 --max-time 10 https://registry.npmjs
 PINNED_VER=$(grep -oE "@cortexkit/opencode-magic-context@[0-9]+\.[0-9]+\.[0-9]+" "$PKG_JSON" 2>/dev/null | cut -d'@' -f3 || true)
 ```
 
+### Tier 2 Check (`ck-mc` build vs checkout)
+
+The npm pin alone cannot see a stale daemon. After the Tier 1 check, the probe runs `ck-mc --version`, extracts the 40-character build SHA, and compares it to `git rev-parse HEAD` of the magic-context checkout. A mismatch prints `ck-mc: DRIFT_DETECTED (installed build: <sha9>, checkout HEAD: <sha9>)` and contributes to exit code `1`. The check prints `ck-mc: SKIPPED (...)` (never a failure) when the binary, the checkout, or the SHA is unavailable.
+
+| Env var | Default |
+|---|---|
+| `CK_MC_BIN` | `~/.local/share/cortexkit/bin/ck-mc` |
+| `MC_REPO` | sibling `../magic-context` checkout of this repo |
+
 ### Exit Codes and Semantics
 
 The script follows strict exit status semantics:
@@ -163,7 +172,7 @@ The script follows strict exit status semantics:
 | Exit Code | Status Token | Meaning |
 |---|---|---|
 | **`0`** | `UP_TO_DATE` | The local workstation configuration matches the latest published upstream release. No action required. |
-| **`1`** | `DRIFT_DETECTED` | The local pin differs from upstream latest. A newer release is available, and the cascade must run. |
+| **`1`** | `DRIFT_DETECTED` | The local plugin pin differs from upstream latest, or the installed `ck-mc` build SHA differs from the checkout HEAD. The cascade must run. |
 | **`2`** | `REFUSED` | The probe encountered a network failure, request timeout, or empty registry response. It refuses to guess. |
 
 ### The Fail-Loud Property
