@@ -2,16 +2,16 @@
 # orw-probe.sh — installed-vs-latest drift tripwire for magic-context (Tier 1 plugin, Tier 2 ck-mc daemon)
 #
 # Exit codes: 0 up to date, 1 drift in any checked tier, 2 refused (npm registry unreachable).
-# Tier 2 is skipped (reported, not failed) when the ck-mc binary or the magic-context checkout is absent.
+# Tier 2 compares the installed ck-mc build SHA with the commit of the upstream release tag v<npm latest>.
+# It is skipped (reported, not failed) when the binary has no build SHA or the upstream tag cannot be resolved.
+# No local checkout is consulted: ck-mc is built from the unmodified upstream tag.
 #
 # Env overrides:
 #   OPENCODE_CONFIG_FILE  opencode.json holding the plugin pin
 #   CK_MC_BIN             installed ck-mc binary (default ~/.local/share/cortexkit/bin/ck-mc)
-#   MC_REPO               magic-context checkout whose HEAD is the build target
-#                         (default: sibling ../magic-context of this repo)
+#   MC_UPSTREAM_URL       git remote holding the release tags (default https://github.com/cortexkit/magic-context.git)
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DRIFT=0
 
 # 1. Tier 1: probe npm registry for latest @cortexkit/opencode-magic-context
@@ -36,24 +36,27 @@ else
     echo "STATUS: UP_TO_DATE ($NPM_LATEST)"
 fi
 
-# 2. Tier 2: installed ck-mc build SHA vs magic-context checkout HEAD
+# 2. Tier 2: installed ck-mc build SHA vs the commit of the upstream release tag v<npm latest>
 CK_MC_BIN="${CK_MC_BIN:-$HOME/.local/share/cortexkit/bin/ck-mc}"
-MC_REPO="${MC_REPO:-$SCRIPT_DIR/../../../magic-context}"
+MC_UPSTREAM_URL="${MC_UPSTREAM_URL:-https://github.com/cortexkit/magic-context.git}"
 
 if [ ! -x "$CK_MC_BIN" ]; then
     echo "ck-mc: SKIPPED (binary not found: $CK_MC_BIN)"
-elif ! git -C "$MC_REPO" rev-parse --verify HEAD >/dev/null 2>&1; then
-    echo "ck-mc: SKIPPED (magic-context checkout not found: $MC_REPO)"
 else
     INSTALLED_SHA=$("$CK_MC_BIN" --version 2>/dev/null | grep -oE '[0-9a-f]{40}' | head -n1 || true)
-    HEAD_SHA=$(git -C "$MC_REPO" rev-parse HEAD)
+    TAG_REFS=$(git ls-remote "$MC_UPSTREAM_URL" "refs/tags/v$NPM_LATEST" "refs/tags/v$NPM_LATEST^{}" 2>/dev/null || true)
+    # An annotated tag lists the tag object and then the peeled commit (^{}); the peeled line wins.
+    TAG_SHA=$(printf '%s\n' "$TAG_REFS" | awk '/\^\{\}$/ {print $1; found=1} END {if (!found) exit 1}' 2>/dev/null || true)
+    [ -n "$TAG_SHA" ] || TAG_SHA=$(printf '%s\n' "$TAG_REFS" | awk 'NF {print $1; exit}')
     if [ -z "$INSTALLED_SHA" ]; then
         echo "ck-mc: SKIPPED (no build SHA in --version output)"
-    elif [ "$INSTALLED_SHA" != "$HEAD_SHA" ]; then
-        echo "ck-mc: DRIFT_DETECTED (installed build: ${INSTALLED_SHA:0:9}, checkout HEAD: ${HEAD_SHA:0:9})"
+    elif [ -z "$TAG_SHA" ]; then
+        echo "ck-mc: SKIPPED (upstream tag v$NPM_LATEST not resolvable at $MC_UPSTREAM_URL)"
+    elif [ "$INSTALLED_SHA" != "$TAG_SHA" ]; then
+        echo "ck-mc: DRIFT_DETECTED (installed build: ${INSTALLED_SHA:0:9}, upstream v$NPM_LATEST: ${TAG_SHA:0:9})"
         DRIFT=1
     else
-        echo "ck-mc: UP_TO_DATE (${HEAD_SHA:0:9})"
+        echo "ck-mc: UP_TO_DATE (${TAG_SHA:0:9}, upstream v$NPM_LATEST)"
     fi
 fi
 

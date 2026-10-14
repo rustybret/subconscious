@@ -54,13 +54,18 @@ exit 0
                 ]
             }, f, indent=2)
 
-    def _make_checkout(self, sha_msg="init"):
-        repo = self.test_root / "mc-repo"
+    def _make_upstream(self, tag=None, annotated=True):
+        """A local stand-in for the upstream remote; returns (url, commit sha the tag points at)."""
+        repo = self.test_root / "upstream"
         repo.mkdir(exist_ok=True)
         git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t"]
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
-        subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", sha_msg], check=True)
-        return repo, subprocess.check_output(git + ["rev-parse", "HEAD"], text=True).strip()
+        subprocess.run(git + ["commit", "-q", "--allow-empty", "-m", "release"], check=True)
+        sha = subprocess.check_output(git + ["rev-parse", "HEAD"], text=True).strip()
+        if tag:
+            args = ["tag", "-a", tag, "-m", tag] if annotated else ["tag", tag]
+            subprocess.run(git + args, check=True)
+        return str(repo), sha
 
     def _make_ck_mc(self, sha: str):
         binary = self.bin_dir / "ck-mc"
@@ -68,12 +73,12 @@ exit 0
         binary.chmod(binary.stat().st_mode | stat.S_IEXEC)
         return binary
 
-    def _run_probe(self, ck_mc_bin=None, mc_repo=None):
+    def _run_probe(self, ck_mc_bin=None, upstream=None):
         env = os.environ.copy()
         env["PATH"] = f"{self.bin_dir}:{env.get('PATH', '')}"
         env["HOME"] = str(self.test_root)
         env["CK_MC_BIN"] = str(ck_mc_bin or self.test_root / "absent-ck-mc")
-        env["MC_REPO"] = str(mc_repo or self.test_root / "absent-repo")
+        env["MC_UPSTREAM_URL"] = str(upstream or self.test_root / "absent-upstream")
         return subprocess.run(
             ["bash", str(ORW_PROBE_SCRIPT)],
             capture_output=True,
@@ -109,30 +114,49 @@ exit 0
         self.assertEqual(proc.returncode, 2, f"Expected exit 2, got {proc.returncode}. Output:\n{proc.stdout}\n{proc.stderr}")
         self.assertIn("orw-probe: REFUSED (npm registry unreachable)", proc.stderr)
 
-    def test_ck_mc_stale_build_is_drift_exit_1(self):
+    def test_ck_mc_build_older_than_upstream_tag_is_drift_exit_1(self):
         self._write_opencode_json("0.48.0")
         self._create_mock_curl('{"dist-tags":{"latest":"0.48.0"}}')
-        repo, _ = self._make_checkout()
+        upstream, _ = self._make_upstream(tag="v0.48.0")
         binary = self._make_ck_mc("2" * 40)
-        proc = self._run_probe(ck_mc_bin=binary, mc_repo=repo)
+        proc = self._run_probe(ck_mc_bin=binary, upstream=upstream)
         self.assertEqual(proc.returncode, 1, f"{proc.stdout}\n{proc.stderr}")
         self.assertIn("STATUS: UP_TO_DATE (0.48.0)", proc.stdout)
-        self.assertIn("ck-mc: DRIFT_DETECTED (installed build: 222222222", proc.stdout)
+        self.assertIn("ck-mc: DRIFT_DETECTED (installed build: 222222222, upstream v0.48.0:", proc.stdout)
 
-    def test_ck_mc_matching_build_exits_0(self):
+    def test_ck_mc_matching_annotated_tag_exits_0(self):
+        # Annotated tags have a tag object distinct from the commit; the peeled commit must be compared.
         self._write_opencode_json("0.48.0")
         self._create_mock_curl('{"dist-tags":{"latest":"0.48.0"}}')
-        repo, sha = self._make_checkout()
+        upstream, sha = self._make_upstream(tag="v0.48.0", annotated=True)
         binary = self._make_ck_mc(sha)
-        proc = self._run_probe(ck_mc_bin=binary, mc_repo=repo)
+        proc = self._run_probe(ck_mc_bin=binary, upstream=upstream)
         self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
-        self.assertIn(f"ck-mc: UP_TO_DATE ({sha[:9]})", proc.stdout)
+        self.assertIn(f"ck-mc: UP_TO_DATE ({sha[:9]}, upstream v0.48.0)", proc.stdout)
+
+    def test_ck_mc_matching_lightweight_tag_exits_0(self):
+        self._write_opencode_json("0.48.0")
+        self._create_mock_curl('{"dist-tags":{"latest":"0.48.0"}}')
+        upstream, sha = self._make_upstream(tag="v0.48.0", annotated=False)
+        binary = self._make_ck_mc(sha)
+        proc = self._run_probe(ck_mc_bin=binary, upstream=upstream)
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("ck-mc: UP_TO_DATE", proc.stdout)
+
+    def test_ck_mc_unresolvable_upstream_tag_is_skipped_not_failed(self):
+        self._write_opencode_json("0.48.0")
+        self._create_mock_curl('{"dist-tags":{"latest":"0.48.0"}}')
+        upstream, sha = self._make_upstream(tag="v0.47.0")
+        binary = self._make_ck_mc(sha)
+        proc = self._run_probe(ck_mc_bin=binary, upstream=upstream)
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
+        self.assertIn("ck-mc: SKIPPED (upstream tag v0.48.0 not resolvable", proc.stdout)
 
     def test_ck_mc_missing_binary_is_skipped_not_failed(self):
         self._write_opencode_json("0.48.0")
         self._create_mock_curl('{"dist-tags":{"latest":"0.48.0"}}')
-        repo, _ = self._make_checkout()
-        proc = self._run_probe(mc_repo=repo)
+        upstream, _ = self._make_upstream(tag="v0.48.0")
+        proc = self._run_probe(upstream=upstream)
         self.assertEqual(proc.returncode, 0, f"{proc.stdout}\n{proc.stderr}")
         self.assertIn("ck-mc: SKIPPED (binary not found", proc.stdout)
 
