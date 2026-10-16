@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.20.96
+
+- When `ck <domain>` cannot find a command, name the managed bin folder it searched (or say when its data home could not be resolved) and state where that data home came from (XDG_DATA_HOME or HOME).
+
+## 0.20.95
+
+- Require subc-daemon 0.36.6 so Linux crash recovery records the module's executable rather than the daemon executable briefly inherited by a newly spawned child. Recording the wrong executable prevented the next daemon from recognizing and stopping that child after a crash. Orphan shutdown test timeouts now report the initial and current observations, persisted record, configured executable's device/inode and Linux `/proc/<pid>/exe` link.
+
 ## 0.20.94
 
 - `ck` prints a metric or field whose value is JSON `null` as "unknown" instead of "none". A null means the module could not determine the value, so it must not read like an empty result. Empty strings, arrays and objects still print "none".
