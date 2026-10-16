@@ -25,6 +25,7 @@ const ROUTE_OPEN_REFUSAL_COUNTER_CODES: &[&str] = &[
     ROUTE_OPEN_REFUSED_REQUIRED_CAPABILITY_UNPROVIDED,
     "target_unavailable",
     subc_protocol::error_codes::TARGET_FLOW_UNSUPPORTED,
+    subc_protocol::error_codes::TARGET_AGENT_RUN_UNSUPPORTED,
     "module_removed",
     "module_no_protocol",
     "unknown_module",
@@ -44,6 +45,8 @@ const ROUTE_OPEN_REFUSAL_COUNTER_CODES: &[&str] = &[
     subc_protocol::error_codes::SCOPE_NOT_LIVE,
     subc_protocol::error_codes::SCOPE_ENDED,
     subc_protocol::error_codes::SCOPE_NOT_CARRIER,
+    subc_protocol::error_codes::SCOPE_BIND_PROOF_REQUIRED,
+    subc_protocol::error_codes::SCOPE_BIND_PROOF_MISMATCH,
     subc_protocol::error_codes::SCOPE_CHANGED,
     subc_protocol::error_codes::INVALID_REQUEST,
 ];

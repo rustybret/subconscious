@@ -1,3 +1,4 @@
+use cortexkit_test_support::ScratchDir as TempDir;
 use std::{
     collections::BTreeMap,
     fs,
@@ -7,7 +8,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use subc_test_support::TestTempDir as TempDir;
 
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
@@ -48,10 +48,14 @@ struct TestServer {
 
 impl TestServer {
     async fn start() -> Self {
+        Self::start_named("ck-cli-server").await
+    }
+
+    async fn start_named(name: &str) -> Self {
         let process_liveness = Arc::new(SupervisorProcessLiveness::new());
         let supervisor_handle = SupervisorHandle::new();
         let daemon = start_test_daemon_with_process_liveness_and_supervisor(
-            "ck-cli-server",
+            name,
             process_liveness.clone(),
             supervisor_handle.clone(),
         )
@@ -143,7 +147,7 @@ fn bare_json_prints_the_one_top_help() {
     assert_exit(&output, 0);
     assert_eq!(
         text(&output.stdout),
-        "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)\n  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint\n  machine   this machine's id: show it, or adopt a restored one\n\nflags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n  --verbose       include diagnostic detail and complete metrics\n\nrun 'ck <domain>' with no verb to see that domain's commands\n"
+        "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)\n  routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint\n  machine   this machine's id: show it, or adopt a restored one\n  activity  consequential agent and module events\n\nflags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n  --verbose       include diagnostic detail and complete metrics\n\nrun 'ck <domain>' with no verb to see that domain's commands\n"
     );
 }
 
@@ -364,8 +368,9 @@ fn setup_dry_run_refuses_when_the_signature_header_is_stripped() {
 
 #[test]
 fn production_ck_ignores_the_test_release_index_key() {
-    let production = Path::new(env!("CARGO_BIN_EXE_ck"));
-    let shape = Command::new(production)
+    // The shipped `ck` target, run as `ckdev-ck` like every test process.
+    let production = cortexkit_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck"));
+    let shape = cortexkit_test_support::dev_command(&production)
         .arg("--ck-build-shape")
         .output()
         .expect("production ck build shape");
@@ -405,7 +410,7 @@ fn production_ck_ignores_the_test_release_index_key() {
         &std::env::var_os("PATH").unwrap_or_default(),
     )))
     .expect("fixture PATH");
-    let output = Command::new(production)
+    let output = cortexkit_test_support::dev_command(&production)
         .args(["setup", "--dry-run"])
         .env("CK_RELEASE_INDEX_URL", &index.url)
         .env("CK_TEST_RELEASE_INDEX_PUBKEY", &index.public_key)
@@ -911,17 +916,6 @@ fn single_row_table<const N: usize>(headers: [&str; N], row: [&str; N]) -> Strin
     format!("{}{}", render(headers), render(row))
 }
 
-fn home_relative(path: &str) -> String {
-    std::env::var("HOME")
-        .ok()
-        .and_then(|home| {
-            path.strip_prefix(&home)
-                .filter(|tail| tail.starts_with(std::path::MAIN_SEPARATOR))
-                .map(|tail| format!("~{tail}"))
-        })
-        .unwrap_or_else(|| path.to_string())
-}
-
 /// Asserts `output` renders the daemon uptime taken at some instant while the
 /// command ran. The CLI reads the uptime mid-run, so a test that samples it
 /// once, before or after, fails whenever a whole second ticks over in
@@ -1046,6 +1040,9 @@ fn setup_core_drift_floor_refusal_is_actionable_and_never_mutates() {
         let output = fixture
             .command(&index, args)
             .env_remove("CK_TEST_SETUP_CONTROL_OK")
+            // This test is about the core-version floor, not the Linux user-manager
+            // preflight, which a CI container cannot satisfy.
+            .env("CK_TEST_SETUP_PREFLIGHT_OK", "1")
             .output()
             .unwrap();
         assert_exit(&output, 1);
@@ -1243,7 +1240,7 @@ fn fresh_setup_prints_the_pasteable_claude_code_command() {
     let stdout = text(&output.stdout);
     assert!(
         stdout.ends_with(
-            "next: connect your agent — Claude Code: claude mcp add ck -- ck-subc-mcp shim --harness claude-code\n      other harnesses: https://github.com/cortexkit/subconscious#readme\n"
+            "next: connect your agent — Claude Code: claude mcp add ck -- ck subc-mcp shim --harness claude-code\n      other harnesses: https://github.com/cortexkit/subconscious#readme\n"
         ),
         "stdout:\n{stdout}"
     );
@@ -1272,7 +1269,12 @@ impl UpgradeFixture {
         write_executable(&mcp, "#!/bin/sh\necho 'ck-subc-mcp 0.17.9'\n");
         write_executable(&claustrum, "#!/bin/sh\necho 'ck-claustrum 0.8.0'\n");
         write_executable(&auth, "#!/bin/sh\necho 'ck-auth 0.8.0'\n");
-        let ck = fs::canonicalize(env!("CARGO_BIN_EXE_ck-under-test")).unwrap();
+        // The manifest names the `ck` this fixture's commands run: the test
+        // CLI as published under its `ckdev-` name.
+        let ck = fs::canonicalize(cortexkit_test_support::ckdev_binary(env!(
+            "CARGO_BIN_EXE_ck-under-test"
+        )))
+        .unwrap();
         let mutations = [
             (ck, "44".repeat(32)),
             (daemon, "33".repeat(32)),
@@ -1350,6 +1352,31 @@ impl UpgradeFixture {
                 self._root.path().join("update-metadata.json"),
             );
         command
+    }
+
+    fn set_core_version(&self, version: &str) {
+        let mut connection: Value =
+            serde_json::from_slice(&fs::read(&self.connection_file).unwrap()).unwrap();
+        connection["daemon_ver"] = json!(version);
+        fs::write(
+            &self.connection_file,
+            serde_json::to_vec(&connection).unwrap(),
+        )
+        .unwrap();
+        let path = self
+            .home
+            .join(".local/share/cortexkit/installer-manifest.json");
+        let mut inventory: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        // The fixture records ck, ck-subc and ck-subc-mcp before other components.
+        for entry in inventory["mutations"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .take(3)
+        {
+            entry["version"] = json!(version);
+        }
+        fs::write(path, serde_json::to_vec(&inventory).unwrap()).unwrap();
     }
 }
 
@@ -1441,6 +1468,99 @@ fn upgrade_and_check_say_everything_is_current_in_one_line() {
         assert_exit(&output, 0);
         assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
         assert_eq!(text(&output.stdout), expected);
+    }
+}
+
+fn core_release_index(base: &str, version: &str) -> (Value, BTreeMap<String, Vec<u8>>) {
+    let (mut index, archives) = upgrade_index(
+        base,
+        "0.55.1",
+        &"22".repeat(32),
+        version,
+        &"aa".repeat(32),
+        "0.8.0",
+        &"55".repeat(32),
+    );
+    let core = &mut index["components"]["core"];
+    core["release"] = json!(format!("subc-core-v{version}"));
+    let assets = &mut core["assets"][host_target()];
+    assets["ck-subc"]["reports"] = json!(version);
+    assets["ck-subc"]["sha256"] = json!("bb".repeat(32));
+    assets["ck-subc-mcp"]["reports"] = Value::Null;
+    assets["ck-subc-mcp"]["sha256"] = json!("cc".repeat(32));
+    (index, archives)
+}
+
+#[test]
+fn upgrade_noops_when_0_20_83_is_installed_and_cache_and_index_offer_0_20_41() {
+    let fixture = UpgradeFixture::new("ck-upgrade-no-downgrade");
+    fixture.set_core_version("0.20.83");
+    let cache = fixture._root.path().join("update-metadata.json");
+    fs::write(&cache, serde_json::to_vec(&json!({
+        "format_version": 3,
+        "checked_at_unix_secs": now_ms() / 1000,
+        "targets": {
+            "ck": {"version": "0.20.41", "sha256": "aa".repeat(32)},
+            "ck-subc": {"version": "0.20.41", "sha256": "bb".repeat(32)},
+            "ck-subc-mcp": {"version": "0.20.41", "sha256": "cc".repeat(32), "reports_release_version": false}
+        }
+    })).unwrap()).unwrap();
+    let index = serve_signed_index(|base| core_release_index(base, "0.20.41"));
+    let manifest = fixture
+        .home
+        .join(".local/share/cortexkit/installer-manifest.json");
+    let before = fs::read(&manifest).unwrap();
+    for args in [
+        &["upgrade"][..],
+        &["upgrade", "--check"][..],
+        &["upgrade", "--dry-run"][..],
+        &[][..],
+    ] {
+        let output = fixture
+            .command(&index, args)
+            .env("CK_TEST_CK_VERSION", "0.20.83")
+            .env("CK_TEST_SUBC_MCP_VERSION", "0.1.0")
+            .output()
+            .unwrap();
+        assert_exit(&output, 0);
+        assert!(output.stderr.is_empty(), "stderr: {}", text(&output.stderr));
+        let stdout = text(&output.stdout);
+        assert!(!stdout.contains("0.20.41"), "stdout:\n{stdout}");
+        if args.is_empty() {
+            assert!(stdout.contains("updates: none"), "stdout:\n{stdout}");
+        } else if !args.contains(&"--dry-run") {
+            assert!(
+                stdout.starts_with("Everything is up to date"),
+                "stdout:\n{stdout}"
+            );
+        }
+        assert_eq!(
+            fs::read(&manifest).unwrap(),
+            before,
+            "upgrade must not mutate inventory"
+        );
+    }
+}
+
+#[test]
+fn upgrade_check_still_offers_a_strictly_newer_core_release() {
+    let fixture = UpgradeFixture::new("ck-upgrade-newer-core");
+    fixture.set_core_version("0.20.83");
+    let index = serve_signed_index(|base| core_release_index(base, "0.20.84"));
+    let output = fixture
+        .command(&index, &["upgrade", "--check"])
+        .env("CK_TEST_CK_VERSION", "0.20.83")
+        .env("CK_TEST_SUBC_MCP_VERSION", "0.1.0")
+        .output()
+        .unwrap();
+    assert_exit(&output, 0);
+    let stdout = text(&output.stdout);
+    for update in [
+        "ck 0.20.83 → 0.20.84",
+        "ck-subc 0.20.83 → 0.20.84",
+        "ck-subc-mcp → release 0.20.84",
+    ] {
+        assert!(stdout.contains(update), "stdout:\n{stdout}");
     }
 }
 
@@ -1645,6 +1765,49 @@ fn daemon_lint_uses_its_explicit_config_without_a_daemon_connection() {
 // before any discovery, so the probe launches nothing; and a ck copy is
 // never listed as a domain by `--help`, which probes each copy exactly once
 // and, since each copy refuses without probing, launches nothing further.
+/// The one test allowed to place production-named (`ck-*`) executables.
+const TWIN_TEST: &str = "a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed";
+
+const PRODUCTION_NAME_EXEMPTIONS: &[(&str, &str)] =
+    &[(TWIN_TEST, "ck-twin"), (TWIN_TEST, "ck-twin-two")];
+
+/// The control for the twin exemption: in this same file, a production-named
+/// spawn outside it is still refused, whether it borrows the twin test's name,
+/// names a file the exemption does not list, or skips the exemption entirely.
+#[test]
+fn a_production_named_spawn_outside_the_twin_exemption_is_refused() {
+    let bin = Path::new("/fixture/bin");
+    let refused = |attempt: &dyn Fn()| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(attempt)).is_err()
+    };
+    assert!(
+        refused(&|| {
+            cortexkit_test_support::exempt_production_executable(
+                TWIN_TEST,
+                &bin.join("ck-twin"),
+                PRODUCTION_NAME_EXEMPTIONS,
+            );
+        }),
+        "another test must not borrow the twin test's exemption"
+    );
+    assert!(
+        refused(&|| {
+            cortexkit_test_support::exempt_production_executable(
+                "a_production_named_spawn_outside_the_twin_exemption_is_refused",
+                &bin.join("ck-twin"),
+                PRODUCTION_NAME_EXEMPTIONS,
+            );
+        }),
+        "the exemption names one test"
+    );
+    assert!(
+        refused(&|| {
+            let _ = cortexkit_test_support::dev_command(bin.join(platform_binary("ck-twin")));
+        }),
+        "the spawn guard refuses a ck-* program"
+    );
+}
+
 #[test]
 fn a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed() {
     let temp = TempDir::new("ck-twin-on-path");
@@ -1663,10 +1826,24 @@ fn a_copy_of_ck_on_path_is_neither_probed_recursively_nor_listed() {
     // Two copies, because a ck never probes its own executable: the CI shape
     // has many builds of ck side by side, and the recursion runs between
     // them, each copy probing the other.
+    //
+    // These copies keep `ck-` names on purpose, the one exemption from the
+    // rule that test processes run as `ckdev-*`: what this test checks is
+    // ck's production discovery of external domains, which matches `ck-*`
+    // executables on PATH by design, so a `ckdev-` copy would never be probed
+    // and the test would check something else. ck itself, not this test,
+    // starts them, and each refuses `--ck-domain` and exits within
+    // milliseconds. The exemption names this test and these two file names
+    // exactly; any other production-named placement is refused.
     for name in ["ck-twin", "ck-twin-two"] {
+        let copy = bin.join(platform_binary(name));
         common::copy_executable(
             Path::new(env!("CARGO_BIN_EXE_ck-under-test")),
-            &bin.join(platform_binary(name)),
+            cortexkit_test_support::exempt_production_executable(
+                TWIN_TEST,
+                &copy,
+                PRODUCTION_NAME_EXEMPTIONS,
+            ),
         );
     }
     let path = std::env::join_paths(
@@ -1776,6 +1953,202 @@ fn a_domain_installed_as_a_symlink_is_probed_and_run_by_its_own_name() {
         .expect("dispatch the symlinked face");
     assert_exit(&dispatched, 0);
     assert_eq!(text(&dispatched.stdout).trim(), "ran as ck-faced: list");
+}
+
+#[cfg(unix)]
+fn write_domain_program(directory: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::create_dir_all(directory).expect("create fake domain directory");
+    let path = directory.join(name);
+    fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake domain");
+    let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).expect("mark fake domain executable");
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn domain_in_cortexkit_bin_is_discovered_and_dispatched() {
+    let temp = TempDir::new("ck-domain-data-bin");
+    let data_home = temp.path().join("data-home");
+    let domain_bin = data_home.join("cortexkit").join("bin");
+    write_domain_program(
+        &domain_bin,
+        "ck-local-only",
+        "if [ \"$1\" = \"--ck-domain\" ]; then echo 'local domain'; exit 0; fi\necho dispatched-from-cortexkit-bin",
+    );
+
+    let dispatched = ck_command()
+        .args(["local-only", "list"])
+        .env("XDG_DATA_HOME", &data_home)
+        .env("PATH", system_path_only())
+        .env("CK_TEST_DOMAIN_PROBE_TIMEOUT_MS", "8000")
+        .output()
+        .expect("dispatch a domain installed only in CortexKit bin");
+    assert_exit(&dispatched, 0);
+    assert_eq!(
+        text(&dispatched.stdout).trim(),
+        "dispatched-from-cortexkit-bin"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cortexkit_bin_domain_takes_precedence_over_path_domain() {
+    let temp = TempDir::new("ck-domain-bin-precedence");
+    let data_home = temp.path().join("data-home");
+    let domain_bin = data_home.join("cortexkit").join("bin");
+    let path_bin = temp.path().join("path-bin");
+    write_domain_program(
+        &domain_bin,
+        "ck-priority",
+        "if [ \"$1\" = \"--ck-domain\" ]; then echo 'bin-folder headline'; exit 0; fi\necho dispatched-from-cortexkit-bin",
+    );
+    write_domain_program(
+        &path_bin,
+        "ck-priority",
+        "if [ \"$1\" = \"--ck-domain\" ]; then echo 'PATH headline'; exit 0; fi\necho dispatched-from-PATH",
+    );
+
+    let dispatched = ck_command()
+        .args(["priority", "list"])
+        .env("XDG_DATA_HOME", &data_home)
+        .env("PATH", &path_bin)
+        .env("CK_TEST_DOMAIN_PROBE_TIMEOUT_MS", "8000")
+        .output()
+        .expect("dispatch the higher-priority domain");
+    assert_exit(&dispatched, 0);
+    assert_eq!(
+        text(&dispatched.stdout).trim(),
+        "dispatched-from-cortexkit-bin"
+    );
+
+    let help = ck_command()
+        .arg("--help")
+        .env("XDG_DATA_HOME", &data_home)
+        .env("PATH", &path_bin)
+        .env("CK_TEST_DOMAIN_PROBE_TIMEOUT_MS", "8000")
+        .output()
+        .expect("list the selected domain once");
+    assert_exit(&help, 0);
+    let help_text = text(&help.stdout);
+    assert!(help_text.contains("bin-folder headline"), "{help_text}");
+    assert!(!help_text.contains("PATH headline"), "{help_text}");
+    assert_eq!(
+        help_text
+            .lines()
+            .filter(|line| line.contains("priority"))
+            .count(),
+        1,
+        "a domain present in both locations must be listed only once:\n{help_text}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn non_domain_in_cortexkit_bin_is_neither_listed_nor_dispatched() {
+    let temp = TempDir::new("ck-domain-bin-nondomain");
+    let data_home = temp.path().join("data-home");
+    let domain_bin = data_home.join("cortexkit").join("bin");
+    write_domain_program(
+        &domain_bin,
+        "ck-not-domain",
+        "if [ \"$1\" = \"--ck-domain\" ]; then exit 1; fi\necho SHOULD_NOT_DISPATCH",
+    );
+
+    let help = ck_command()
+        .arg("--help")
+        .env("XDG_DATA_HOME", &data_home)
+        .env("PATH", system_path_only())
+        .env("CK_TEST_DOMAIN_PROBE_TIMEOUT_MS", "8000")
+        .output()
+        .expect("list domains without the non-domain binary");
+    assert_exit(&help, 0);
+    assert!(
+        !text(&help.stdout).contains("not-domain"),
+        "a binary that declined the handshake was listed:\n{}",
+        text(&help.stdout)
+    );
+
+    let refused = ck_command()
+        .arg("not-domain")
+        .env("XDG_DATA_HOME", &data_home)
+        .env("PATH", system_path_only())
+        .env("CK_TEST_DOMAIN_PROBE_TIMEOUT_MS", "8000")
+        .output()
+        .expect("refuse to dispatch the non-domain binary");
+    assert_exit(&refused, 1);
+    assert!(
+        refused.stdout.is_empty(),
+        "non-domain binary was dispatched"
+    );
+    assert!(
+        text(&refused.stderr).contains("is not a ck command"),
+        "the refusal should explain why dispatch was denied:\n{}",
+        text(&refused.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn path_only_domain_is_discovered_and_dispatched() {
+    let temp = TempDir::new("ck-domain-path-only");
+    let data_home = temp.path().join("data-home");
+    let path_bin = temp.path().join("path-bin");
+    fs::create_dir_all(&data_home).expect("create isolated data home without a domain");
+    write_domain_program(
+        &path_bin,
+        "ck-path-only",
+        "if [ \"$1\" = \"--ck-domain\" ]; then echo 'PATH-only domain'; exit 0; fi\necho dispatched-from-PATH",
+    );
+
+    let dispatched = ck_command()
+        .args(["path-only", "list"])
+        .env("XDG_DATA_HOME", &data_home)
+        .env("PATH", &path_bin)
+        .env("CK_TEST_DOMAIN_PROBE_TIMEOUT_MS", "8000")
+        .output()
+        .expect("dispatch a domain found only on PATH");
+    assert_exit(&dispatched, 0);
+    assert_eq!(text(&dispatched.stdout).trim(), "dispatched-from-PATH");
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_gateway_domain_is_listed_and_invoked_through_ck() {
+    let temp = TempDir::new("ck-mcp-domain");
+    let data_home = temp.path().join("data-home");
+    let domain_bin = data_home.join("cortexkit").join("bin");
+    write_domain_program(
+        &domain_bin,
+        "ck-subc-mcp",
+        "if [ \"$1\" = \"--ck-domain\" ]; then printf '%s\\n' 'CortexKit MCP gateway'; exit 0; fi\nprintf 'forwarded:'\nfor arg in \"$@\"; do printf ' <%s>' \"$arg\"; done\nprintf '\\n'",
+    );
+
+    let help = ck_command()
+        .arg("--help")
+        .env("XDG_DATA_HOME", &data_home)
+        .output()
+        .expect("render command help with the MCP gateway");
+    assert_exit(&help, 0);
+    assert!(
+        text(&help.stdout).contains("subc-mcp  CortexKit MCP gateway"),
+        "the opted-in MCP gateway should be listed:\n{}",
+        text(&help.stdout)
+    );
+
+    let dispatched = ck_command()
+        .args(["subc-mcp", "shim", "--harness", "opencode"])
+        .env("XDG_DATA_HOME", &data_home)
+        .output()
+        .expect("dispatch the MCP shim through ck");
+    assert_exit(&dispatched, 0);
+    assert_eq!(
+        text(&dispatched.stdout),
+        "forwarded: <shim> <--harness> <opencode>\n"
+    );
 }
 
 #[cfg(unix)]
@@ -2044,12 +2417,11 @@ async fn module_logs_merges_sources_by_timestamp_and_reports_real_filter_counts(
     );
 }
 
-/// The daemon stamps each capture line with the moment it read it, so the
-/// stderr lane interleaves with the daemon's and the module's own lines by
-/// time. A capture file begun before that has unstamped lines at its top;
-/// they are still shown, and still undated, rather than given a time.
+/// A capture file begun before daemon stamping has an unstamped head.
+/// Those lines inherit the first following stamp, so they stay at the
+/// beginning of the capture lane instead of becoming the merged tail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn module_logs_orders_stamped_capture_lines_by_stamp_and_keeps_unstamped_ones() {
+async fn module_logs_orders_legacy_capture_head_before_stamped_tail() {
     let module_id = "stamped-capture";
     let data_home = unique_temp_dir("ck-module-logs-stamped-data");
     let runtime_dir = unique_temp_dir("ck-module-logs-stamped-runtime");
@@ -2106,11 +2478,11 @@ async fn module_logs_orders_stamped_capture_lines_by_stamp_and_keeps_unstamped_o
         text(&output.stdout),
         concat!(
             "daemon       2026-09-19T07:04:01.000Z INFO  subc: spawned module_id=stamped-capture\n",
+            "stderr       old unstamped line\n",
             "stderr       2026-09-19T07:04:02.000Z first stamped line\n",
             "mod          2026-09-19T07:04:03.000Z INFO  stamped-capture: module line\n",
             "daemon       2026-09-19T07:04:04.000Z WARN  subc: slow module_id=stamped-capture\n",
             "stderr       2026-09-19T07:04:05.000Z second stamped line\n",
-            "stderr       old unstamped line\n",
         )
     );
 }
@@ -2194,11 +2566,22 @@ async fn module_list_json_uses_subc_override_and_shows_stub() {
             .any(|module| module["module_id"] == module_id),
         "ck module list --json should include the supervised stub: {value}"
     );
+    let entry = modules
+        .iter()
+        .find(|module| module["module_id"] == module_id)
+        .unwrap();
+    if cfg!(windows) {
+        assert_eq!(entry["launch_nonce_source"], "pipe");
+    } else {
+        assert!(entry.get("launch_nonce_source").is_none());
+    }
 
     let text_output = ck_with_subc(&server.connection_file_path, ["module", "list"]);
     assert_exit(&text_output, 0);
     let text_stdout = text(&text_output.stdout);
-    let expected_list = if cfg!(any(target_os = "linux", target_os = "macos")) {
+    let expected_list = if cfg!(windows) {
+        "module        status   health   reload   nonce source\nck-list-stub  running  unknown  nothing  pipe        \n"
+    } else if cfg!(any(target_os = "linux", target_os = "macos")) {
         "module        status   health   reload \nck-list-stub  running  unknown  nothing\n"
     } else {
         "module        status   health   reload             \nck-list-stub  running  unknown  nothing (image n/a)\n"
@@ -2235,7 +2618,9 @@ async fn module_list_renders_status_words_not_wire_booleans() {
 
     let output = ck_with_subc(&server.connection_file_path, ["module", "list"]);
     assert_exit(&output, 0);
-    let expected_list = if cfg!(any(target_os = "linux", target_os = "macos")) {
+    let expected_list = if cfg!(windows) {
+        "module  status   health    reload   nonce source\ninsula  running  degraded  nothing  pipe        \n"
+    } else if cfg!(any(target_os = "linux", target_os = "macos")) {
         "module  status   health    reload \ninsula  running  degraded  nothing\n"
     } else {
         "module  status   health    reload             \ninsula  running  degraded  nothing (image n/a)\n"
@@ -2275,7 +2660,13 @@ async fn module_list_keeps_configured_path_mismatch_pending_on_every_platform() 
         entry["pending_reload"]["path"]["configured"],
         json!(replacement)
     );
-    if !cfg!(any(target_os = "linux", target_os = "macos")) {
+    if cfg!(windows) {
+        // Configuration points elsewhere, but the retained child still runs
+        // the unchanged file at its original spawn path. Image agreement must
+        // not erase the independent configured-path mismatch above.
+        assert_eq!(entry["pending_reload"]["image"]["status"], "match");
+        assert_eq!(entry["launch_nonce_source"], "pipe");
+    } else if !cfg!(any(target_os = "linux", target_os = "macos")) {
         assert_eq!(entry["pending_reload"]["image"]["status"], "unavailable");
         assert_eq!(
             entry["pending_reload"]["image"]["reason"],
@@ -2286,9 +2677,14 @@ async fn module_list_keeps_configured_path_mismatch_pending_on_every_platform() 
     let output = ck_with_subc(&server.connection_file_path, ["module", "list"]);
     assert_exit(&output, 0);
     let stdout = text(&output.stdout);
+    let expected_suffix = if cfg!(windows) {
+        "pending (path)  pipe"
+    } else {
+        "pending (path)"
+    };
     assert!(
         stdout.lines().any(|line| {
-            line.starts_with(module_id) && line.trim_end().ends_with("pending (path)")
+            line.starts_with(module_id) && line.trim_end().ends_with(expected_suffix)
         }),
         "{stdout}"
     );
@@ -2416,6 +2812,9 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
     ));
     assert_eq!(status_json["module"]["module_id"], "aft");
     assert_eq!(status_json["health"]["status"], "degraded");
+    if cfg!(windows) {
+        assert_eq!(status_json["module"]["launch_nonce_source"], "pipe");
+    }
 
     let provenance = control_rpc_value_on_stream_within(
         &mut wait_for_client(&server.connection_file_path).await,
@@ -2429,7 +2828,10 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
     let observed = &provenance["modules"][0]["daemon_observed"];
     let pid = observed["pid"].as_u64().unwrap();
     let started = age_from_ms(observed["spawned_at_ms"].as_u64().unwrap());
-    let binary = home_relative(observed["spawned_from"].as_str().unwrap());
+    // `ck` shortens paths under its own home folder to `~`. Every test `ck` runs
+    // with a throwaway HOME (see isolate_ck_command), so the build folder is never
+    // under it and the path is printed in full.
+    let binary = observed["spawned_from"].as_str().unwrap().to_string();
     let image = match observed["running_image"]["status"].as_str() {
         Some("match") => "running image matches".to_string(),
         Some("mismatch") => "running image differs: running vs disk".to_string(),
@@ -2460,7 +2862,7 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
         "start age renders as an age: {rendered_age:?} vs {started:?}"
     );
     assert_eq!(before, format!("aft — running, degraded\n  pid {pid}"));
-    let image_verdict = if cfg!(any(target_os = "linux", target_os = "macos")) {
+    let image_verdict = if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
         "matches file at spawned path"
     } else {
         "not checked on this platform (unsupported_platform)"
@@ -2474,7 +2876,16 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
     let (resources, rest) = rest
         .split_once('\n')
         .expect("resources line is followed by more status");
-    if cfg!(any(target_os = "linux", target_os = "macos")) {
+    if cfg!(windows) {
+        let (memory, cpu) = resources
+            .split_once(" windows working set · cpu ")
+            .expect("a Windows resources line names the working-set measurement");
+        assert!(memory.starts_with("memory "), "{resources:?}");
+        assert!(
+            cpu.contains(" (user ") && cpu.contains(", kernel ") && cpu.ends_with(')'),
+            "{resources:?}"
+        );
+    } else if cfg!(any(target_os = "linux", target_os = "macos")) {
         assert!(
             resources.starts_with("memory ") && resources.contains(" · cpu "),
             "a running module renders its memory and cpu: {resources:?}"
@@ -2488,8 +2899,9 @@ async fn module_status_renders_key_value_block_byte_for_byte() {
     assert_eq!(
         rest,
         format!(
-            "0 of 1 in 10m · drain 25 ms · restart backoff 10 ms to 30s\n  launch_nonce_env: {nonce_env}\n  last exit: none\n  drain gauges: 0 drains with undeclared gauge\n  binary: {binary} ({image})\n  configured program: matches running process\n  running image: {image_verdict}\nmetrics: run `ck health aft`\n",
-            nonce_env = !cfg!(unix)
+            "0 of 1 in 10m · drain 25 ms · restart backoff 10 ms to 30s\n  launch_nonce_env: {nonce_env}{nonce_source}\n  last exit: none\n  drain gauges: 0 drains with undeclared gauge\n  binary: {binary} ({image})\n  configured program: matches running process\n  running image: {image_verdict}\n",
+            nonce_env = !cfg!(unix),
+            nonce_source = if cfg!(windows) { "\n  launch nonce source (daemon): pipe" } else { "" },
         )
     );
 
@@ -2540,19 +2952,24 @@ async fn module_terminals_renders_one_record_byte_for_byte() {
     ));
     let entry = &json["entries"][0];
     assert_eq!(json["entries"].as_array().unwrap().len(), 1);
-    let when = age_from_ms(entry["at_ms"].as_u64().unwrap());
+    let at_ms = entry["at_ms"].as_u64().unwrap();
+    let fixed_now_ms = at_ms - 7 * 24 * 60 * 60 * 1_000;
     let disposition = entry["disposition"]
         .as_str()
         .unwrap()
         .replace(['_', '-'], " ");
 
-    let output = ck_with_subc(&server.connection_file_path, ["module", "terminals", "aft"]);
+    let output = ck_with_subc_at_now(
+        &server.connection_file_path,
+        ["module", "terminals", "aft"],
+        fixed_now_ms,
+    );
     assert_exit(&output, 0);
     assert_eq!(
         text(&output.stdout),
         single_row_table(
             ["when", "exit", "disposition", "daemon"],
-            [&when, "exit 7", &disposition, "-"]
+            ["in 7d", "exit 7", &disposition, "-"]
         )
     );
 
@@ -2612,7 +3029,7 @@ async fn module_stop_waits_past_ten_seconds_within_running_drain_budget() {
         RestartPolicy::new(3, Duration::from_millis(137))
             .with_max_backoff(Duration::from_millis(7_321)),
     )
-    .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
+    .with_privacy_trampoline(common::ckdev_subc())
     .with_process_liveness(Arc::clone(&server.process_liveness))
     .with_forwarding(Arc::clone(&server.forwarding))
     .with_handle(server.supervisor_handle.clone())
@@ -2860,8 +3277,13 @@ async fn provenance_human_output_keeps_declared_values_under_the_declared_label(
     assert!(declared_at < observed_at, "stdout:\n{stdout}");
     let module_declared = &stdout[declared_at..observed_at];
     let module_observed = &stdout[observed_at..];
+    let expected_observed_start = if cfg!(windows) {
+        "Daemon observed\n  launch nonce source: pipe\n  pid:"
+    } else {
+        "Daemon observed\n  pid:"
+    };
     assert!(
-        module_observed.starts_with("Daemon observed\n  pid:"),
+        module_observed.starts_with(expected_observed_start),
         "module-level observed section boundary was not verified:\n{module_observed}"
     );
     for declared in [
@@ -2893,6 +3315,14 @@ async fn provenance_human_output_keeps_declared_values_under_the_declared_label(
     let source = json["modules"][0]["module_declared"]["build"]["launch_nonce_source"]
         .as_str()
         .unwrap_or_else(|| panic!("the stub declares a nonce source: {json}"));
+    let expected_source = if cfg!(windows) {
+        "pipe"
+    } else if cfg!(unix) {
+        "fd"
+    } else {
+        "env"
+    };
+    assert_eq!(source, expected_source);
     assert!(
         module_declared.contains(&format!("launch nonce source: {source}")),
         "stdout:\n{stdout}"
@@ -2908,12 +3338,12 @@ async fn provenance_human_output_keeps_declared_values_under_the_declared_label(
     assert!(stdout.contains("started "), "stdout:\n{stdout}");
     assert!(stdout.contains("spawned from:"), "stdout:\n{stdout}");
     assert!(stdout.contains("running image "), "stdout:\n{stdout}");
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     assert!(
-        stdout.contains("running image matches the file it was spawned from"),
+        module_observed.contains("running image matches the file it was spawned from"),
         "stdout:\n{stdout}"
     );
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     assert!(
         stdout.contains("running image could not be compared"),
         "stdout:\n{stdout}"
@@ -3080,6 +3510,123 @@ async fn health_summarizes_provider_state_and_headline_metrics() {
     );
 
     module.stop().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn module_status_shows_healthy_health_detail_and_headline_metrics() {
+    let server = TestServer::start_named("ckdev-module-status-health").await;
+    let supervisor = supervisor_with_fast_health(&server);
+    let xdg_root = server.temp_dir.path().join("child-xdg");
+    let xdg_paths = [
+        ("XDG_DATA_HOME", xdg_root.join("data")),
+        ("XDG_RUNTIME_DIR", xdg_root.join("runtime")),
+        ("XDG_CONFIG_HOME", xdg_root.join("config")),
+    ];
+    for (_, path) in &xdg_paths {
+        fs::create_dir_all(path).unwrap();
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&xdg_paths[1].1, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let xdg_data = xdg_paths[0].1.to_str().unwrap();
+    let xdg_runtime = xdg_paths[1].1.to_str().unwrap();
+    let xdg_config = xdg_paths[2].1.to_str().unwrap();
+
+    let metrics = serde_json::json!({
+        "headline": ["indexing"],
+        "indexing": "view publication prefrontal 0/? files [preparing]",
+        "roots_warming": 84,
+    })
+    .to_string();
+    let with_health = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        "ckdev-status-detail",
+        vec![
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
+            ("FAKE_AFT_HEALTH_STATUS", "ok"),
+            (
+                "FAKE_AFT_HEALTH_DETAIL",
+                "indexing view publication prefrontal 0/? files [preparing]",
+            ),
+            ("FAKE_AFT_HEALTH_METRICS", metrics.as_str()),
+            ("XDG_DATA_HOME", xdg_data),
+            ("XDG_RUNTIME_DIR", xdg_runtime),
+            ("XDG_CONFIG_HOME", xdg_config),
+        ],
+    )
+    .await;
+    let without_health_detail = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        "ckdev-status-empty",
+        vec![
+            ("FAKE_AFT_ADVERTISE_HEALTH", "1"),
+            ("XDG_DATA_HOME", xdg_data),
+            ("XDG_RUNTIME_DIR", xdg_runtime),
+            ("XDG_CONFIG_HOME", xdg_config),
+        ],
+    )
+    .await;
+    wait_for_health_status(
+        &server.connection_file_path,
+        "ckdev-status-detail",
+        SupervisorHealthStatus::Ok,
+    )
+    .await;
+    wait_for_health_status(
+        &server.connection_file_path,
+        "ckdev-status-empty",
+        SupervisorHealthStatus::Ok,
+    )
+    .await;
+
+    let status = ck_with_subc(
+        &server.connection_file_path,
+        ["module", "status", "ckdev-status-detail"],
+    );
+    assert_exit(&status, 0);
+    let stdout = text(&status.stdout);
+    assert!(
+        stdout.contains("  indexing view publication prefrontal 0/? files [preparing]\n"),
+        "healthy detail missing from module status:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("  indexing: view publication prefrontal 0/? files [preparing]\n"),
+        "headline metric missing from module status:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("metrics: run `ck health ckdev-status-detail`\n"),
+        "the non-headline metrics hint should remain:\n{stdout}"
+    );
+
+    let empty = ck_with_subc(
+        &server.connection_file_path,
+        ["module", "status", "ckdev-status-empty"],
+    );
+    assert_exit(&empty, 0);
+    let empty_stdout = text(&empty.stdout);
+    assert!(
+        !empty_stdout.contains("metrics: run `ck health ckdev-status-empty`"),
+        "status without extra metrics should not print the health hint:\n{empty_stdout}"
+    );
+    assert!(
+        !empty_stdout.contains("indexing view publication prefrontal 0/? files [preparing]"),
+        "status without a health detail should omit its detail line:\n{empty_stdout}"
+    );
+    assert!(
+        !empty_stdout.contains("indexing:"),
+        "status without headline metrics should omit their lines:\n{empty_stdout}"
+    );
+    assert!(
+        !empty_stdout.contains("  metrics: none\n"),
+        "status without metrics should omit a headline line:\n{empty_stdout}"
+    );
+
+    with_health.stop().await.unwrap();
+    without_health_detail.stop().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3319,26 +3866,39 @@ fn looks_like_age(text: &str) -> bool {
     text == "just now" || text.ends_with(" ago")
 }
 
+/// The test CLI, run as `ckdev-under-test` (see `common::ck_under_test_command`).
 fn ck_command() -> Command {
     let mut command = common::ck_under_test_command();
+    isolate_ck_command(&mut command);
+    command
+}
+
+fn isolate_ck_command(command: &mut Command) {
+    let home = unique_temp_dir("ck-home");
     // Every CLI test gets an isolated update cache and a closed local endpoint.
     // This proves dashboard output without reaching public release infrastructure.
-    // The domain list is discovered from PATH (`ck-<name> --ck-domain`), so a
-    // test that pins rendered output must not see the host's real `ck-auth`
-    // or `ck-models`. Every CLI test therefore runs with the SYSTEM path only:
-    // `curl` and `sh` stay reachable (the update check shells out, and a ck
-    // that cannot spawn curl never connects to a test's listener, which wedges
-    // that test in `accept()` rather than failing it), while the user-level
-    // directories that hold installed `ck-*` binaries are absent. A test that
-    // wants a domain builds one in its own directory and prepends it.
+    // Domain discovery checks the managed bin directory and then PATH, so a
+    // test that pins rendered output must not inherit a host data home or user
+    // PATH containing real domains. Every CLI test therefore runs with the
+    // SYSTEM path only: `curl` and `sh` stay reachable (the update check shells
+    // out, and a ck that cannot spawn curl never connects to a test's listener,
+    // which wedges that test in `accept()` rather than failing it), while the
+    // user-level directories that hold installed `ck-*` binaries are absent.
+    // A test that wants a domain builds one in its own directory and prepends it.
     command
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .env(
             "CK_UPDATE_CACHE_PATH",
             unique_temp_dir("ck-update-cache").join("update-metadata.json"),
         )
+        .env("XDG_DATA_HOME", unique_temp_dir("ck-data-home").path())
+        .env("XDG_CONFIG_HOME", unique_temp_dir("ck-config-home").path())
+        .env("XDG_RUNTIME_DIR", unique_temp_dir("ck-runtime-dir").path())
+        .env("LOCALAPPDATA", unique_temp_dir("ck-local-app-data").path())
+        .env("CK_PROFILE_PATH", home.path().join(".profile"))
         .env("CK_RELEASE_INDEX_URL", "http://127.0.0.1:0/index.json")
         .env("PATH", system_path_only());
-    command
 }
 
 /// The platform's system tool directories and nothing else.
@@ -3369,6 +3929,20 @@ fn system_path_only() -> std::ffi::OsString {
 fn ck_with_subc<const N: usize>(connection_file: &Path, args: [&str; N]) -> Output {
     let mut command = ck_command();
     command.args(args).arg("--subc").arg(connection_file);
+    command.output().unwrap()
+}
+
+fn ck_with_subc_at_now<const N: usize>(
+    connection_file: &Path,
+    args: [&str; N],
+    now_ms: u64,
+) -> Output {
+    let mut command = ck_command();
+    command
+        .env("CK_TEST_TERMINALS_NOW_MS", now_ms.to_string())
+        .args(args)
+        .arg("--subc")
+        .arg(connection_file);
     command.output().unwrap()
 }
 
@@ -3421,7 +3995,7 @@ fn supervisor_with_restart_limit(server: &TestServer, max_restarts: u32) -> Supe
         Arc::clone(&server.registry),
         RestartPolicy::new(max_restarts, Duration::from_millis(10)),
     )
-    .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
+    .with_privacy_trampoline(common::ckdev_subc())
     .with_process_liveness(Arc::clone(&server.process_liveness))
     .with_forwarding(Arc::clone(&server.forwarding))
     .with_handle(server.supervisor_handle.clone())
@@ -3574,30 +4148,16 @@ async fn wait_for_stub_request(path: &Path, channel: u16, corr: u64) {
 }
 
 fn scripted_supervisor_entry(module_id: &str, drain_timeout_ms: Option<u64>) -> SupervisorEntry {
-    SupervisorEntry {
-        launch_nonce_env: None,
-        module_id: module_id.to_string(),
-        state: "running".to_string(),
-        enabled: true,
-        live: true,
-        protocol: ModuleProtocol::Subc,
-        health: SupervisorHealthStatus::Ok,
-        pending_reload: None,
-        last_probe_ms: None,
-        last_exit_code: None,
-        last_exit_signal: None,
-        last_exit_ms: None,
-        last_exit_kind: None,
-        restart_count: Some(0),
-        max_restarts: Some(3),
-        lifetime_restarts: Some(0),
-        spawn_generation: Some(1),
-        restart_window_secs: Some(600),
-        drain_timeout_ms,
-        restart_backoff_ms: Some(100),
-        restart_max_backoff_ms: Some(30_000),
-        resources: None,
-    }
+    SupervisorEntry::new(module_id, "running", true, true, SupervisorHealthStatus::Ok)
+        .with_protocol(ModuleProtocol::Subc)
+        .with_restart_count(Some(0))
+        .with_max_restarts(Some(3))
+        .with_lifetime_restarts(Some(0))
+        .with_spawn_generation(Some(1))
+        .with_restart_window_secs(Some(600))
+        .with_drain_timeout_ms(drain_timeout_ms)
+        .with_restart_backoff_ms(Some(100))
+        .with_restart_max_backoff_ms(Some(30_000))
 }
 
 fn quota_wire_fixture() -> Value {

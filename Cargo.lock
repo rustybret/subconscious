@@ -4,13 +4,13 @@ version = 4
 
 [[package]]
 name = "agent-token-vectors"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
+ "cortexkit-test-support",
  "ed25519-dalek",
  "hex",
  "serde",
  "serde_json",
- "subc-test-support",
 ]
 
 [[package]]
@@ -189,6 +189,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "block2"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
+dependencies = [
+ "objc2",
+]
+
+[[package]]
 name = "bstr"
 version = "1.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -257,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "ck-bus"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -266,7 +275,9 @@ dependencies = [
  "cortexkit-bus-naming",
  "cortexkit-bus-nats",
  "cortexkit-bus-trait",
+ "cortexkit-lease",
  "cortexkit-store-types 0.2.2",
+ "cortexkit-test-support",
  "data-encoding",
  "futures-util",
  "nkeys",
@@ -277,7 +288,6 @@ dependencies = [
  "subc-daemon",
  "subc-jsonc",
  "subc-protocol",
- "subc-test-support",
  "subc-transport",
  "syn 2.0.118",
  "tempfile",
@@ -394,6 +404,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cortexkit-lease"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a0fc0f64f4fa68109464728f7c4d2afd5b676ff8d11d1e99cd2d022f6bc02a1"
+dependencies = [
+ "fs2",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "cortexkit-log"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -414,10 +434,11 @@ checksum = "d14cf5bd9d4b76fcf4d5380550dd11f9191598309ecaacc4805e317b2d6deb90"
 
 [[package]]
 name = "cortexkit-release"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "assert_cmd",
  "clap",
+ "cortexkit-lease",
  "cortexkit-paths",
  "fs4",
  "predicates",
@@ -444,6 +465,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94feb32be066be355bd3191fdf3de1f733a54a9cb84932413145b7b7f4b2135e"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "cortexkit-test-support"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "987f96b58d7a73a04dd34ffa7149f64c78914b1570a457e6c00cf0c7291aba1c"
+dependencies = [
+ "rustix",
+ "sha2",
+ "subc-os",
+ "tokio",
 ]
 
 [[package]]
@@ -648,6 +681,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]
@@ -1089,9 +1132,10 @@ dependencies = [
 
 [[package]]
 name = "mcp-stdio-adapter"
-version = "0.1.10"
+version = "0.1.14"
 dependencies = [
  "cortexkit-log",
+ "cortexkit-test-support",
  "rustix",
  "serde",
  "serde_json",
@@ -1099,7 +1143,6 @@ dependencies = [
  "subc-jobobject",
  "subc-jsonc",
  "subc-protocol",
- "subc-test-support",
  "tokio",
  "tokio-util",
  "tracing",
@@ -1174,6 +1217,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "objc2"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08849bbd4767dfae9457696856ae1c84fe4e0281bbe4a7abff2d0e06fb7981f8"
+dependencies = [
+ "objc2-encode",
+]
+
+[[package]]
+name = "objc2-encode"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ef25abbcd74fb2609453eb695bd2f860d389e457f67dc17cafc8b8cbc89d0c33"
+
+[[package]]
+name = "objc2-foundation"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3e0adef53c21f888deb4fa59fc59f7eb17404926ee8a6f59f5df0fd7f9f3272"
+dependencies = [
+ "bitflags",
+ "objc2",
+]
+
+[[package]]
+name = "objc2-local-authentication"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e48e0b8b339e0d9d2ed4416b7f93f9d4daadff7d4dd797f89867cde11aeac607"
+dependencies = [
+ "block2",
+ "objc2",
+ "objc2-foundation",
 ]
 
 [[package]]
@@ -1818,24 +1897,24 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "subc-cgroup"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
- "subc-test-support",
+ "cortexkit-test-support",
  "tokio",
 ]
 
 [[package]]
 name = "subc-client-rs"
-version = "0.26.1"
+version = "0.29.2"
 dependencies = [
  "async-trait",
+ "cortexkit-test-support",
  "serde",
  "serde_json",
  "sha2",
  "subc-control",
  "subc-os",
  "subc-protocol",
- "subc-test-support",
  "subc-transport",
  "syn 2.0.118",
  "tokio",
@@ -1845,7 +1924,7 @@ dependencies = [
 
 [[package]]
 name = "subc-control"
-version = "0.28.0"
+version = "0.31.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1854,25 +1933,27 @@ dependencies = [
 
 [[package]]
 name = "subc-core"
-version = "0.20.62"
+version = "0.20.94"
 dependencies = [
  "base64",
  "cortexkit-log",
  "cortexkit-paths",
+ "cortexkit-test-support",
  "ed25519-dalek",
  "hex-literal",
  "rusqlite",
  "rustix",
+ "semver",
  "serde",
  "serde_json",
  "sha2",
+ "subc-client-rs",
  "subc-control",
  "subc-core",
  "subc-daemon",
  "subc-jsonc",
  "subc-os",
  "subc-protocol",
- "subc-test-support",
  "subc-transport",
  "terminal_size",
  "tokio",
@@ -1882,10 +1963,12 @@ dependencies = [
 
 [[package]]
 name = "subc-daemon"
-version = "0.32.5"
+version = "0.36.5"
 dependencies = [
+ "base64",
  "cortexkit-log",
  "cortexkit-paths",
+ "cortexkit-test-support",
  "fs4",
  "getrandom 0.2.17",
  "loom",
@@ -1900,10 +1983,11 @@ dependencies = [
  "subc-jobobject",
  "subc-jsonc",
  "subc-os",
+ "subc-presence",
  "subc-protocol",
- "subc-test-support",
  "subc-transport",
  "subc-uptime",
+ "subtle",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1913,19 +1997,19 @@ dependencies = [
 name = "subc-daemon-consumer"
 version = "0.0.2"
 dependencies = [
+ "cortexkit-test-support",
  "serde_json",
  "subc-daemon",
  "subc-protocol",
- "subc-test-support",
  "subc-transport",
  "tokio",
 ]
 
 [[package]]
 name = "subc-jobobject"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
- "subc-test-support",
+ "cortexkit-test-support",
  "tokio",
  "windows-sys 0.61.2",
 ]
@@ -1939,9 +2023,10 @@ dependencies = [
 
 [[package]]
 name = "subc-mcp"
-version = "0.1.25"
+version = "0.1.37"
 dependencies = [
  "cortexkit-log",
+ "cortexkit-test-support",
  "rmcp",
  "serde",
  "serde_json",
@@ -1951,7 +2036,6 @@ dependencies = [
  "subc-jsonc",
  "subc-os",
  "subc-protocol",
- "subc-test-support",
  "subc-transport",
  "tokio",
  "tracing",
@@ -1959,42 +2043,50 @@ dependencies = [
 
 [[package]]
 name = "subc-os"
-version = "0.1.9"
+version = "0.1.17"
 dependencies = [
+ "cortexkit-test-support",
  "libc",
  "rustix",
  "subc-os",
  "tokio",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "subc-presence"
+version = "0.1.1"
+dependencies = [
+ "block2",
+ "objc2",
+ "objc2-foundation",
+ "objc2-local-authentication",
+ "windows",
+ "windows-future",
+ "zeroize",
 ]
 
 [[package]]
 name = "subc-protocol"
-version = "0.29.1"
+version = "0.32.4"
 dependencies = [
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "subc-test-support"
-version = "0.1.1"
-dependencies = [
- "rustix",
- "serde_json",
-]
-
-[[package]]
 name = "subc-transport"
-version = "0.10.0"
+version = "0.13.0"
 dependencies = [
+ "cortexkit-test-support",
  "getrandom 0.2.17",
  "hmac",
  "rustix",
  "serde",
  "serde_json",
  "sha2",
+ "subc-os",
  "subc-protocol",
- "subc-test-support",
  "subtle",
  "tokio",
 ]
@@ -2330,6 +2422,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "cortexkit-store-types 0.2.1",
+ "cortexkit-test-support",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2337,7 +2430,6 @@ dependencies = [
  "subc-control",
  "subc-daemon",
  "subc-protocol",
- "subc-test-support",
  "subc-transport",
  "thiserror 1.0.69",
  "tokio",
@@ -2383,9 +2475,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.26.1"
+version = "1.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
+checksum = "7cc1186384beb7dd8eedea376413fd654937285ea6c9cfbb928dc3043ea4b606"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
@@ -2489,6 +2581,49 @@ dependencies = [
 ]
 
 [[package]]
+name = "winapi"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c839a674fcd7a98952e593242ea400abe93992746761e38641405d28b00f419"
+dependencies = [
+ "winapi-i686-pc-windows-gnu",
+ "winapi-x86_64-pc-windows-gnu",
+]
+
+[[package]]
+name = "winapi-i686-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
+
+[[package]]
+name = "winapi-x86_64-pc-windows-gnu"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
+
+[[package]]
+name = "windows"
+version = "0.62.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "527fadee13e0c05939a6a05d5bd6eec6cd2e3dbd648b9f8e447c6518133d8580"
+dependencies = [
+ "windows-collections",
+ "windows-core",
+ "windows-future",
+ "windows-numerics",
+]
+
+[[package]]
+name = "windows-collections"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b2d95af1a8a14a3c7367e1ed4fc9c20e0a26e79551b1454d72583c97cc6610"
+dependencies = [
+ "windows-core",
+]
+
+[[package]]
 name = "windows-core"
 version = "0.62.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2499,6 +2634,17 @@ dependencies = [
  "windows-link",
  "windows-result",
  "windows-strings",
+]
+
+[[package]]
+name = "windows-future"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1d6f90251fe18a279739e78025bd6ddc52a7e22f921070ccdc67dde84c605cb"
+dependencies = [
+ "windows-core",
+ "windows-link",
+ "windows-threading",
 ]
 
 [[package]]
@@ -2528,6 +2674,16 @@ name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-numerics"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e2e40844ac143cdb44aead537bbf727de9b044e107a0f1220392177d15b0f26"
+dependencies = [
+ "windows-core",
+ "windows-link",
+]
 
 [[package]]
 name = "windows-result"
@@ -2579,6 +2735,15 @@ dependencies = [
  "windows_x86_64_gnu",
  "windows_x86_64_gnullvm",
  "windows_x86_64_msvc",
+]
+
+[[package]]
+name = "windows-threading"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3949bd5b99cafdf1c7ca86b43ca564028dfe27d66958f2470940f73d86d75b37"
+dependencies = [
+ "windows-link",
 ]
 
 [[package]]

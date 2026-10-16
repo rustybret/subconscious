@@ -35,16 +35,9 @@ fn main() {
 
 fn git_head_sha() -> Option<String> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").ok()?;
-    // Rebuild when HEAD moves. Best-effort: if the paths are missing (a source
-    // tarball), the SHA reports unavailable and there is nothing to track.
-    let git_dir = Path::new(&manifest_dir).join("../../.git");
-    if git_dir.exists() {
-        println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
-        // Branch tips move under refs/heads without HEAD itself changing.
-        println!("cargo:rerun-if-changed={}", git_dir.join("refs").display());
-    }
+    emit_git_rerun_paths(Path::new(&manifest_dir));
     let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
+        .args(["--no-optional-locks", "rev-parse", "HEAD"])
         .current_dir(&manifest_dir)
         .output()
         .ok()?;
@@ -62,7 +55,7 @@ fn git_head_sha() -> Option<String> {
     // the dirtiness probe itself fails, the whole identity reports
     // unavailable rather than an unmarked SHA that may be lying.
     let status = Command::new("git")
-        .args(["status", "--porcelain"])
+        .args(["--no-optional-locks", "status", "--porcelain"])
         .current_dir(&manifest_dir)
         .output()
         .ok()?;
@@ -76,10 +69,61 @@ fn git_head_sha() -> Option<String> {
     }
 }
 
+// Keep this helper identical in the four build scripts; sharing it needs a build-dependency crate.
+fn emit_git_rerun_paths(root: &Path) {
+    for path in ["HEAD", "packed-refs", "index"] {
+        emit_git_rerun_path(root, path);
+    }
+
+    if let Ok(output) = Command::new("git")
+        .args(["--no-optional-locks", "symbolic-ref", "-q", "HEAD"])
+        .current_dir(root)
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(branch_ref) = String::from_utf8(output.stdout) {
+                emit_git_rerun_path(root, branch_ref.trim());
+            }
+        }
+    }
+}
+
+fn emit_git_rerun_path(root: &Path, path: &str) {
+    let Some(path) = Command::new("git")
+        .args(["--no-optional-locks", "rev-parse", "--git-path", path])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+    else {
+        return;
+    };
+    let path = path.trim();
+    if path.is_empty() {
+        return;
+    }
+    let path = Path::new(path);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    if path.exists() {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+}
+
 fn lock_digest() -> Option<String> {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").ok()?;
     let lock_path = PathBuf::from(&manifest_dir).join("../../Cargo.lock");
-    println!("cargo:rerun-if-changed={}", lock_path.display());
+    // Watch the lock only where it exists. A crate built from a registry or
+    // vendored copy has no workspace lock two levels up, and cargo treats a
+    // missing watched path as always changed, so naming it would rebuild this
+    // crate on every build of every consumer.
+    if lock_path.exists() {
+        println!("cargo:rerun-if-changed={}", lock_path.display());
+    }
     let bytes = std::fs::read(&lock_path).ok()?;
     Some(sha256_hex(&bytes))
 }

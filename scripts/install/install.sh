@@ -282,24 +282,20 @@ case "${os}-${arch}" in
 esac
 
 if [[ "$os" == "linux" ]]; then
-  if ! kernel_release=$(uname -r); then
-    kernel_release="unknown"
+  if ! command -v systemctl >/dev/null 2>&1; then
+    refuse "systemd-unavailable" "Linux setup is unsupported because systemd is not available on this host"
   fi
-  if [[ -n "${WSL_DISTRO_NAME:-}" || "$kernel_release" == *[Mm]icrosoft* || "$kernel_release" == *WSL* ]]; then
-    if ! command -v systemctl >/dev/null 2>&1; then
-      refuse "wsl-systemd-user-unavailable" "systemctl is not available for the Linux installation path"
-    fi
-    if ! systemd_evidence=$(mktemp); then
-      refuse "wsl-systemd-user-unavailable" "could not collect systemd-user prerequisite evidence"
-    fi
-    if ! systemctl --user show-environment >"$systemd_evidence" 2>&1; then
-      printf 'refusal: wsl-systemd-user-unavailable: systemctl --user show-environment failed\n' >&2
-      cat "$systemd_evidence" >&2
-      rm -f "$systemd_evidence"
-      exit 1
-    fi
+  if ! systemd_evidence=$(mktemp); then
+    refuse "systemd-user-manager-unavailable" "could not collect systemd user-manager check output"
+  fi
+  if ! systemctl --user show-environment >"$systemd_evidence" 2>&1; then
     rm -f "$systemd_evidence"
+    if systemctl show-environment >/dev/null 2>&1; then
+      refuse "systemd-user-manager-unavailable" "systemd is available, but no user session bus is reachable. Log in normally, or run \`loginctl enable-linger \$USER\` then start a new login session; if it exists, export \`XDG_RUNTIME_DIR=/run/user/\$(id -u)\`."
+    fi
+    refuse "systemd-unavailable" "Linux setup is unsupported because systemd is not available on this host"
   fi
+  rm -f "$systemd_evidence"
 fi
 
 if ! command -v curl >/dev/null 2>&1; then
@@ -312,8 +308,8 @@ fi
 index_url="${CK_RELEASE_INDEX_URL:-$INDEX_URL_DEFAULT}"
 archive_name="ck-${os}-${arch}.zip"
 data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/cortexkit"
-bin_dir="$data_dir/bin"
-destination="$bin_dir/ck"
+cmd_dir="$data_dir/cmd"
+destination="$cmd_dir/ck"
 manifest="$data_dir/installer-manifest.json"
 
 if ! temp_dir=$(mktemp -d); then
@@ -410,10 +406,10 @@ candidate_digest=$(sha256_for "$candidate")
 if [[ -f "$destination" ]] && cmp -s "$candidate" "$destination"; then
   printf 'ck already matches verified download at %s; skipping placement.\n' "$destination"
 else
-  if ! mkdir -p "$bin_dir"; then
-    refuse "placement-failed" "could not create destination directory $bin_dir"
+  if ! mkdir -p "$cmd_dir"; then
+    refuse "placement-failed" "could not create destination directory $cmd_dir"
   fi
-  if ! placement_tmp=$(mktemp "$bin_dir/.ck.XXXXXX"); then
+  if ! placement_tmp=$(mktemp "$cmd_dir/.ck.XXXXXX"); then
     refuse "placement-failed" "could not prepare destination $destination"
   fi
   if ! cp "$candidate" "$placement_tmp"; then
@@ -434,17 +430,17 @@ fi
 select_profile
 # Quote the resolved installation path, rather than assuming the default data
 # home. Shell metacharacters in a user-selected directory must remain literal.
-profile_bin_dir=${bin_dir//\\/\\\\}
-profile_bin_dir=${profile_bin_dir//\"/\\\"}
-profile_bin_dir=${profile_bin_dir//\$/\\\$}
+profile_cmd_dir=${cmd_dir//\\/\\\\}
+profile_cmd_dir=${profile_cmd_dir//\"/\\\"}
+profile_cmd_dir=${profile_cmd_dir//\$/\\\$}
 if [[ "$profile_kind" == "fish" ]]; then
   path_block="$PATH_BLOCK_BEGIN
-set -gx PATH \"$profile_bin_dir\" \$PATH
+set -gx PATH \"$profile_cmd_dir\" \$PATH
 $PATH_BLOCK_END"
 else
-  profile_bin_dir=${profile_bin_dir//\`/\\\`}
+  profile_cmd_dir=${profile_cmd_dir//\`/\\\`}
   path_block="$PATH_BLOCK_BEGIN
-export PATH=\"$profile_bin_dir:\$PATH\"
+export PATH=\"$profile_cmd_dir:\$PATH\"
 $PATH_BLOCK_END"
 fi
 ensure_profile_path "$profile_path" "$path_block"

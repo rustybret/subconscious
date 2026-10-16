@@ -11,8 +11,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
+    call_mode::CallMode,
     manifest::{CapabilityDeclarations, ProviderRole},
-    scope::{ScopeEnded, ScopeRecord, ScopeRecordResult, ScopeStamp, ScopeStatus},
+    scope::{
+        ScopeEnd, ScopeEndResult, ScopeEnded, ScopeRecord, ScopeRecordResult, ScopeStamp,
+        ScopeStatus,
+    },
     BindIdentity, Principal, RouteCloseReason, RouteTarget,
 };
 
@@ -74,13 +78,14 @@ pub enum ModuleControlRequest {
         /// unattested rather than as trusted-by-default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         principal: Option<Principal>,
-        /// Consumer-declared reverse-request capabilities for the route. This is
-        /// an unverified declaration, not a privilege grant; if a consumer
-        /// over-declares, providers may still send reverse requests that later
-        /// time out or deny. Providers must treat an absent field as no
-        /// reverse-request capability. The vocabulary is open strings; known MCP
-        /// method-family values today are "elicitation", "sampling", and
-        /// "roots".
+        /// Consumer-declared reverse-request families and provider-contract
+        /// capabilities for the route. For example, `content/v1` declares that
+        /// the consumer understands the tool-provider content result format.
+        /// This remains an unverified declaration that grants nothing; a provider
+        /// that over-trusts it may still send reverse requests that later time
+        /// out or deny. Providers must treat an absent field as no declared
+        /// capability. The vocabulary is open strings; known MCP method-family
+        /// values today are "elicitation", "sampling", and "roots".
         #[serde(default, skip_serializing_if = "Option::is_none")]
         consumer_capabilities: Option<Vec<String>>,
         /// The versions of provider roles the consumer speaks on this route,
@@ -107,6 +112,12 @@ pub enum ModuleControlRequest {
         /// that predates scopes. A provider that needs a scope refuses the bind.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scope: Option<ScopeStamp>,
+        /// The daemon-derived mode, sent only to targets declaring
+        /// [`crate::call_mode::CALL_MODES_CAPABILITY`]. If absent, readers derive
+        /// the mode from `scope` with [`crate::call_mode::derive_call_mode`].
+        /// Providers must refuse an unknown mode.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_mode: Option<CallMode>,
     },
     #[serde(rename = "health.check")]
     HealthCheck {},
@@ -190,6 +201,16 @@ pub enum ModuleControlRequestFromModule {
         generation: u64,
         scopes: Vec<ScopeRecord>,
     },
+    /// Change selected scopes after the daemon accepts a full `scope.sync` from
+    /// this connection. Shares the full sync's generation sequence. Unlike a
+    /// full sync, omitting a scope does not end it; expiry processing still runs.
+    /// A whole-call refusal is an `Error` frame and changes nothing.
+    #[serde(rename = "scope.apply")]
+    ScopeApply {
+        generation: u64,
+        upsert: Vec<ScopeRecord>,
+        end: Vec<ScopeEnd>,
+    },
     /// Read one scope's current state.
     #[serde(rename = "scope.describe")]
     ScopeDescribe {
@@ -226,6 +247,14 @@ pub enum ModuleControlResponseToModule {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         ended: Vec<ScopeEnded>,
     },
+    #[serde(rename = "scope.apply")]
+    ScopeApply {
+        generation: u64,
+        results: Vec<ScopeRecordResult>,
+        end_results: Vec<ScopeEndResult>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        ended: Vec<ScopeEnded>,
+    },
     #[serde(rename = "scope.describe")]
     ScopeDescribe {
         status: ScopeStatus,
@@ -241,6 +270,61 @@ pub enum ModuleControlResponseToModule {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scope: Option<ScopeStamp>,
     },
+}
+
+/// A module's channel-0 request to confirm one in-flight write with the person.
+///
+/// This standalone body keeps the existing exhaustive module-control enums
+/// unchanged. The daemon validates the summary and the asking connection's
+/// permission before showing a prompt; constructing a request grants nothing.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperatorConfirmRequest {
+    op: OperatorConfirmOp,
+    pub summary: String,
+    /// The caller's route channel as seen on the asking module's connection.
+    pub route_channel: u16,
+    /// The epoch of that route on the asking module's connection.
+    pub route_epoch: u32,
+}
+
+impl OperatorConfirmRequest {
+    pub fn new(summary: impl Into<String>, route_channel: u16, route_epoch: u32) -> Self {
+        Self {
+            op: OperatorConfirmOp::Confirm,
+            summary: summary.into(),
+            route_channel,
+            route_epoch,
+        }
+    }
+}
+
+/// A successful channel-0 reply to an [`OperatorConfirmRequest`].
+///
+/// Only `outcome: "confirmed"` confirms the write. Refusals use [`crate::ErrorBody`]
+/// instead. Readers must not treat an unknown outcome as confirmation.
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OperatorConfirmReply {
+    op: OperatorConfirmOp,
+    pub outcome: String,
+}
+
+impl OperatorConfirmReply {
+    pub fn confirmed() -> Self {
+        Self {
+            op: OperatorConfirmOp::Confirm,
+            outcome: "confirmed".to_string(),
+        }
+    }
+}
+
+// A required, single-valued field both emits the op and refuses a missing or
+// different op when decoding, without exposing a caller-editable tag.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+enum OperatorConfirmOp {
+    #[serde(rename = "operator.confirm")]
+    Confirm,
 }
 
 impl From<HealthReport> for ModuleControlResponse {
@@ -488,6 +572,7 @@ mod tests {
             role_versions,
             admission_facts: None,
             scope: None,
+            call_mode: None,
         };
         let absent = serde_json::to_value(bind(None)).unwrap();
         assert!(absent.get("role_versions").is_none(), "{absent}");

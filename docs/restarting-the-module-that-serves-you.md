@@ -27,7 +27,7 @@ What can improve is how the error reads, not whether it happens.
 This is the part that costs real work if you get it wrong.
 
 A restart drains for a bounded window and then tears down regardless of whether
-in-flight requests finished (`crates/subc-core/src/supervise.rs`, in
+in-flight requests finished (`crates/subc-daemon/src/supervise.rs`, in
 `begin_forwarding_drain_with` — the quiescence result is consumed only by a
 `warn!`; route release and GOODBYE emission run unconditionally afterwards). So
 a command that was in flight when the route died **may have executed
@@ -56,7 +56,7 @@ The teardown is scoped to the draining module's endpoint
 (`release_module_endpoint_routes`), so restarting a module that does *not* serve
 your session is uneventful.
 
-Verified as a control: a `stop claustrum && ck-auth import && start claustrum &&
+Verified as a control: a `stop claustrum && ck auth import && start claustrum &&
 health` chain run from an aft-served session returned the complete buffer —
 both ack tables, the import line, and the trailing health read — with no
 transport error. Same operator, same wrapper, same daemon, different module.

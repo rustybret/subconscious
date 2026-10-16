@@ -748,10 +748,10 @@ fn insert_value(document: &mut Value, dotted_key: &str, desired: Value) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
 
-    fn fixture_path(name: &str) -> TestTempDir {
-        TestTempDir::new(name)
+    fn fixture_path(name: &str) -> ScratchDir {
+        ScratchDir::new(name)
     }
 
     #[test]
@@ -1090,6 +1090,21 @@ mod tests {
             fs::read_to_string(&config).expect("read unchanged"),
             original
         );
+    }
+
+    #[test]
+    fn pending_privileged_operator_prompt_requires_restart_only_on_a_live_host() {
+        let keys = [
+            "privileged_operator_prompt",
+            "modules.example.enabled",
+            "privileged_operator_prompt",
+        ];
+        assert_eq!(
+            restart_required_from_pending_keys(true, keys),
+            ["privileged_operator_prompt"]
+        );
+        assert!(restart_required_from_pending_keys(false, keys).is_empty());
+        assert!(restart_required_from_pending_keys(true, ["modules.example.enabled"]).is_empty());
     }
 
     #[test]

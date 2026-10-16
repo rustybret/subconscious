@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use cortexkit_test_support::ScratchDir;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fs, io,
@@ -12,24 +13,23 @@ use std::{
     },
     time::Duration,
 };
-use subc_test_support::TestTempDir;
 
 use serde_json::{json, Value};
 use subc_client_rs::{
-    async_trait, serve_with_handle, BindDecision, CallError, CallOptions, CatalogUpdateError,
-    CloseRouteOptions, ConsumerIdentity, ConsumerOptions, HandlerOutcome, ModuleHandle,
-    ModuleHandler, OutcomeUnknownCause, PolicyResolveError, PolicyResolver, PolicyResolverConfig,
-    PolicyVerdict, ProjectRef, RequestCtx, RetryBackoff, ReverseRequestRegistrationError,
-    RouteBindRequest, RouteCloseDisposition, RouteCloseReason, RouteEndReason, RouteHandle,
-    ScopeCallError, ScopeDescribeReply, ScopeSelector, SubcConsumer, SubcModuleError, Subject,
-    SubscribeOptions,
+    async_trait, serve_with_handle, BindDecision, CallError, CallMode, CallOptions,
+    CatalogUpdateError, CloseRouteOptions, ConsumerIdentity, ConsumerOptions, HandlerOutcome,
+    ModuleHandle, ModuleHandler, OutcomeUnknownCause, PolicyResolveError, PolicyResolver,
+    PolicyResolverConfig, PolicyVerdict, ProjectRef, RequestCtx, RetryBackoff,
+    ReverseRequestRegistrationError, ReverseRequestRegistry, RouteBindRequest,
+    RouteCloseDisposition, RouteCloseReason, RouteEndReason, RouteHandle, ScopeCallError,
+    ScopeDescribeReply, ScopeSelector, SubcConsumer, SubcModuleError, Subject, SubscribeOptions,
 };
 use subc_control::{ClientControlRequest, ClientControlResponse, PollKind};
 use subc_protocol::{
     manifest::{
-        CapabilityDeclarations, CapabilityNeed, CapabilityRequirement, Concurrency, ExecutionMode,
-        IdentityScope, ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole,
-        Tool,
+        CapabilityDeclarations, CapabilityNeed, CapabilityRequirement, Concurrency,
+        EventDeclaration, ExecutionMode, IdentityScope, ManagementOperation,
+        ManagementOperationKind, ModuleManifest, ProviderRole, Tool,
     },
     scope::{ScopeKind, ScopeStamp, ScopeStatus},
     session::HealthStatus,
@@ -52,6 +52,106 @@ const CONSUMER_MODULE_B: &str = "subc-client-rs-consumer-b";
 const CATALOG_FAKE_AFT_MODULE_ID: &str = "subc-client-rs-catalog-fake-aft";
 const PUSH_MODULE_ID: &str = "subc-client-rs-push";
 const POLICY_MODULE_ID: &str = "subc-client-rs-policy-resolver";
+
+#[test]
+fn route_option_legacy_struct_literals_and_default_updates_still_compile() {
+    let _full_call = CallOptions {
+        timeout: Duration::from_secs(30),
+        priority: Priority::Interactive,
+        admission_class: subc_protocol::AdmissionClass::Normal,
+        route_retry: RetryBackoff::default(),
+        route_retry_deadline: Duration::from_secs(90),
+        consumer_identity: None,
+        reverse_requests: ReverseRequestRegistry::new(),
+        role_versions: None,
+    };
+    let _full_close = CloseRouteOptions {
+        drain: false,
+        drain_timeout: Duration::from_secs(30),
+        consumer_identity: None,
+        reverse_requests: ReverseRequestRegistry::new(),
+        role_versions: None,
+    };
+    let _call_update = CallOptions {
+        timeout: Duration::from_secs(5),
+        ..CallOptions::default()
+    };
+    let _close_update = CloseRouteOptions {
+        drain: true,
+        ..CloseRouteOptions::default()
+    };
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declared_consumer_capabilities_reach_provider_bind_on_real_daemon() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-consumer-capabilities");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let manifest = inline_module_manifest("subc-client-rs-capability-provider", &["echo"]);
+    let handler = ConsumerCapabilitiesRecordingHandler::default();
+    let (_module, serving) =
+        spawn_inline_module_with_handler(&daemon.connection_file, manifest, handler.clone()).await;
+
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let reverse_requests = ReverseRequestRegistry::new();
+    reverse_requests
+        .on_request("elicitation", |_body, _ctx| async { Vec::new() })
+        .unwrap();
+    let opts = CallOptions {
+        reverse_requests,
+        ..fast_call_options()
+    }
+    .with_consumer_capability("content/v1")
+    .unwrap()
+    .with_consumer_capability("elicitation")
+    .unwrap();
+    consumer
+        .open_route(
+            tool_target("subc-client-rs-capability-provider"),
+            BindIdentity::new(PathBuf::from("/tmp/project"), "tests", "capabilities"),
+            opts,
+        )
+        .await
+        .unwrap();
+
+    {
+        let binds = handler
+            .binds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            binds.as_slice(),
+            &[Some(vec![
+                "content/v1".to_string(),
+                "elicitation".to_string()
+            ])],
+            "the real provider bind must receive the merged, sorted, unique declaration list"
+        );
+    }
+    serving.abort();
+    let _ = serving.await;
+    daemon.kill_and_wait();
+}
 
 struct LiveDaemon {
     child: Child,
@@ -96,6 +196,26 @@ struct EchoModuleHandler;
 impl ModuleHandler for EchoModuleHandler {
     async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
         HandlerOutcome::Response(body)
+    }
+}
+
+#[derive(Clone, Default)]
+struct ConsumerCapabilitiesRecordingHandler {
+    binds: Arc<Mutex<Vec<Option<Vec<String>>>>>,
+}
+
+#[async_trait]
+impl ModuleHandler for ConsumerCapabilitiesRecordingHandler {
+    async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        HandlerOutcome::Response(body)
+    }
+
+    async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
+        self.binds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(request.consumer_capabilities.clone());
+        BindDecision::accept()
     }
 }
 
@@ -328,17 +448,87 @@ impl ModuleHandler for PolicyModuleHandler {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subc_consumer_catalog_list_reads_declared_events_from_real_daemon() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
+    );
+    let temp_dir = unique_temp_dir("subc-client-rs-catalog-events");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+
+    let events = vec![
+        EventDeclaration::new("task_completed", 2)
+            .with_headers(vec!["project_id".to_string()])
+            .with_summary(Some("A task completed".to_string())),
+        EventDeclaration::new("task_failed", 1),
+    ];
+    let manifest =
+        ModuleManifest::builder("subc-client-rs-catalog-events", env!("CARGO_PKG_VERSION"))
+            .events(Some(events.clone()))
+            .build();
+    let (_handle, serving) =
+        serve_with_handle(&daemon.connection_file, manifest, EchoModuleHandler)
+            .await
+            .unwrap();
+    let module_task = tokio::spawn(serving);
+
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let catalog = consumer.catalog_list().await.unwrap();
+    let module = catalog
+        .modules
+        .iter()
+        .find(|module| module.module_id == "subc-client-rs-catalog-events")
+        .expect("catalog.list must include the event-publishing module");
+    assert_eq!(module.events.as_ref(), Some(&events));
+
+    module_task.abort();
+    let _ = module_task.await;
+    daemon.kill_and_wait();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subc_consumer_catalog_list_reads_tool_provider_without_open_routes() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let fake_aft_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "fake-aft-stub"),
-        &["build", "-p", "subc-core", "--bin", "fake-aft-stub"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "fake-aft-stub",
+            "--message-format=json",
+        ],
     );
 
     let temp_dir = unique_temp_dir("subc-client-rs-catalog-list");
@@ -387,6 +577,85 @@ async fn subc_consumer_catalog_list_reads_tool_provider_without_open_routes() {
     daemon.kill_and_wait();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subc_consumer_supervisor_list_includes_enabled_and_disabled_modules_from_real_daemon() {
+    const ENABLED_MODULE_ID: &str = "subc-client-rs-supervisor-enabled";
+    const DISABLED_MODULE_ID: &str = "subc-client-rs-supervisor-disabled";
+
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
+    );
+    let fake_aft_bin = ensure_binary(
+        &workspace,
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "fake-aft-stub",
+            "--message-format=json",
+        ],
+    );
+
+    let temp_dir = unique_temp_dir("subc-client-rs-supervisor-list");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    fs::create_dir_all(config_dir.join("cortexkit")).unwrap();
+    let mut config: Value =
+        serde_json::from_str(&fake_aft_stub_config_doc(&fake_aft_bin, ENABLED_MODULE_ID)).unwrap();
+    config["modules"][DISABLED_MODULE_ID] = json!({
+        "program": fake_aft_bin.to_string_lossy(),
+        "args": [],
+        "env": {},
+        "enabled": false,
+    });
+    fs::write(
+        config_dir.join("cortexkit").join("subc.jsonc"),
+        serde_json::to_string_pretty(&config).unwrap(),
+    )
+    .unwrap();
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    wait_for_catalog_module(&daemon.connection_file, ENABLED_MODULE_ID, START_TIMEOUT).await;
+
+    let consumer = SubcConsumer::connect(&daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let response = consumer.supervisor_list().await.unwrap();
+    assert_eq!(response.modules.len(), 2);
+
+    let enabled = response
+        .modules
+        .iter()
+        .find(|module| module.module_id == ENABLED_MODULE_ID)
+        .expect("supervisor.list must include the enabled configured module");
+    assert!(enabled.enabled);
+    assert_eq!(enabled.state, "running");
+
+    let disabled = response
+        .modules
+        .iter()
+        .find(|module| module.module_id == DISABLED_MODULE_ID)
+        .expect("supervisor.list must include the disabled configured module");
+    assert!(!disabled.enabled);
+    assert_eq!(disabled.state, "disabled");
+
+    daemon.kill_and_wait();
+}
+
 /// A route.open the daemon refuses surfaces its refusal body, `detail`
 /// included, through `CallError::route_open_refusal`. Two paths: a terminal
 /// refusal returns at once with its own body, and a retryable one that
@@ -398,8 +667,15 @@ async fn route_open_refusal_keeps_the_daemons_code_and_detail() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-route-open-refusal");
     let runtime_dir = temp_dir.join("runtime");
@@ -485,8 +761,15 @@ async fn capability_resolver_does_not_fall_back_to_module_id_equality_and_orders
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-capability-resolvers");
     let runtime_dir = temp_dir.join("runtime");
@@ -610,13 +893,27 @@ async fn clean_subc_client_rs_serves_through_real_daemon() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let module_bin = ensure_binary(
         &workspace,
-        example_path(&workspace, "echo-module"),
-        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-client-rs",
+            "--example",
+            "echo-module",
+            "--message-format=json",
+        ],
     );
 
     let temp_dir = unique_temp_dir("subc-client-rs-real-daemon");
@@ -776,16 +1073,44 @@ async fn clean_subc_client_rs_serves_through_real_daemon() {
 /// what tells the two apart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hello_carries_it() {
+    assert_supervised_launch_nonce_delivery().await;
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn windows_phase_one_supervised_module_reports_pipe_in_daemon_and_hello() {
+    // A failed pipe read may use SUBC_LAUNCH_NONCE until every Windows module
+    // reads the pipe, so successful registration alone cannot prove delivery.
+    // Require both the module's registration-message source and the daemon's
+    // per-spawn delivery record to say pipe.
+    assert_supervised_launch_nonce_delivery().await;
+}
+
+async fn assert_supervised_launch_nonce_delivery() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let module_bin = ensure_binary(
         &workspace,
-        example_path(&workspace, "echo-module"),
-        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-client-rs",
+            "--example",
+            "echo-module",
+            "--message-format=json",
+        ],
     );
 
     let temp_dir = unique_temp_dir("subc-client-rs-launch-nonce-fd");
@@ -822,7 +1147,13 @@ async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hell
 
     let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
     wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
-    let expected_source = if cfg!(unix) { "fd" } else { "env" };
+    let expected_source = if cfg!(unix) {
+        "fd"
+    } else if cfg!(windows) {
+        "pipe"
+    } else {
+        "env"
+    };
     let started = wait_for_event(&events_path, START_TIMEOUT, |event| {
         event["kind"] == "launch_nonce"
     })
@@ -847,6 +1178,11 @@ async fn a_supervised_module_reads_its_launch_nonce_from_the_descriptor_and_hell
     let modules = &response["modules"];
     assert_eq!(
         modules[0]["module_declared"]["build"]["launch_nonce_source"], expected_source,
+        "{response}"
+    );
+    #[cfg(windows)]
+    assert_eq!(
+        modules[0]["daemon_observed"]["launch_nonce_source"], "pipe",
         "{response}"
     );
     daemon.kill_and_wait();
@@ -879,8 +1215,15 @@ async fn module_handle_catalog_update_refreshes_catalog_without_dropping_open_ro
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
 
     let temp_dir = unique_temp_dir("subc-client-rs-module-handle-update");
@@ -937,8 +1280,15 @@ async fn a_registering_module_receives_the_daemons_machine_id_in_hello_ack() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
 
     let temp_dir = unique_temp_dir("subc-client-rs-machine-id");
@@ -970,12 +1320,63 @@ async fn a_registering_module_receives_the_daemons_machine_id_in_hello_ack() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn daemon_capabilities_round_trip_from_real_hello_ack() {
+    let workspace = workspace_root();
+    let daemon_bin = ensure_binary(
+        &workspace,
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
+    );
+
+    let temp_dir = unique_temp_dir("subc-client-rs-daemon-capabilities");
+    let runtime_dir = temp_dir.join("runtime");
+    let config_dir = temp_dir.join("config");
+    fs::create_dir_all(&runtime_dir).unwrap();
+    write_empty_config(&config_dir);
+
+    let mut daemon = spawn_daemon(&daemon_bin, &runtime_dir, &config_dir);
+    wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
+    let (handle, serve_task) = spawn_inline_module(
+        &daemon.connection_file,
+        inline_module_manifest("subc-client-rs-daemon-capabilities", &["a"]),
+    )
+    .await;
+
+    let capabilities = handle.daemon_capabilities();
+    assert!(
+        capabilities
+            .iter()
+            .any(|capability| capability == subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1),
+        "HELLO_ACK capabilities: {capabilities:?}"
+    );
+    assert!(handle.daemon_supports(subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1));
+    assert!(!handle.daemon_supports("not-advertised/v1"));
+
+    daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn module_handle_catalog_update_surfaces_frozen_field_rejections() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
 
     let temp_dir = unique_temp_dir("subc-client-rs-module-handle-frozen");
@@ -1006,8 +1407,15 @@ async fn module_handle_catalog_update_fails_fast_after_connection_death() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
 
     let temp_dir = unique_temp_dir("subc-client-rs-module-handle-death");
@@ -1043,13 +1451,27 @@ async fn subc_consumer_reports_outcome_unknown_mid_call_then_reopens_after_resta
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let module_bin = ensure_binary(
         &workspace,
-        example_path(&workspace, "echo-module"),
-        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-client-rs",
+            "--example",
+            "echo-module",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-consumer-midcall");
     let runtime_dir = temp_dir.join("runtime");
@@ -1151,13 +1573,27 @@ async fn subc_consumer_recovers_after_daemon_restart_and_refuses_unknown_module_
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let module_bin = ensure_binary(
         &workspace,
-        example_path(&workspace, "echo-module"),
-        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-client-rs",
+            "--example",
+            "echo-module",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-consumer-race");
     let runtime_dir = temp_dir.join("runtime");
@@ -1251,13 +1687,27 @@ async fn subc_consumer_multiplexes_targets_and_classifies_reconnect_in_flight() 
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let module_bin = ensure_binary(
         &workspace,
-        example_path(&workspace, "echo-module"),
-        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-client-rs",
+            "--example",
+            "echo-module",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-consumer-mux");
     let runtime_dir = temp_dir.join("runtime");
@@ -1384,13 +1834,27 @@ async fn subc_consumer_close_route_releases_the_route_and_reopens_fresh() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let module_bin = ensure_binary(
         &workspace,
-        example_path(&workspace, "echo-module"),
-        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-client-rs",
+            "--example",
+            "echo-module",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-close-route");
     let runtime_dir = temp_dir.join("runtime");
@@ -1477,8 +1941,15 @@ async fn subc_consumer_push_events_delivers_registered_push() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-push-delivery");
     let runtime_dir = temp_dir.join("runtime");
@@ -1531,8 +2002,15 @@ async fn subc_consumer_counts_pushes_dropped_without_receiver() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-push-drop");
     let runtime_dir = temp_dir.join("runtime");
@@ -1592,8 +2070,15 @@ async fn subc_consumer_push_events_end_when_route_closes() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-push-teardown");
     let runtime_dir = temp_dir.join("runtime");
@@ -1655,13 +2140,27 @@ async fn subc_consumer_subscribe_streaming_contract() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let module_bin = ensure_binary(
         &workspace,
-        example_path(&workspace, "echo-module"),
-        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-client-rs",
+            "--example",
+            "echo-module",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-subscribe");
     let runtime_dir = temp_dir.join("runtime");
@@ -1948,7 +2447,10 @@ fn spawn_daemon_child(daemon_bin: &Path, runtime_dir: &Path, config_dir: &Path) 
         .parent()
         .expect("runtime dir is inside the test temp tree")
         .join("data");
-    Command::new(daemon_bin)
+    // The daemon runs as `ckdev-subc`, never under the production `ck-subc`
+    // name it was built with.
+    let daemon_bin = &cortexkit_test_support::ckdev_binary(daemon_bin);
+    cortexkit_test_support::dev_command(daemon_bin)
         .env_remove(subc_protocol::SUBC_MODULE_ID_ENV)
         .env_remove(subc_protocol::SUBC_LAUNCH_NONCE_ENV)
         .env_remove(subc_client_rs::launch_nonce::LAUNCH_NONCE_FD_ENV)
@@ -2128,7 +2630,7 @@ async fn wait_for_module_route(handler: &PushModuleHandler, channel: u16) -> Rou
 
 struct PolicyHarness {
     daemon: LiveDaemon,
-    _temp_dir: TestTempDir,
+    _temp_dir: ScratchDir,
     module: ModuleHandle,
     serve_task: tokio::task::JoinHandle<Result<(), SubcModuleError>>,
     handler: PolicyModuleHandler,
@@ -2147,8 +2649,15 @@ async fn start_policy_harness(scripts: impl IntoIterator<Item = PolicyScript>) -
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-policy-resolver");
     let runtime_dir = temp_dir.join("runtime");
@@ -2189,7 +2698,7 @@ fn policy_resolver(consumer: SubcConsumer, hard_timeout: Duration) -> PolicyReso
     )
 }
 
-fn policy_project_root() -> (TestTempDir, String) {
+fn policy_project_root() -> (ScratchDir, String) {
     let root = unique_temp_dir("subc-client-rs-policy-project");
     let path = root.to_string_lossy().into_owned();
     (root, path)
@@ -2446,27 +2955,64 @@ fn goodbye_frame(channel: u16, epoch: u32, corr: u64) -> Frame {
     .unwrap()
 }
 
-fn ensure_binary(workspace: &Path, path: PathBuf, cargo_args: &[&str]) -> PathBuf {
-    static BUILD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let _guard = BUILD_LOCK
-        .get_or_init(|| Mutex::new(()))
+fn ensure_binary(workspace: &Path, cargo_args: &[&str]) -> PathBuf {
+    type BuildResults = HashMap<Vec<String>, Result<PathBuf, String>>;
+    static BUILD_RESULTS: OnceLock<Mutex<BuildResults>> = OnceLock::new();
+    let mut results = BUILD_RESULTS
+        .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let output = Command::new("cargo")
-        .args(cargo_args)
-        .current_dir(workspace)
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run cargo {cargo_args:?}: {error}"));
-    if !output.status.success() {
-        panic!(
-            "cargo {cargo_args:?} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    assert!(path.exists(), "expected binary at {}", path.display());
-    path
+    let key = cargo_args.iter().map(|arg| (*arg).to_owned()).collect();
+    let result = results
+        .entry(key)
+        .or_insert_with(|| {
+            let output = Command::new("cargo")
+            .args(cargo_args)
+            .current_dir(workspace)
+            .output()
+            .map_err(|error| format!("failed to run cargo {cargo_args:?}: {error}"))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "cargo {cargo_args:?} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            // Take the executable of the target the call named (`--bin X` or
+            // `--example X`), not merely the first executable cargo reports,
+            // so a build that also produces another binary can't hand back the
+            // wrong one.
+            let wanted = cargo_args
+                .windows(2)
+                .find(|pair| pair[0] == "--bin" || pair[0] == "--example")
+                .map(|pair| pair[1]);
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find_map(|message| {
+                    (message["reason"] == "compiler-artifact"
+                        && wanted.is_none_or(|name| message["target"]["name"] == name))
+                        .then(|| message["executable"].as_str().map(PathBuf::from))
+                        .flatten()
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "Cargo did not report an executable for {cargo_args:?}\nstdout:\n{}\nstderr:\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                })
+        })
+        .clone();
+    drop(results);
+    let artifact = result.unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        artifact.exists(),
+        "Cargo-reported executable does not exist: {}",
+        artifact.display()
+    );
+    artifact
 }
 
 fn workspace_root() -> PathBuf {
@@ -2477,23 +3023,8 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn binary_path(workspace: &Path, name: &str) -> PathBuf {
-    workspace
-        .join("target")
-        .join("debug")
-        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
-}
-
-fn example_path(workspace: &Path, name: &str) -> PathBuf {
-    workspace
-        .join("target")
-        .join("debug")
-        .join("examples")
-        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
-}
-
-fn unique_temp_dir(name: &str) -> TestTempDir {
-    TestTempDir::new(name)
+fn unique_temp_dir(name: &str) -> ScratchDir {
+    ScratchDir::new(name)
 }
 
 /// Issue #35: the #31 push family must be OBSERVABLE by a Rust consumer. The
@@ -2506,8 +3037,15 @@ async fn subc_consumer_control_pushes_deliver_route_closed_on_module_death() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-control-push");
     let runtime_dir = temp_dir.join("runtime");
@@ -2567,8 +3105,15 @@ async fn subc_consumer_counts_control_pushes_dropped_without_receiver() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-control-push-drop");
     let runtime_dir = temp_dir.join("runtime");
@@ -2629,8 +3174,15 @@ async fn subc_consumer_push_burst_counts_overflow_and_keeps_the_subscription() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-push-burst");
     let runtime_dir = temp_dir.join("runtime");
@@ -2762,8 +3314,15 @@ async fn subc_consumer_retries_once_in_place_on_stale_route_epoch() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-stale-epoch");
     let runtime_dir = temp_dir.join("runtime");
@@ -3259,8 +3818,15 @@ async fn serve_returns_when_the_daemon_connection_closes_rather_than_reconnectin
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
 
     let temp_dir = unique_temp_dir("subc-client-rs-serve-returns-on-eof");
@@ -3326,7 +3892,7 @@ const SCOPE_SYNC_CORR_BASE: u64 = 1_000_000;
 
 struct ScopeHarness {
     daemon: LiveDaemon,
-    _temp_dir: TestTempDir,
+    _temp_dir: ScratchDir,
     sync_path: PathBuf,
     owner_events: PathBuf,
     provider_events: PathBuf,
@@ -3394,11 +3960,28 @@ async fn start_scope_harness() -> ScopeHarness {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
-    let stub_bin = binary_path(&workspace, "fake-aft-stub");
-    assert!(stub_bin.exists(), "expected {}", stub_bin.display());
+    let stub_bin = ensure_binary(
+        &workspace,
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "fake-aft-stub",
+            "--message-format=json",
+        ],
+    );
 
     let temp_dir = unique_temp_dir("subc-client-rs-scopes");
     let runtime_dir = temp_dir.join("runtime");
@@ -3499,13 +4082,13 @@ fn scope_record(scope_ref: &str, scope_epoch: u64) -> Value {
 }
 
 fn scope_selector(scope_ref: &str, scope_epoch: u64) -> ScopeSelector {
-    ScopeSelector {
-        owner: Principal::Reserved {
+    ScopeSelector::new(
+        Principal::Reserved {
             module_id: SCOPE_OWNER.to_string(),
         },
-        scope_ref: scope_ref.to_string(),
-        scope_epoch: Some(scope_epoch),
-    }
+        scope_ref.to_string(),
+        Some(scope_epoch),
+    )
 }
 
 fn refusal_code(err: &CallError) -> Option<&str> {
@@ -3984,17 +4567,31 @@ async fn start_drain_harness(
     name: &str,
     extra_env: &[(&str, &str)],
     module_settings: Value,
-) -> (TestTempDir, LiveDaemon, PathBuf) {
+) -> (ScratchDir, LiveDaemon, PathBuf) {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let module_bin = ensure_binary(
         &workspace,
-        example_path(&workspace, "echo-module"),
-        &["build", "-p", "subc-client-rs", "--example", "echo-module"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-client-rs",
+            "--example",
+            "echo-module",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir(name);
     let runtime_dir = temp_dir.join("runtime");
@@ -4274,10 +4871,12 @@ const SDK_SCOPE_READER: &str = "subc-client-rs-sdk-scope-reader";
 
 struct ScopeOwnerRun {
     daemon: LiveDaemon,
-    _temp_dir: TestTempDir,
+    _temp_dir: ScratchDir,
     /// One entry per script step, in order: `{"ok": reply}`,
     /// `{"refused": {"code", "message"}}`, or `{"other": error}`.
     results: Vec<Value>,
+    /// Requests as executed by the example, including resolved absolute deadlines.
+    requests: Vec<Value>,
 }
 
 impl ScopeOwnerRun {
@@ -4316,13 +4915,27 @@ async fn run_scope_owner_with_config(steps: Value, extra_config: Value) -> Scope
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let owner_bin = ensure_binary(
         &workspace,
-        example_path(&workspace, "scope-owner"),
-        &["build", "-p", "subc-client-rs", "--example", "scope-owner"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-client-rs",
+            "--example",
+            "scope-owner",
+            "--message-format=json",
+        ],
     );
 
     let temp_dir = unique_temp_dir("subc-client-rs-sdk-scopes");
@@ -4368,6 +4981,7 @@ async fn run_scope_owner_with_config(steps: Value, extra_config: Value) -> Scope
     wait_for_connection_file(&daemon.connection_file, START_TIMEOUT).await;
     wait_for_event(&results_path, START_TIMEOUT, |event| event["done"] == true).await;
     let mut results = vec![Value::Null; steps.as_array().unwrap().len()];
+    let mut requests = vec![Value::Null; results.len()];
     for event in read_events(&results_path) {
         if let Some(step) = event["step"].as_u64() {
             let slot = &mut results[usize::try_from(step).unwrap()];
@@ -4375,6 +4989,7 @@ async fn run_scope_owner_with_config(steps: Value, extra_config: Value) -> Scope
             // owner would run it again under a new connection.
             if slot.is_null() {
                 *slot = event["result"].clone();
+                requests[usize::try_from(step).unwrap()] = event["request"].clone();
             }
         }
     }
@@ -4382,6 +4997,7 @@ async fn run_scope_owner_with_config(steps: Value, extra_config: Value) -> Scope
         daemon,
         _temp_dir: temp_dir,
         results,
+        requests,
     }
 }
 
@@ -4535,6 +5151,7 @@ fn a_route_bind_request_is_built_through_its_constructor_and_setters() {
     assert_eq!(bare.role_versions, None);
     assert_eq!(bare.admission_facts, None);
     assert_eq!(bare.scope, None);
+    assert_eq!(bare.call_mode, CallMode::Classic);
 
     let stamp: ScopeStamp = serde_json::from_value(json!({
         "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
@@ -4554,7 +5171,8 @@ fn a_route_bind_request_is_built_through_its_constructor_and_setters() {
         .with_consumer_capabilities(vec!["elicitation".to_string()])
         .with_role_versions(role_versions.clone())
         .with_admission_facts(json!({ "schema": 1 }))
-        .with_scope(stamp.clone());
+        .with_scope(stamp.clone())
+        .with_call_mode(CallMode::Flow);
     assert_eq!(full.principal, Some(principal));
     assert_eq!(
         full.consumer_capabilities,
@@ -4563,6 +5181,7 @@ fn a_route_bind_request_is_built_through_its_constructor_and_setters() {
     assert_eq!(full.role_versions, Some(role_versions));
     assert_eq!(full.admission_facts, Some(json!({ "schema": 1 })));
     assert_eq!(full.scope, Some(stamp));
+    assert_eq!(full.call_mode, CallMode::Flow);
 }
 
 /// A detached handle belongs to no connection: every operation that would
@@ -4573,8 +5192,15 @@ async fn every_operation_on_a_detached_route_handle_fails_as_a_stale_route() {
     let workspace = workspace_root();
     let daemon_bin = ensure_binary(
         &workspace,
-        binary_path(&workspace, "ck-subc"),
-        &["build", "-p", "subc-core", "--bins"],
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "subc-core",
+            "--bin",
+            "ck-subc",
+            "--message-format=json",
+        ],
     );
     let temp_dir = unique_temp_dir("subc-client-rs-detached-handle");
     let runtime_dir = temp_dir.join("runtime");
@@ -4719,6 +5345,143 @@ impl ModuleHandler for ScopeRecordingHandler {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_applied_run_scope_expires_and_closes_its_route_without_an_owner_resync() {
+    let mut run = run_scope_owner_with_config(
+        json!([
+            sync_step(1, json!([])),
+            {
+                "op": "apply",
+                "generation": 2,
+                "upsert": [{
+                    "ref": "run-a",
+                    "scope_epoch": 1,
+                    "kind": "ephemeral",
+                    "expires_in_ms": 15000,
+                    "carriers": [{ "principal": { "kind": "direct" } }],
+                    "attributes": { "agent_id": "agent-7", "run_id": "run-7" }
+                }],
+                "end": []
+            }
+        ]),
+        json!({ "scope_authority_owners": [SDK_SCOPE_OWNER] }),
+    )
+    .await;
+    assert_eq!(run.results[0]["ok"]["generation"], 1, "{:?}", run.results);
+    assert_eq!(run.results[1]["ok"]["generation"], 2, "{:?}", run.results);
+    assert_eq!(
+        run.results[1]["ok"]["results"][0]["outcome"], "created",
+        "{:?}",
+        run.results
+    );
+    let sent_record = &run.requests[1]["upsert"][0];
+    assert!(sent_record.get("expires_in_ms").is_none());
+    let expires_at_ms = sent_record["expires_at_ms"]
+        .as_u64()
+        .expect("the example records the absolute deadline it sent");
+    let closes_by_ms = expires_at_ms + 2000;
+
+    // Registration happens after the owner's last call. The run gate reads
+    // the provider's advertised capability when the consumer opens the route.
+    let (_provider, serve_task) = spawn_inline_module(
+        &run.daemon.connection_file,
+        inline_capability_module_manifest("run-provider", Some("agent-run-scopes/v1")),
+    )
+    .await;
+    wait_for_catalog_module(&run.daemon.connection_file, "run-provider", START_TIMEOUT).await;
+    let consumer = SubcConsumer::connect(&run.daemon.connection_file, fast_consumer_options())
+        .await
+        .unwrap();
+    let mut pushes = consumer.control_pushes(16);
+    let identity = consumer_identity("run-expiry");
+    assert!(
+        expires_at_ms.saturating_sub(unix_ms_now()) >= 2000,
+        "harness fault: fewer than 2000 ms remain before the recorded expiry at route.open"
+    );
+    let handle = consumer
+        .open_route_scoped(
+            tool_target("run-provider"),
+            identity,
+            ScopeSelector::new(sdk_scope_owner(), "run-a".to_string(), Some(1)),
+            fast_call_options(),
+        )
+        .await
+        .expect("a live run scope admits an opted-in provider");
+
+    // Use the recorded wall deadline, not EVENT_TIMEOUT: an early close or
+    // an expiry loop taking more than two seconds after the deadline is wrong.
+    let closed = loop {
+        assert!(
+            unix_ms_now() <= closes_by_ms,
+            "route.closed missed the expiry bound"
+        );
+        let push = timeout(
+            Duration::from_millis(closes_by_ms.saturating_sub(unix_ms_now())),
+            pushes.recv(),
+        )
+        .await
+        .expect("route.closed must arrive by expires_at_ms + 2000")
+        .expect("control push receiver stays open");
+        if push.op == "route.closed" {
+            let received_at_ms = unix_ms_now();
+            assert!(
+                received_at_ms >= expires_at_ms,
+                "route.closed arrived before expiry"
+            );
+            assert!(
+                received_at_ms <= closes_by_ms,
+                "route.closed missed the expiry bound"
+            );
+            break push;
+        }
+    };
+    assert_eq!(
+        closed.body["channels"],
+        json!([handle.channel]),
+        "{}",
+        closed.body
+    );
+    assert_eq!(closed.body["reason"], "scope_ended", "{}", closed.body);
+    assert_eq!(
+        closed.route_close_reason().unwrap().disposition(),
+        RouteCloseDisposition::MustNotReopen
+    );
+
+    // The channel GOODBYE and control push are separate frames. Require both
+    // effects inside the same wall-time bound, even if the push arrives first.
+    loop {
+        assert!(
+            unix_ms_now() <= closes_by_ms,
+            "the expired route handle is still live"
+        );
+        let result = timeout(
+            Duration::from_millis(closes_by_ms.saturating_sub(unix_ms_now())),
+            consumer.request(
+                &handle,
+                br#"{"tool":"capability.resolve","arguments":{}}"#.to_vec(),
+                fast_call_options(),
+            ),
+        )
+        .await
+        .expect("the route handle must become stale by expires_at_ms + 2000");
+        if matches!(result, Err(CallError::StaleRouteHandle(_))) {
+            assert!(
+                unix_ms_now() <= closes_by_ms,
+                "GOODBYE missed the expiry bound"
+            );
+            break;
+        }
+        sleep(Duration::from_millis(
+            20.min(closes_by_ms.saturating_sub(unix_ms_now())),
+        ))
+        .await;
+    }
+
+    consumer.close().await;
+    run.daemon.kill_and_wait();
+    assert!(serve_task.await.unwrap().is_ok());
+}
+
 /// A module served through the SDK sees the daemon's scope stamp in `on_bind`,
 /// exactly as the daemon stamped it, and sees none on an unscoped route.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4780,11 +5543,7 @@ async fn a_served_modules_on_bind_receives_the_daemons_scope_stamp() {
         .open_route_scoped(
             target.clone(),
             identity("scoped"),
-            ScopeSelector {
-                owner: sdk_scope_owner(),
-                scope_ref: "session-a".to_string(),
-                scope_epoch: Some(3),
-            },
+            ScopeSelector::new(sdk_scope_owner(), "session-a".to_string(), Some(3)),
             fast_call_options(),
         )
         .await
@@ -4857,3 +5616,12 @@ async fn describing_an_unknown_ref_answers_not_live_with_the_owners_state() {
     run.daemon.kill_and_wait();
     assert!(serve_task.await.unwrap().is_ok());
 }
+
+// These tests share the wire helpers but have a separate, feature-enabled daemon.
+#[path = "real_daemon/operator_confirm.rs"]
+mod operator_confirm;
+
+mod activity;
+
+#[path = "real_daemon/call_modes.rs"]
+mod call_modes;

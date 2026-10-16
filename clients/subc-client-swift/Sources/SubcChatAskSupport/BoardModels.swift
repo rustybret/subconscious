@@ -529,12 +529,53 @@ public struct BoardLaneItem: Codable, Equatable {
     /// `pending`, `active`, `done`, `blocked`; open for the producer to extend.
     public var state: String
     public var wait: BoardLaneWait?
+    /// When the owner expects the item done, in Unix milliseconds.
+    public var etaMs: Int64?
+    /// When the item last changed state, in Unix milliseconds.
+    public var changedAtMs: Int64?
+    /// What the owner does next on this item, at most 300 characters.
+    public var followUp: String?
+    /// A reference to the owner's note behind this item.
+    public var noteRef: String?
 
-    public init(id: String, text: String, state: String, wait: BoardLaneWait? = nil) {
+    public init(
+        id: String, text: String, state: String, wait: BoardLaneWait? = nil,
+        etaMs: Int64? = nil, changedAtMs: Int64? = nil, followUp: String? = nil, noteRef: String? = nil
+    ) {
         self.id = id
         self.text = text
         self.state = state
         self.wait = wait
+        self.etaMs = etaMs
+        self.changedAtMs = changedAtMs
+        self.followUp = followUp
+        self.noteRef = noteRef
+    }
+
+    // Lane elements arrive snake_case on the wire, and camelCase after a
+    // consumer's key normalization, so each key decodes in either spelling.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: AnyCodingKey.self)
+        id = try c.either("id")
+        text = try c.either("text")
+        state = try c.either("state")
+        wait = try c.eitherIfPresent("wait")
+        etaMs = try c.eitherIfPresent("etaMs")
+        changedAtMs = try c.eitherIfPresent("changedAtMs")
+        followUp = try c.eitherIfPresent("followUp")
+        noteRef = try c.eitherIfPresent("noteRef")
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: AnyCodingKey.self)
+        try c.encode(id, forKey: .named("id"))
+        try c.encode(text, forKey: .named("text"))
+        try c.encode(state, forKey: .named("state"))
+        try c.encodeIfPresent(wait, forKey: .named("wait"))
+        try c.encodeIfPresent(etaMs, forKey: .named("etaMs"))
+        try c.encodeIfPresent(changedAtMs, forKey: .named("changedAtMs"))
+        try c.encodeIfPresent(followUp, forKey: .named("followUp"))
+        try c.encodeIfPresent(noteRef, forKey: .named("noteRef"))
     }
 }
 
@@ -546,6 +587,11 @@ public struct BoardLaneWait: Codable, Equatable {
     public var ref: String?
     public var refState: String?
     public var refTerminalAtMs: Int64?
+    /// The board owner's most recent idle transition, repeated on each wait and
+    /// absent when the owner has no turn anchor yet. A held board ages its
+    /// `rotten` verdict against it: a terminal reference is rotten once it has
+    /// been terminal for over an hour and the owner has gone idle since.
+    public var lastIdleTransitionMs: Int64?
     public var rotten: Bool?
     public var sinceMs: Int64
     public var agentId: String?
@@ -555,13 +601,15 @@ public struct BoardLaneWait: Codable, Equatable {
 
     public init(
         on: String, ref: String? = nil, refState: String? = nil, refTerminalAtMs: Int64? = nil,
-        rotten: Bool? = nil, sinceMs: Int64, agentId: String? = nil, displayName: String? = nil,
-        sender: String? = nil, excerpt: String? = nil
+        lastIdleTransitionMs: Int64? = nil, rotten: Bool? = nil, sinceMs: Int64,
+        agentId: String? = nil, displayName: String? = nil, sender: String? = nil,
+        excerpt: String? = nil
     ) {
         self.on = on
         self.ref = ref
         self.refState = refState
         self.refTerminalAtMs = refTerminalAtMs
+        self.lastIdleTransitionMs = lastIdleTransitionMs
         self.rotten = rotten
         self.sinceMs = sinceMs
         self.agentId = agentId
@@ -576,6 +624,7 @@ public struct BoardLaneWait: Codable, Equatable {
         ref = try c.eitherIfPresent("ref")
         refState = try c.eitherIfPresent("refState")
         refTerminalAtMs = try c.eitherIfPresent("refTerminalAtMs")
+        lastIdleTransitionMs = try c.eitherIfPresent("lastIdleTransitionMs")
         rotten = try c.eitherIfPresent("rotten")
         sinceMs = try c.either("sinceMs")
         agentId = try c.eitherIfPresent("agentId")
@@ -590,6 +639,7 @@ public struct BoardLaneWait: Codable, Equatable {
         try c.encodeIfPresent(ref, forKey: .named("ref"))
         try c.encodeIfPresent(refState, forKey: .named("refState"))
         try c.encodeIfPresent(refTerminalAtMs, forKey: .named("refTerminalAtMs"))
+        try c.encodeIfPresent(lastIdleTransitionMs, forKey: .named("lastIdleTransitionMs"))
         try c.encodeIfPresent(rotten, forKey: .named("rotten"))
         try c.encode(sinceMs, forKey: .named("sinceMs"))
         try c.encodeIfPresent(agentId, forKey: .named("agentId"))

@@ -7,9 +7,10 @@
 //! readers hold until they do (`docs/designs/daemon-scopes.md`, sections 2, 3,
 //! 5 and 6).
 //!
-//! The table is pure state. The control handler decides who the syncing owner
-//! is and whether its connection belongs to the owner's current launch, and
-//! passes both in, so every rule below can be exercised without a socket.
+//! The table owns scope state and its injected wall clock. The control handler
+//! determines the syncing owner and whether its connection belongs to that
+//! owner's current launch, then passes both values to the table. Each rule
+//! below can therefore be tested without a socket.
 //!
 //! Route admission ([`ScopeTable::admit`]) reads the table and returns the stamp
 //! for the bind and the tag it was taken at. A sync reports each scope whose
@@ -19,15 +20,25 @@
 //! commit compares its captured tag against the published one and must never
 //! take the scope lock.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
+    sync::Arc,
+};
+
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use subc_protocol::{
+    call_mode::CALL_MODES_CAPABILITY,
     error_codes,
     manifest::CapabilityDeclarations,
     scope::{
-        ParentState, ScopeEnded, ScopeParent, ScopeRecord, ScopeRecordOutcome, ScopeRecordResult,
-        ScopeSelector, ScopeStamp, ScopeStatus, FLOW_SCOPES_CAPABILITY, MAX_CARRIER_TARGETS,
-        MAX_LIVE_SCOPES_PER_OWNER, MAX_SCOPE_ATTRIBUTE_BYTES, MAX_SCOPE_TOMBSTONES_PER_OWNER,
+        ParentState, ScopeEnd, ScopeEndOutcome, ScopeEndResult, ScopeEnded, ScopeParent,
+        ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeSelector, ScopeStamp, ScopeStatus,
+        AGENT_RUN_SCOPES_CAPABILITY, FLOW_SCOPES_CAPABILITY, MAX_CARRIER_TARGETS,
+        MAX_LIVE_SCOPES_PER_OWNER, MAX_SCOPE_ATTRIBUTE_BYTES, MAX_SCOPE_EXPIRY_AHEAD_MS,
+        MAX_SCOPE_TOMBSTONES_PER_OWNER,
     },
     Principal, RouteCloseReason,
 };
@@ -78,6 +89,14 @@ impl HelloLaunchNonces {
         self.by_connection.remove(&connection_id);
     }
 
+    /// The launch nonce this connection presented at HELLO, if any. Unlike
+    /// [`Self::presented`], this does not compare it with the module's current
+    /// launch: during a blue/green swap two launches of one module are live, and
+    /// the caller asks the supervisor whether either of them issued this nonce.
+    pub(crate) fn nonce(&self, connection_id: ConnectionId) -> Option<&str> {
+        self.by_connection.get(&connection_id).map(String::as_str)
+    }
+
     /// Whether `connection_id` presented `current`, the module's recorded
     /// spawn nonce. No recorded nonce (a module the supervisor did not spawn)
     /// is never current.
@@ -98,6 +117,20 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
+}
+
+fn bind_proof_matches(proof: &str, hash: &str) -> bool {
+    let mut decoded = [0u8; 32];
+    if proof.len() != 43 || URL_SAFE_NO_PAD.decode_slice(proof, &mut decoded) != Ok(32) {
+        return false;
+    }
+    // The stored hash is validated before entering the table. Compare digest
+    // bytes in constant time; neither the proof nor its digest enters a stamp.
+    let nibble = |b: u8| if b <= b'9' { b - b'0' } else { b - b'a' + 10 };
+    let expected: [u8; 32] = std::array::from_fn(|i| {
+        (nibble(hash.as_bytes()[2 * i]) << 4) | nibble(hash.as_bytes()[2 * i + 1])
+    });
+    bool::from(Sha256::digest(decoded).as_slice().ct_eq(&expected))
 }
 
 /// What a bind captures at admission and compares at commit: the session the
@@ -216,6 +249,7 @@ fn drain_for_change(before: &LiveScope, after: &LiveScope) -> ScopeDrain {
     if (before_attributes.delegates && !after_attributes.delegates)
         || before_attributes.agent_id != after_attributes.agent_id
         || before_attributes.flow_id != after_attributes.flow_id
+        || before_attributes.run_id != after_attributes.run_id
     {
         drain = drain.widen(ScopeDrain::All(RouteCloseReason::ScopeDelegationChanged));
     }
@@ -235,6 +269,55 @@ pub(crate) struct BoundScope {
     pub(crate) owner: String,
     pub(crate) scope_ref: String,
     pub(crate) tag: ScopeTag,
+    // Shared by pending and committed forwarding entries, so moving a bind
+    // into a route never creates an idle window.
+    _lease: Arc<ScopeBindLease>,
+}
+
+#[derive(Debug)]
+struct ScopeBindLease {
+    binds: Arc<std::sync::atomic::AtomicUsize>,
+    released: std::sync::atomic::AtomicBool,
+    presence: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl PartialEq for ScopeBindLease {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.binds, &other.binds)
+    }
+}
+
+impl Eq for ScopeBindLease {}
+
+impl Drop for ScopeBindLease {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+impl ScopeBindLease {
+    fn release(&self) {
+        if !self
+            .released
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            self.binds.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+impl BoundScope {
+    pub(crate) fn commit_presence(&self) {
+        if let Some(presence) = &self._lease.presence {
+            presence.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Data dispatch can retain binding snapshots after a route closes. Release
+    /// usage at table removal rather than waiting for those snapshots to drop.
+    pub(crate) fn release_bind(&self) {
+        self._lease.release();
+    }
 }
 
 /// An admitted scoped open: what the bind is stamped with, and the tag the
@@ -259,10 +342,9 @@ pub(crate) fn check_target_flow_support(
         return Ok(());
     }
     let supported = capabilities.is_some_and(|capabilities| {
-        capabilities
-            .provides
-            .iter()
-            .any(|capability| capability == FLOW_SCOPES_CAPABILITY)
+        capabilities.provides.iter().any(|capability| {
+            capability == FLOW_SCOPES_CAPABILITY || capability == CALL_MODES_CAPABILITY
+        })
     });
     if supported {
         return Ok(());
@@ -271,8 +353,36 @@ pub(crate) fn check_target_flow_support(
         code: error_codes::TARGET_FLOW_UNSUPPORTED,
         message: format!(
             "target module '{target_module}' does not provide capability \
-             '{FLOW_SCOPES_CAPABILITY}', required for a scope carrying flow_id"
+             '{CALL_MODES_CAPABILITY}' or '{FLOW_SCOPES_CAPABILITY}', required for a scope carrying flow_id"
         ),
+    })
+}
+
+/// A run requires `call-modes/v1` or, during migration, `agent-run-scopes/v1`.
+/// Delegating runs require `call-modes/v1`: legacy providers assumed a run never
+/// carries its agent's authority, so decoding the stamp alone is not sufficient.
+pub(crate) fn check_target_agent_run_support(
+    stamp: &ScopeStamp,
+    target_module: &str,
+    capabilities: Option<&CapabilityDeclarations>,
+) -> Result<(), ScopeAdmissionRefusal> {
+    if stamp.attributes.run_id.is_none()
+        || capabilities.is_some_and(|caps| {
+            caps.provides.iter().any(|cap| {
+                cap == CALL_MODES_CAPABILITY
+                    || (!stamp.attributes.delegates && cap == AGENT_RUN_SCOPES_CAPABILITY)
+            })
+        })
+    {
+        return Ok(());
+    }
+    Err(ScopeAdmissionRefusal {
+        code: error_codes::TARGET_AGENT_RUN_UNSUPPORTED,
+        message: if stamp.attributes.delegates {
+            format!("target module '{target_module}' does not provide capability '{CALL_MODES_CAPABILITY}', required for a run scope delegating agent authority")
+        } else {
+            format!("target module '{target_module}' does not provide capability '{CALL_MODES_CAPABILITY}' or '{AGENT_RUN_SCOPES_CAPABILITY}', required for a scope carrying run_id")
+        },
     })
 }
 
@@ -283,15 +393,39 @@ pub(crate) struct ScopeAdmissionRefusal {
     pub(crate) message: String,
 }
 
-/// An accepted sync: the reply's contents plus the tag changes to publish.
+/// The reply contents and tag changes produced by an accepted sync or apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SyncApplied {
     pub(crate) results: Vec<ScopeRecordResult>,
+    pub(crate) end_results: Vec<ScopeEndResult>,
     pub(crate) ended: Vec<ScopeEnded>,
+    pub(crate) tag_changes: Vec<ScopeTagChange>,
+    pub(crate) expired: Vec<ScopeExpired>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScopeExpired {
+    pub(crate) owner: String,
+    pub(crate) scope_ref: String,
+    pub(crate) scope_epoch: u64,
+    pub(crate) expires_at_ms: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ExpirySwept {
+    pub(crate) expired: Vec<ScopeExpired>,
     pub(crate) tag_changes: Vec<ScopeTagChange>,
 }
 
-/// A refused sync. Nothing in the table changed, sync authority included.
+/// One `scope.sync` (`end` is `None`: the records are the owner's whole set) or
+/// one `scope.apply` (`end` is `Some`: the records and ends are a delta).
+struct ScopeChange {
+    generation: u64,
+    scopes: Vec<ScopeRecord>,
+    end: Option<Vec<ScopeEnd>>,
+}
+
+/// A refused sync or apply leaves the table unchanged, including sync authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SyncRefusal {
     pub(crate) code: &'static str,
@@ -309,12 +443,14 @@ pub(crate) struct ScopeDescription {
     pub(crate) stamp: Option<ScopeStamp>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct LiveScope {
     record: ScopeRecord,
     version: u64,
     /// `None` exactly when the record has no parent.
     parent_state: Option<ParentState>,
+    binds: Arc<std::sync::atomic::AtomicUsize>,
+    presence: HashMap<ConnectionId, Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl LiveScope {
@@ -332,26 +468,29 @@ struct SyncAuthority {
     last_generation: u64,
 }
 
-/// The `(ref, scope_epoch)` pairs one owner ended in this incarnation, oldest
-/// first, bounded by [`MAX_SCOPE_TOMBSTONES_PER_OWNER`]. Evicting the oldest
-/// never refuses anything: a reader that finds nothing reads `not_live`, which
-/// after the owner has synced means the same as ended.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EndCause {
+    Expired,
+    OwnerEnded,
+}
+
+/// Ended `(ref, scope_epoch)` pairs and their causes for this daemon incarnation,
+/// oldest first, bounded by [`MAX_SCOPE_TOMBSTONES_PER_OWNER`]. Eviction never
+/// causes a refusal. Describe reports `not_live` when no live record or
+/// tombstone remains; admission refuses both ended and absent scopes.
+#[derive(Debug, Default, Clone)]
 struct Tombstones {
     order: VecDeque<(String, u64)>,
-    by_ref: HashMap<String, BTreeSet<u64>>,
+    by_ref: HashMap<String, BTreeMap<u64, EndCause>>,
 }
 
 impl Tombstones {
-    fn insert(&mut self, scope_ref: &str, scope_epoch: u64) {
-        if !self
-            .by_ref
-            .entry(scope_ref.to_string())
-            .or_default()
-            .insert(scope_epoch)
-        {
+    fn insert(&mut self, scope_ref: &str, scope_epoch: u64, cause: EndCause) {
+        let epochs = self.by_ref.entry(scope_ref.to_string()).or_default();
+        if epochs.contains_key(&scope_epoch) {
             return;
         }
+        epochs.insert(scope_epoch, cause);
         self.order.push_back((scope_ref.to_string(), scope_epoch));
         while self.order.len() > MAX_SCOPE_TOMBSTONES_PER_OWNER {
             let Some((evicted_ref, evicted_epoch)) = self.order.pop_front() else {
@@ -366,16 +505,16 @@ impl Tombstones {
         }
     }
 
-    fn contains(&self, scope_ref: &str, scope_epoch: u64) -> bool {
+    fn cause(&self, scope_ref: &str, scope_epoch: u64) -> Option<EndCause> {
         self.by_ref
             .get(scope_ref)
-            .is_some_and(|epochs| epochs.contains(&scope_epoch))
+            .and_then(|epochs| epochs.get(&scope_epoch).copied())
     }
 
     fn latest(&self, scope_ref: &str) -> Option<u64> {
         self.by_ref
             .get(scope_ref)
-            .and_then(|epochs| epochs.last().copied())
+            .and_then(|epochs| epochs.last_key_value().map(|(epoch, _)| *epoch))
     }
 
     #[cfg(test)]
@@ -384,7 +523,7 @@ impl Tombstones {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct OwnerScopes {
     authority: Option<SyncAuthority>,
     /// Whether this owner has had a sync accepted in this incarnation. Readers
@@ -396,9 +535,8 @@ struct OwnerScopes {
 }
 
 /// All scopes, per owner, for one daemon incarnation.
-#[derive(Debug)]
 pub(crate) struct ScopeTable {
-    /// Module ids whose scopes may carry `agent_id` and `delegates`. Fixed for
+    /// Module ids whose scopes may carry authority attributes. Fixed for
     /// the daemon's life: the config key is restart-required, so no live route
     /// can hold an `owner_authorized` stamp its owner has since lost.
     authority_owners: BTreeSet<String>,
@@ -406,8 +544,11 @@ pub(crate) struct ScopeTable {
     /// Source of every `version`. One counter for the whole table, so a version
     /// is never reused within an incarnation even across an epoch change.
     last_version: u64,
+    wall_clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     #[cfg(test)]
     link_lookups: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    pub(crate) idle_check_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 fn reserved_module_id(principal: &Principal) -> Option<&str> {
@@ -444,9 +585,90 @@ impl ScopeTable {
             authority_owners: authority_owners.into_iter().collect(),
             owners: HashMap::new(),
             last_version: 0,
+            wall_clock: Arc::new(crate::clock::wall_now_ms),
             #[cfg(test)]
             link_lookups: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            idle_check_hook: None,
         }
+    }
+
+    pub(crate) fn set_wall_clock(&mut self, clock: Arc<dyn Fn() -> u64 + Send + Sync>) {
+        self.wall_clock = clock;
+    }
+
+    fn expire_owner(owner: &str, state: &mut OwnerScopes, now: u64) -> Vec<ScopeExpired> {
+        let mut expired = Vec::new();
+        state.live.retain(|scope_ref, scope| {
+            let Some(deadline) = scope
+                .record
+                .expires_at_ms
+                .filter(|deadline| *deadline <= now)
+            else {
+                return true;
+            };
+            state
+                .tombstones
+                .insert(scope_ref, scope.record.scope_epoch, EndCause::Expired);
+            expired.push(ScopeExpired {
+                owner: owner.to_string(),
+                scope_ref: scope_ref.clone(),
+                scope_epoch: scope.record.scope_epoch,
+                expires_at_ms: deadline,
+            });
+            false
+        });
+        expired
+    }
+
+    /// Whether any live scope carries a deadline, which is when the expiry
+    /// loop needs to tick.
+    pub(crate) fn has_deadlines(&self) -> bool {
+        self.owners.values().any(|state| {
+            state
+                .live
+                .values()
+                .any(|scope| scope.record.expires_at_ms.is_some())
+        })
+    }
+
+    /// Wall time decides expiry; timers only prompt this operation. Authority
+    /// and generation are deliberately independent of a scope's lifetime.
+    pub(crate) fn sweep_expired(&mut self) -> ExpirySwept {
+        let now = (self.wall_clock)();
+        let mut swept = ExpirySwept::default();
+        let mut changed_owners = Vec::new();
+        for (owner, state) in &mut self.owners {
+            let before: HashMap<_, _> = state
+                .live
+                .iter()
+                .filter(|(_, scope)| {
+                    scope
+                        .record
+                        .expires_at_ms
+                        .is_some_and(|deadline| deadline <= now)
+                })
+                .map(|(scope_ref, scope)| (scope_ref.clone(), scope.tag()))
+                .collect();
+            let expired = Self::expire_owner(owner, state, now);
+            if !expired.is_empty() {
+                for scope in &expired {
+                    swept.tag_changes.push(ScopeTagChange {
+                        owner: owner.clone(),
+                        scope_ref: scope.scope_ref.clone(),
+                        before: Some(before[&scope.scope_ref]),
+                        after: None,
+                        drain: ScopeDrain::All(RouteCloseReason::ScopeEnded),
+                    });
+                }
+                changed_owners.push(owner.clone());
+                swept.expired.extend(expired);
+            }
+        }
+        for owner in changed_owners {
+            self.refresh_links_to(&owner, &mut swept.tag_changes);
+        }
+        swept
     }
 
     fn owner_authorized(&self, owner: &str) -> bool {
@@ -462,6 +684,9 @@ impl ScopeTable {
     /// owner's next connection to sync can take it.
     pub(crate) fn release_connection(&mut self, connection_id: ConnectionId) {
         for state in self.owners.values_mut() {
+            for scope in state.live.values_mut() {
+                scope.presence.remove(&connection_id);
+            }
             if state
                 .authority
                 .is_some_and(|authority| authority.connection_id == connection_id)
@@ -486,18 +711,66 @@ impl ScopeTable {
         generation: u64,
         scopes: Vec<ScopeRecord>,
     ) -> Result<SyncApplied, SyncRefusal> {
+        self.change(
+            owner,
+            connection_id,
+            is_current_launch,
+            generation,
+            scopes,
+            None,
+        )
+    }
+
+    pub(crate) fn apply(
+        &mut self,
+        owner: &str,
+        connection_id: ConnectionId,
+        is_current_launch: impl Fn(ConnectionId) -> bool,
+        generation: u64,
+        upsert: Vec<ScopeRecord>,
+        end: Vec<ScopeEnd>,
+    ) -> Result<SyncApplied, SyncRefusal> {
+        self.change(
+            owner,
+            connection_id,
+            is_current_launch,
+            generation,
+            upsert,
+            Some(end),
+        )
+    }
+
+    fn change(
+        &mut self,
+        owner: &str,
+        connection_id: ConnectionId,
+        is_current_launch: impl Fn(ConnectionId) -> bool,
+        generation: u64,
+        scopes: Vec<ScopeRecord>,
+        end: Option<Vec<ScopeEnd>>,
+    ) -> Result<SyncApplied, SyncRefusal> {
         // Taken out of the map for the duration so the other owners' scopes can
         // be read while this owner's are rebuilt. Every path puts it back.
-        let mut state = self.owners.remove(owner).unwrap_or_default();
+        let original = self.owners.remove(owner).unwrap_or_default();
+        // Stage expiry changes along with record changes. If the proposed set
+        // exceeds the live-scope limit, discard both without publishing tags
+        // or changing the generation baseline.
+        let mut state = original.clone();
         let outcome = self.sync_owner(
             owner,
             &mut state,
             connection_id,
             &is_current_launch,
-            generation,
-            scopes,
+            ScopeChange {
+                generation,
+                scopes,
+                end,
+            },
         );
-        self.owners.insert(owner.to_string(), state);
+        self.owners.insert(
+            owner.to_string(),
+            if outcome.is_ok() { state } else { original },
+        );
         let mut applied = outcome?;
         self.refresh_links_to(owner, &mut applied.tag_changes);
         // The refresh can change parent states and versions, so the reply is
@@ -529,10 +802,21 @@ impl ScopeTable {
         state: &mut OwnerScopes,
         connection_id: ConnectionId,
         is_current_launch: &impl Fn(ConnectionId) -> bool,
-        generation: u64,
-        scopes: Vec<ScopeRecord>,
+        change: ScopeChange,
     ) -> Result<SyncApplied, SyncRefusal> {
+        let ScopeChange {
+            generation,
+            scopes,
+            end,
+        } = change;
         let taking_authority = Self::check_authority(state, connection_id, is_current_launch)?;
+        if end.is_some() && (taking_authority || !state.synced) {
+            return Err(SyncRefusal {
+                code: error_codes::SCOPE_SYNC_REQUIRED,
+                message: "scope.apply requires a full scope.sync on this authority connection"
+                    .to_string(),
+            });
+        }
         if let (false, Some(authority)) = (taking_authority, state.authority) {
             if generation <= authority.last_generation {
                 return Err(SyncRefusal {
@@ -545,15 +829,86 @@ impl ScopeTable {
             }
         }
         Self::check_sync_bounds(&scopes)?;
+        if let Some(end) = &end {
+            Self::check_end_bounds(&scopes, end)?;
+        }
+
+        let now = (self.wall_clock)();
+        let before_call = state.live.clone();
+        let expired = Self::expire_owner(owner, state, now);
+        let mut ended: Vec<_> = expired
+            .iter()
+            .map(|scope| ScopeEnded {
+                scope_ref: scope.scope_ref.clone(),
+                scope_epoch: scope.scope_epoch,
+            })
+            .collect();
+        let end_results: Vec<_> = end
+            .iter()
+            .flatten()
+            .map(|entry| {
+                let live = state
+                    .live
+                    .get(&entry.scope_ref)
+                    .is_some_and(|held| held.record.scope_epoch == entry.scope_epoch);
+                ScopeEndResult::new(
+                    entry.scope_ref.clone(),
+                    entry.scope_epoch,
+                    if live {
+                        ScopeEndOutcome::Ended
+                    } else {
+                        ScopeEndOutcome::NotLive
+                    },
+                )
+            })
+            .collect();
 
         let owner_authorized = self.owner_authorized(owner);
         let mut refusals: HashMap<usize, RecordRefusal> = HashMap::new();
-        // The set as it will stand after this sync. A refused record keeps its
+        // The set as it will stand after this call. A refused record keeps its
         // previous state, so its held record (if any) stays in the set.
-        let mut next: BTreeMap<String, ScopeRecord> = BTreeMap::new();
+        let mut next: BTreeMap<String, ScopeRecord> = if end.is_some() {
+            state
+                .live
+                .iter()
+                .map(|(scope_ref, held)| (scope_ref.clone(), held.record.clone()))
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        for entry in &end_results {
+            if entry.outcome == ScopeEndOutcome::Ended {
+                next.remove(&entry.scope_ref);
+            }
+        }
         for (index, record) in scopes.iter().enumerate() {
             let held = state.live.get(&record.scope_ref);
-            match Self::record_refusal(record, held, &state.tombstones, owner_authorized) {
+            let refusal =
+                Self::record_refusal(record, held, &state.tombstones, owner_authorized, now)
+                    .or_else(|| {
+                        #[cfg(test)]
+                        if record.replace_only_if_idle {
+                            if let Some(hook) = &self.idle_check_hook {
+                                hook();
+                            }
+                        }
+                        held.filter(|held| {
+                            record.replace_only_if_idle
+                                && (record.scope_epoch > held.record.scope_epoch
+                                    || record.bind_proof_sha256 != held.record.bind_proof_sha256)
+                                && (held.binds.load(std::sync::atomic::Ordering::SeqCst) != 0
+                                    || held.presence.values().any(|present| {
+                                        present.load(std::sync::atomic::Ordering::SeqCst)
+                                    }))
+                        })
+                        .map(|_| {
+                            (
+                                error_codes::SCOPE_EPOCH_IN_USE,
+                                "routes are still bound to the live scope epoch".to_string(),
+                            )
+                        })
+                    });
+            match refusal {
                 Some(refusal) => {
                     refusals.insert(index, refusal);
                     if let Some(held) = held {
@@ -561,7 +916,9 @@ impl ScopeTable {
                     }
                 }
                 None => {
-                    next.insert(record.scope_ref.clone(), record.clone());
+                    let mut stored = record.clone();
+                    stored.replace_only_if_idle = false;
+                    next.insert(record.scope_ref.clone(), stored);
                 }
             }
         }
@@ -657,15 +1014,26 @@ impl ScopeTable {
             }
         }
 
-        // Commit. Nothing above touched `state`.
+        if next.len() > MAX_LIVE_SCOPES_PER_OWNER {
+            return Err(SyncRefusal {
+                code: error_codes::SCOPE_LIVE_LIMIT_EXCEEDED,
+                message: format!(
+                    "{} live scopes exceed the limit of {MAX_LIVE_SCOPES_PER_OWNER}",
+                    next.len()
+                ),
+            });
+        }
+
+        // Commit the staged owner's state only after every whole-call check.
         let old = std::mem::take(&mut state.live);
-        let mut ended = Vec::new();
         for (scope_ref, held) in &old {
             let replaced = next
                 .get(scope_ref)
                 .is_none_or(|record| record.scope_epoch != held.record.scope_epoch);
             if replaced {
-                state.tombstones.insert(scope_ref, held.record.scope_epoch);
+                state
+                    .tombstones
+                    .insert(scope_ref, held.record.scope_epoch, EndCause::OwnerEnded);
                 ended.push(ScopeEnded {
                     scope_ref: scope_ref.clone(),
                     scope_epoch: held.record.scope_epoch,
@@ -698,6 +1066,8 @@ impl ScopeTable {
                     record,
                     version,
                     parent_state,
+                    binds: held.map(|held| Arc::clone(&held.binds)).unwrap_or_default(),
+                    presence: held.map(|held| held.presence.clone()).unwrap_or_default(),
                 },
             );
         }
@@ -708,9 +1078,9 @@ impl ScopeTable {
         });
 
         let mut tag_changes = Vec::new();
-        let refs: BTreeSet<&String> = old.keys().chain(state.live.keys()).collect();
+        let refs: BTreeSet<&String> = before_call.keys().chain(state.live.keys()).collect();
         for scope_ref in refs {
-            let old_scope = old.get(scope_ref);
+            let old_scope = before_call.get(scope_ref);
             let new_scope = state.live.get(scope_ref);
             let before = old_scope.map(LiveScope::tag);
             let after = new_scope.map(LiveScope::tag);
@@ -777,8 +1147,10 @@ impl ScopeTable {
 
         Ok(SyncApplied {
             results,
+            end_results,
             ended,
             tag_changes,
+            expired,
         })
     }
 
@@ -828,6 +1200,14 @@ impl ScopeTable {
         }
         let mut seen = HashSet::new();
         for record in scopes {
+            if let Some(hash) = &record.bind_proof_sha256 {
+                subc_protocol::scope::validate_bind_proof_sha256(hash).map_err(|message| {
+                    SyncRefusal {
+                        code: INVALID_CONTROL_BODY,
+                        message: message.to_string(),
+                    }
+                })?;
+            }
             if record.scope_ref.is_empty() {
                 return Err(SyncRefusal {
                     code: INVALID_CONTROL_BODY,
@@ -842,6 +1222,12 @@ impl ScopeTable {
             }
             if let Some(flow_id) = &record.attributes.flow_id {
                 subc_protocol::scope::validate_flow_id(flow_id).map_err(|error| SyncRefusal {
+                    code: INVALID_CONTROL_BODY,
+                    message: error.to_string(),
+                })?;
+            }
+            if let Some(run_id) = &record.attributes.run_id {
+                subc_protocol::scope::validate_run_id(run_id).map_err(|error| SyncRefusal {
                     code: INVALID_CONTROL_BODY,
                     message: error.to_string(),
                 })?;
@@ -863,12 +1249,41 @@ impl ScopeTable {
         Ok(())
     }
 
+    fn check_end_bounds(scopes: &[ScopeRecord], end: &[ScopeEnd]) -> Result<(), SyncRefusal> {
+        if end.len() > MAX_LIVE_SCOPES_PER_OWNER {
+            return Err(SyncRefusal {
+                code: error_codes::SCOPE_LIVE_LIMIT_EXCEEDED,
+                message: format!(
+                    "{} end entries exceed the limit of {MAX_LIVE_SCOPES_PER_OWNER}",
+                    end.len()
+                ),
+            });
+        }
+        let mut seen: HashSet<_> = scopes
+            .iter()
+            .map(|scope| scope.scope_ref.as_str())
+            .collect();
+        for entry in end {
+            if entry.scope_ref.is_empty() || !seen.insert(entry.scope_ref.as_str()) {
+                return Err(SyncRefusal {
+                    code: INVALID_CONTROL_BODY,
+                    message: format!(
+                        "scope ref '{}' is empty or appears more than once",
+                        entry.scope_ref
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// The checks one record fails or passes on its own, before parent links.
     fn record_refusal(
         record: &ScopeRecord,
         held: Option<&LiveScope>,
         tombstones: &Tombstones,
         owner_authorized: bool,
+        now: u64,
     ) -> Option<RecordRefusal> {
         for carrier in &record.carriers {
             if let Some(targets) = &carrier.targets {
@@ -887,7 +1302,7 @@ impl ScopeTable {
         if !record.attributes.is_empty() && !owner_authorized {
             return Some((
                 error_codes::SCOPE_ATTRIBUTE_NOT_PERMITTED,
-                "agent_id, delegates and flow_id may be set only by an owner listed in \
+                "agent_id, delegates, flow_id and run_id may be set only by an owner listed in \
                  scope_authority_owners"
                     .to_string(),
             ));
@@ -898,14 +1313,32 @@ impl ScopeTable {
                 "delegates requires an agent_id".to_string(),
             ));
         }
+        if record.attributes.run_id.is_some() {
+            if record.attributes.agent_id.is_none() {
+                return Some((
+                    error_codes::SCOPE_RUN_ID_WITHOUT_AGENT,
+                    "run_id requires an agent_id".to_string(),
+                ));
+            }
+            if record.attributes.flow_id.is_some() {
+                return Some((
+                    error_codes::SCOPE_RUN_ID_WITH_FLOW_ID,
+                    "run_id cannot accompany flow_id".to_string(),
+                ));
+            }
+        }
         let epoch = record.scope_epoch;
-        if tombstones.contains(&record.scope_ref, epoch) {
+        if let Some(cause) = tombstones.cause(&record.scope_ref, epoch) {
             return Some((
-                error_codes::SCOPE_EPOCH_ENDED,
+                if cause == EndCause::Expired {
+                    error_codes::SCOPE_EXPIRED
+                } else {
+                    error_codes::SCOPE_EPOCH_ENDED
+                },
                 format!("scope_epoch {epoch} of this ref already ended; use a higher epoch"),
             ));
         }
-        match held {
+        let epoch_refusal = match held {
             Some(held) if epoch < held.record.scope_epoch => Some((
                 error_codes::SCOPE_EPOCH_REGRESSED,
                 format!(
@@ -933,7 +1366,31 @@ impl ScopeTable {
                         format!("scope_epoch {epoch} is lower than the ended epoch {latest}"),
                     )
                 }),
+        };
+        if epoch_refusal.is_some() {
+            return epoch_refusal;
         }
+        if let Some(held) = held.filter(|held| epoch == held.record.scope_epoch) {
+            return (held.record.expires_at_ms != record.expires_at_ms).then(|| (
+                error_codes::SCOPE_EXPIRY_IMMUTABLE,
+                format!("expires_at_ms is fixed for scope_epoch {epoch}; use a higher epoch to change it"),
+            ));
+        }
+        if let Some(deadline) = record.expires_at_ms {
+            if deadline <= now {
+                return Some((
+                    error_codes::SCOPE_EXPIRED,
+                    format!(
+                        "scope '{}' deadline {deadline} has passed",
+                        record.scope_ref
+                    ),
+                ));
+            }
+            if deadline - now > MAX_SCOPE_EXPIRY_AHEAD_MS {
+                return Some((error_codes::SCOPE_EXPIRY_TOO_FAR, format!("scope '{}' deadline exceeds the {MAX_SCOPE_EXPIRY_AHEAD_MS} ms expiry horizon", record.scope_ref)));
+            }
+        }
+        None
     }
 
     /// The record `owner/scope_ref` names. With an overlay `(syncing owner,
@@ -1205,6 +1662,112 @@ impl ScopeTable {
         selector: &ScopeSelector,
         owner_configured: bool,
     ) -> Result<ScopeAdmission, ScopeAdmissionRefusal> {
+        let admission = self.attribute(opener, target_module, selector, owner_configured)?;
+        self.check_bind_proof(opener, selector)?;
+        Ok(admission)
+    }
+
+    /// Reserve usage while the caller still holds the scope write lock used for
+    /// admission. The forwarding entry owns the lease until failure or close;
+    /// successful presence instead belongs to the client connection and survives
+    /// route close. A failed bind never promotes its provisional presence.
+    /// Reserved openers are launch-attested carriers, not evidence of a live
+    /// host: their binds and requested presence do not count toward idleness.
+    pub(crate) fn reserve_bind(
+        &mut self,
+        admission: &ScopeAdmission,
+        opener: &Principal,
+        connection_id: ConnectionId,
+        hold_presence: bool,
+    ) -> BoundScope {
+        let held = self
+            .owners
+            .get_mut(&admission.owner)
+            .unwrap()
+            .live
+            .get_mut(&admission.stamp.scope_ref)
+            .unwrap();
+        let counts_for_idle = !matches!(opener, Principal::Reserved { .. });
+        if counts_for_idle {
+            held.binds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        held.presence.retain(|_, present| {
+            present.load(std::sync::atomic::Ordering::SeqCst) || Arc::strong_count(present) > 1
+        });
+        let presence = if hold_presence && counts_for_idle {
+            if let Some(present) = held.presence.get(&connection_id) {
+                Some(Arc::clone(present))
+            } else if held.presence.len() < 8 {
+                let present = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                held.presence.insert(connection_id, Arc::clone(&present));
+                Some(present)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        BoundScope {
+            owner: admission.owner.clone(),
+            scope_ref: admission.stamp.scope_ref.clone(),
+            tag: admission.tag,
+            _lease: Arc::new(ScopeBindLease {
+                binds: Arc::clone(&held.binds),
+                released: std::sync::atomic::AtomicBool::new(!counts_for_idle),
+                presence,
+            }),
+        }
+    }
+
+    /// Recheck only the proof constraint on the selected live epoch. Tag
+    /// settlement still handles ended or changed scopes, preserving the bind
+    /// behavior of records without a hash.
+    /// The daemon-stamped opener determines whether proof is needed; reserved
+    /// modules are already launch-attested, so any proof they send is ignored.
+    pub(crate) fn check_bind_proof(
+        &self,
+        opener: &Principal,
+        selector: &ScopeSelector,
+    ) -> Result<(), ScopeAdmissionRefusal> {
+        if matches!(opener, Principal::Reserved { .. }) {
+            return Ok(());
+        }
+        let record = reserved_module_id(&selector.owner)
+            .and_then(|owner| self.owners.get(owner))
+            .and_then(|owner| owner.live.get(&selector.scope_ref))
+            .map(|scope| &scope.record)
+            .filter(|record| Some(record.scope_epoch) == selector.scope_epoch);
+        let Some(record) = record else {
+            return Ok(());
+        };
+        if let Some(hash) = &record.bind_proof_sha256 {
+            let proof = selector
+                .bind_proof
+                .as_deref()
+                .ok_or_else(|| ScopeAdmissionRefusal {
+                    code: error_codes::SCOPE_BIND_PROOF_REQUIRED,
+                    message: "this scope requires a bind proof".to_string(),
+                })?;
+            if !bind_proof_matches(proof, hash) {
+                return Err(ScopeAdmissionRefusal {
+                    code: error_codes::SCOPE_BIND_PROOF_MISMATCH,
+                    message: "the bind proof does not match this scope".to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve attribution for an already attested module or bound route.
+    /// Activity reporting is not a new bind and must not retain or require the
+    /// original bind proof. Route opens must use `admit` instead.
+    pub(crate) fn attribute(
+        &self,
+        opener: &Principal,
+        target_module: &str,
+        selector: &ScopeSelector,
+        owner_configured: bool,
+    ) -> Result<ScopeAdmission, ScopeAdmissionRefusal> {
         let refuse = |code: &'static str, message: String| ScopeAdmissionRefusal { code, message };
         let Some(scope_epoch) = selector.scope_epoch else {
             return Err(refuse(
@@ -1248,6 +1811,16 @@ impl ScopeTable {
                 ),
             ));
         }
+        if let Some(deadline) = scope
+            .record
+            .expires_at_ms
+            .filter(|deadline| *deadline <= (self.wall_clock)())
+        {
+            return Err(refuse(
+                error_codes::SCOPE_NOT_LIVE,
+                format!("scope '{scope_ref}' of {owner} deadline {deadline} has passed"),
+            ));
+        }
         if reserved_module_id(opener) != Some(owner) {
             let permitted = match carrier_allowance(&scope.record, opener) {
                 None => false,
@@ -1266,16 +1839,17 @@ impl ScopeTable {
         }
         Ok(ScopeAdmission {
             owner: owner.to_string(),
-            stamp: ScopeStamp {
-                owner: selector.owner.clone(),
-                scope_ref: scope_ref.clone(),
+            stamp: ScopeStamp::new(
+                selector.owner.clone(),
+                scope_ref.clone(),
                 scope_epoch,
-                kind: scope.record.kind,
-                parent: scope.record.parent.clone(),
-                parent_state: scope.parent_state,
-                attributes: scope.record.attributes.clone(),
-                owner_authorized: self.owner_authorized(owner),
-            },
+                scope.record.kind,
+            )
+            .with_parent(scope.record.parent.clone())
+            .with_parent_state(scope.parent_state)
+            .with_attributes(scope.record.attributes.clone())
+            .with_owner_authorized(self.owner_authorized(owner))
+            .with_expires_at_ms(scope.record.expires_at_ms),
             tag: scope.tag(),
         })
     }
@@ -1299,16 +1873,19 @@ impl ScopeTable {
                 status: ScopeStatus::Live,
                 scope_epoch: Some(scope.record.scope_epoch),
                 owner_synced: state.synced,
-                stamp: Some(ScopeStamp {
-                    owner: owner.clone(),
-                    scope_ref: scope_ref.to_string(),
-                    scope_epoch: scope.record.scope_epoch,
-                    kind: scope.record.kind,
-                    parent: scope.record.parent.clone(),
-                    parent_state: scope.parent_state,
-                    attributes: scope.record.attributes.clone(),
-                    owner_authorized: self.owner_authorized(owner_id),
-                }),
+                stamp: Some(
+                    ScopeStamp::new(
+                        owner.clone(),
+                        scope_ref,
+                        scope.record.scope_epoch,
+                        scope.record.kind,
+                    )
+                    .with_parent(scope.record.parent.clone())
+                    .with_parent_state(scope.parent_state)
+                    .with_attributes(scope.record.attributes.clone())
+                    .with_owner_authorized(self.owner_authorized(owner_id))
+                    .with_expires_at_ms(scope.record.expires_at_ms),
+                ),
             };
         }
         match state.tombstones.latest(scope_ref) {
@@ -1325,6 +1902,10 @@ impl ScopeTable {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "scope_delta_tests.rs"]
+mod delta_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1345,16 +1926,69 @@ mod tests {
         ScopeTable::new([PREFRONTAL.to_string()])
     }
 
-    fn record(scope_ref: &str, scope_epoch: u64, kind: ScopeKind) -> ScopeRecord {
-        ScopeRecord {
-            scope_ref: scope_ref.to_string(),
-            scope_epoch,
-            kind,
-            parent: None,
-            child_owners: Vec::new(),
-            carriers: Vec::new(),
-            attributes: ScopeAttributes::default(),
+    #[test]
+    fn scope_bind_proof_non_reserved_openers_require_matching_proof() {
+        const HASH: &str = "4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0";
+        const PROOF: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
+        let mut table = table();
+        let mut record = head("s", 1).with_bind_proof_sha256(Some(HASH.into()));
+        record.carriers.push(ScopeCarrier::new(Principal::Direct));
+        sync(&mut table, PREFRONTAL, conn(1), 1, vec![record]);
+        let selector = ScopeSelector::new(reserved(PREFRONTAL), "s", Some(1));
+        assert_eq!(
+            table
+                .admit(&Principal::Direct, AFT, &selector, true)
+                .unwrap_err()
+                .code,
+            error_codes::SCOPE_BIND_PROOF_REQUIRED
+        );
+        for opener in [Principal::Direct, Principal::Unverified] {
+            assert_eq!(
+                table.check_bind_proof(&opener, &selector).unwrap_err().code,
+                error_codes::SCOPE_BIND_PROOF_REQUIRED
+            );
+            assert_eq!(
+                table
+                    .check_bind_proof(
+                        &opener,
+                        &selector.clone().with_bind_proof(Some("wrong".into()))
+                    )
+                    .unwrap_err()
+                    .code,
+                error_codes::SCOPE_BIND_PROOF_MISMATCH
+            );
+            table
+                .check_bind_proof(
+                    &opener,
+                    &selector.clone().with_bind_proof(Some(PROOF.into())),
+                )
+                .unwrap();
         }
+        table
+            .admit(
+                &Principal::Direct,
+                AFT,
+                &selector.with_bind_proof(Some(PROOF.into())),
+                true,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn scope_record_validation_refuses_malformed_bind_proof_hashes() {
+        for hash in ["A".repeat(64), "a".repeat(63), "g".repeat(64)] {
+            let mut table = table();
+            let record = head("s", 1).with_bind_proof_sha256(Some(hash));
+            let error = table
+                .sync(PREFRONTAL, conn(1), any_current, 1, vec![record])
+                .unwrap_err();
+            assert_eq!(error.code, INVALID_CONTROL_BODY);
+            assert!(error.message.contains("bind_proof_sha256"));
+        }
+    }
+
+    fn record(scope_ref: &str, scope_epoch: u64, kind: ScopeKind) -> ScopeRecord {
+        ScopeRecord::new(scope_ref, scope_epoch, kind)
     }
 
     fn head(scope_ref: &str, scope_epoch: u64) -> ScopeRecord {
@@ -1373,11 +2007,11 @@ mod tests {
         parent_epoch: u64,
     ) -> ScopeRecord {
         let mut record = record(scope_ref, 1, ScopeKind::Worker);
-        record.parent = Some(ScopeParent {
-            owner: reserved(parent_owner),
-            scope_ref: parent_ref.to_string(),
-            scope_epoch: parent_epoch,
-        });
+        record.parent = Some(ScopeParent::new(
+            reserved(parent_owner),
+            parent_ref.to_string(),
+            parent_epoch,
+        ));
         record
     }
 
@@ -1480,11 +2114,7 @@ mod tests {
     fn a_gated_attribute_from_an_unlisted_owner_is_refused() {
         let mut table = table();
         let mut gated = head("h", 1);
-        gated.attributes = ScopeAttributes {
-            agent_id: Some("agent".to_string()),
-            delegates: false,
-            flow_id: None,
-        };
+        gated.attributes = ScopeAttributes::new().with_agent_id(Some("agent".to_string()));
         let mut delegating = head("d", 1);
         delegating.attributes.delegates = true;
 
@@ -1530,20 +2160,19 @@ mod tests {
         let mut delegating = head("d", 1);
         delegating.attributes.delegates = true;
         let mut empty_targets = head("t", 1);
-        empty_targets.carriers.push(ScopeCarrier {
-            principal: reserved(AFT),
-            targets: Some(Vec::new()),
-        });
+        empty_targets
+            .carriers
+            .push(ScopeCarrier::new(reserved(AFT)).with_targets(Some(Vec::new())));
         let mut too_many_targets = head("u", 1);
-        too_many_targets.carriers.push(ScopeCarrier {
-            principal: reserved(AFT),
-            targets: Some((0..=MAX_CARRIER_TARGETS).map(|i| format!("m{i}")).collect()),
-        });
+        too_many_targets
+            .carriers
+            .push(ScopeCarrier::new(reserved(AFT)).with_targets(Some(
+                (0..=MAX_CARRIER_TARGETS).map(|i| format!("m{i}")).collect(),
+            )));
         let mut targeted = head("ok", 1);
-        targeted.carriers.push(ScopeCarrier {
-            principal: reserved(AFT),
-            targets: Some(vec!["plexus".to_string()]),
-        });
+        targeted
+            .carriers
+            .push(ScopeCarrier::new(reserved(AFT)).with_targets(Some(vec!["plexus".to_string()])));
         let applied = sync(
             &mut table,
             PREFRONTAL,
@@ -1909,10 +2538,9 @@ mod tests {
     fn an_unchanged_record_does_not_move_its_version() {
         let mut table = table();
         let mut scope = head("s", 1);
-        scope.carriers.push(ScopeCarrier {
-            principal: reserved(BROCA),
-            targets: None,
-        });
+        scope
+            .carriers
+            .push(ScopeCarrier::new(reserved(BROCA)).with_targets(None));
         sync(&mut table, PREFRONTAL, conn(1), 1, vec![scope.clone()]);
         let before = version(&table, PREFRONTAL, "s");
 
@@ -1936,10 +2564,8 @@ mod tests {
     fn a_refused_record_keeps_its_previous_state_while_the_rest_apply() {
         let mut table = table();
         let mut kept = head("kept", 5);
-        kept.carriers.push(ScopeCarrier {
-            principal: reserved(BROCA),
-            targets: None,
-        });
+        kept.carriers
+            .push(ScopeCarrier::new(reserved(BROCA)).with_targets(None));
         sync(
             &mut table,
             PREFRONTAL,
@@ -1988,10 +2614,9 @@ mod tests {
     fn a_parent_is_accepted_only_from_its_owner_or_a_child_owner_at_its_live_epoch() {
         let mut table = table();
         let mut parent = with_child_owner(head("h", 3), MAGIC);
-        parent.carriers.push(ScopeCarrier {
-            principal: reserved(AFT),
-            targets: None,
-        });
+        parent
+            .carriers
+            .push(ScopeCarrier::new(reserved(AFT)).with_targets(None));
         sync(&mut table, PREFRONTAL, conn(1), 1, vec![parent.clone()]);
 
         // The parent's owner.
@@ -2073,17 +2698,9 @@ mod tests {
         let mut table = table();
         // Within one owner: a names b and b names a.
         let mut a = with_child_owner(head("a", 1), MAGIC);
-        a.parent = Some(ScopeParent {
-            owner: reserved(PREFRONTAL),
-            scope_ref: "b".to_string(),
-            scope_epoch: 1,
-        });
+        a.parent = Some(ScopeParent::new(reserved(PREFRONTAL), "b".to_string(), 1));
         let mut b = head("b", 1);
-        b.parent = Some(ScopeParent {
-            owner: reserved(PREFRONTAL),
-            scope_ref: "a".to_string(),
-            scope_epoch: 1,
-        });
+        b.parent = Some(ScopeParent::new(reserved(PREFRONTAL), "a".to_string(), 1));
         let applied = sync(&mut table, PREFRONTAL, conn(1), 1, vec![a, b]);
         let refused = applied
             .results
@@ -2096,11 +2713,11 @@ mod tests {
 
         // A scope naming itself.
         let mut own = head("self", 1);
-        own.parent = Some(ScopeParent {
-            owner: reserved(PREFRONTAL),
-            scope_ref: "self".to_string(),
-            scope_epoch: 1,
-        });
+        own.parent = Some(ScopeParent::new(
+            reserved(PREFRONTAL),
+            "self".to_string(),
+            1,
+        ));
         let applied = sync(&mut table, PREFRONTAL, conn(1), 2, vec![own]);
         assert_eq!(
             outcome(&applied, "self").code.as_deref(),
@@ -2115,11 +2732,7 @@ mod tests {
         sync(&mut table, MAGIC, conn(2), 1, vec![m]);
         assert_eq!(parent_state(&table, MAGIC, "m"), Some(ParentState::Pending));
         let mut p = with_child_owner(head("p", 1), MAGIC);
-        p.parent = Some(ScopeParent {
-            owner: reserved(MAGIC),
-            scope_ref: "m".to_string(),
-            scope_epoch: 1,
-        });
+        p.parent = Some(ScopeParent::new(reserved(MAGIC), "m".to_string(), 1));
         let applied = sync(&mut table, PREFRONTAL, conn(1), 1, vec![p]);
         assert_eq!(
             outcome(&applied, "p").code.as_deref(),
@@ -2178,11 +2791,7 @@ mod tests {
                 (record.scope_ref.clone(), record)
             })
             .collect::<BTreeMap<_, _>>();
-        let parent = ScopeParent {
-            owner: reserved(PREFRONTAL),
-            scope_ref: "0".to_string(),
-            scope_epoch: 1,
-        };
+        let parent = ScopeParent::new(reserved(PREFRONTAL), "0".to_string(), 1);
         let mut cache = Default::default();
         for index in 0..size {
             assert!(!table.link_closes_cycle_cached(

@@ -24,9 +24,17 @@
 //! - macOS: the start time is `kp_proc.p_starttime` from `sysctl`
 //!   `KERN_PROC_PID` (microseconds since the epoch), and the executable is the
 //!   path `proc_pidpath` reports, then `stat` on that path. These two calls are
-//!   the crate's only unsafe code. macOS has no pidfd, so a signal is a plain
+//!   unsafe. macOS has no pidfd, so a signal is a plain
 //!   `kill` sent right after the checks; see [`Process::signal`].
+//! - Windows: creation time and forced stops use one retained process handle.
+//!   `ExecutableCapture` pins the resolved executable until a suspended spawn
+//!   binds its volume and 128-bit file ID to that handle and creation time.
 //! - Anywhere else: [`Process::open`] reports [`std::io::ErrorKind::Unsupported`].
+//!
+//! For persisted PID owners, [`process_identity`] reads versioned kernel start
+//! identities and distinguishes alive, dead and unknown without spawning a
+//! process. Its foreign calls are signal-zero `kill` on Unix and `proc_pidinfo`
+//! on macOS. Only dead owners may be reclaimed; unknown owners stay protected.
 //!
 //! It also reads how much memory and CPU time one process is using, for
 //! reporting only; see [`resource_usage`]. On Linux that is procfs again; on
@@ -34,10 +42,10 @@
 //! times to nanoseconds, the other two unsafe calls in the crate.
 //!
 //! And it carries the launch nonce from the daemon to each module it spawns
-//! over an inherited pipe instead of the environment: [`launch_nonce`] is the
-//! one reader every module uses, and [`LaunchNonceHandoff`] the daemon's half.
-//! That module's unsafe code is `dup2`, `fcntl`, `fstat` and `ioctl` on
-//! descriptors, each with its preconditions stated beside it.
+//! over an inherited Unix pipe or a PID-authenticated Windows named pipe:
+//! [`launch_nonce`] is the one cached reader every module uses. Windows keeps
+//! an environment copy for old Windows readers until live source reports show
+//! every module consuming the named pipe.
 
 #![deny(unsafe_code)]
 
@@ -45,17 +53,32 @@
 pub mod fork_exec_test;
 pub mod launch_nonce;
 pub mod privacy_identity;
+pub mod process_identity;
+pub mod socket_peer;
+#[cfg_attr(not(windows), path = "windows_acl_noop.rs")]
+pub mod windows_acl;
 #[cfg(unix)]
 pub use launch_nonce::LaunchNonceHandoff;
 pub use launch_nonce::{
     launch_nonce, LaunchNonce, LaunchNonceError, LaunchNonceSource, LAUNCH_NONCE_ENV,
-    LAUNCH_NONCE_FD, LAUNCH_NONCE_FD_ENV,
+    LAUNCH_NONCE_FD, LAUNCH_NONCE_FD_ENV, LAUNCH_NONCE_PIPE_ENV, LAUNCH_NONCE_PIPE_FALLBACK_ENV,
 };
+
+#[cfg(windows)]
+pub use launch_nonce::{LaunchNoncePipeDelivery, LaunchNoncePipeHandoff};
 
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(windows)]
+mod windows;
+#[cfg(all(test, windows))]
+mod windows_tests;
+#[cfg(windows)]
+pub use windows::{
+    ExecutableCapture, ImageAgreement, ImageUnavailable, SpawnedImage, WindowsFileIdentity,
+};
 
 #[cfg(target_os = "linux")]
 use linux as platform;
@@ -64,8 +87,9 @@ use macos as platform;
 
 use std::{io, path::Path};
 
-/// True where [`Process`] can identify and signal a process by pid.
-pub const PROCESS_IDENTITY_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+/// True where [`Process`] can identify and stop a process by pid.
+pub const PROCESS_IDENTITY_SUPPORTED: bool =
+    cfg!(any(target_os = "linux", target_os = "macos", windows));
 
 /// Device and inode of a file: which file, independent of the name used to
 /// reach it.
@@ -99,11 +123,24 @@ pub fn file_identity(path: &Path) -> Option<FileIdentity> {
 pub struct Observation {
     /// The kernel's start time for the process. Opaque: compare it only with a
     /// value read on the same host by this crate. Linux counts clock ticks since
-    /// boot; macOS counts microseconds since the epoch.
+    /// boot; macOS counts microseconds since the epoch; Windows counts 100 ns
+    /// intervals since the Windows epoch.
     pub start_time: u64,
     /// The file the process is executing, or `None` if it could not be read
     /// (for example, a process owned by another user).
+    /// Windows uses the full file ID in `SpawnedImage` instead of a Unix inode;
+    /// this field is always `None` there.
     pub executable: Option<FileIdentity>,
+}
+
+/// Whether the running executable's identity could be read. Permission denial
+/// is distinct on Linux because a non-dumpable process hides its executable
+/// while leaving its start time readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutableAccess {
+    Readable,
+    PermissionDenied,
+    Unavailable,
 }
 
 /// A signal [`Process::signal`] can send.
@@ -123,7 +160,14 @@ pub fn start_time(pid: u32) -> Option<u64> {
     {
         platform::start_time(pid)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        Process::open(pid)
+            .ok()??
+            .observe()
+            .map(|observation| observation.start_time)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = pid;
         None
@@ -133,7 +177,8 @@ pub fn start_time(pid: u32) -> Option<u64> {
 /// True where [`resource_usage`] can read a live process. Elsewhere it always
 /// answers `None`, and a caller can use this to say "not supported here"
 /// rather than "could not read".
-pub const RESOURCE_USAGE_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+pub const RESOURCE_USAGE_SUPPORTED: bool =
+    cfg!(any(target_os = "linux", target_os = "macos", windows));
 
 /// What [`ResourceUsage::memory_bytes`] measures. The platforms offer
 /// different figures, and they are not interchangeable.
@@ -147,6 +192,9 @@ pub enum MemoryKind {
     /// file-backed pages. Swapped-out pages are not included; see
     /// [`ResourceUsage::swap_bytes`].
     ResidentSet,
+    /// Windows `WorkingSetSize`: pageable memory currently resident in RAM,
+    /// including shared pages. This is not Unix RSS or private committed memory.
+    WindowsWorkingSet,
 }
 
 /// One reading of a process's memory and cumulative CPU time.
@@ -183,7 +231,11 @@ pub fn resource_usage(pid: u32) -> Option<ResourceUsage> {
     {
         platform::resource_usage(pid)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        Process::open(pid).ok()??.resource_usage()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = pid;
         None
@@ -196,6 +248,8 @@ pub struct Process {
     pid: u32,
     #[cfg(target_os = "linux")]
     pidfd: Option<std::os::fd::OwnedFd>,
+    #[cfg(windows)]
+    handle: std::os::windows::io::OwnedHandle,
 }
 
 impl Process {
@@ -217,7 +271,11 @@ impl Process {
         {
             Ok(platform::exists(pid).then_some(Self { pid }))
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(windows)]
+        {
+            windows::open(pid).map(|opened| opened.map(|handle| Self { pid, handle }))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             let _ = pid;
             Err(io::Error::new(
@@ -244,9 +302,32 @@ impl Process {
         }
     }
 
-    /// The process's start time and executable, or `None` once it has exited
-    /// (including as a zombie not yet reaped by its parent).
+    /// The process's start time and executable, or `None` when it has exited
+    /// (including as a zombie not yet reaped) or cannot be observed. On Linux,
+    /// [`Self::is_alive_but_unobservable`] distinguishes a hidden procfs entry.
     pub fn observe(&self) -> Option<Observation> {
+        self.observe_with_executable_access()
+            .map(|(observed, _)| observed)
+    }
+
+    /// Whether Linux hides the entire procfs entry while the process still
+    /// exists. This proves existence, not identity, and never authorizes a signal.
+    /// Other platforms return false without changing their observation behavior.
+    pub fn is_alive_but_unobservable(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            linux::alive_but_unobservable(self.pid, self.pidfd.as_ref())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    /// Observe the process and distinguish Linux executable permission denial
+    /// from other failures, without changing the legacy observation's fields.
+    /// Other platforms retain their existing readable/unavailable distinction.
+    pub fn observe_with_executable_access(&self) -> Option<(Observation, ExecutableAccess)> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             #[cfg(target_os = "linux")]
@@ -254,15 +335,63 @@ impl Process {
                 return None;
             }
             let start_time = platform::start_time(self.pid)?;
-            Some(Observation {
-                start_time,
-                executable: platform::executable_identity(self.pid),
-            })
+            #[cfg(target_os = "linux")]
+            let (executable, access) = match linux::executable_identity(self.pid) {
+                Ok(identity) => (Some(identity), ExecutableAccess::Readable),
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    (None, ExecutableAccess::PermissionDenied)
+                }
+                Err(_) => (None, ExecutableAccess::Unavailable),
+            };
+            #[cfg(target_os = "macos")]
+            let executable = macos::executable_identity(self.pid);
+            #[cfg(target_os = "macos")]
+            let access = if executable.is_some() {
+                ExecutableAccess::Readable
+            } else {
+                ExecutableAccess::Unavailable
+            };
+            Some((
+                Observation {
+                    start_time,
+                    executable,
+                },
+                access,
+            ))
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(windows)]
+        {
+            windows::observe(self).map(|observed| (observed, ExecutableAccess::Unavailable))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             None
         }
+    }
+
+    /// Wait on the retained Windows handle. `Ok(false)` means the bound elapsed,
+    /// not that a reused PID was observed.
+    #[cfg(windows)]
+    pub fn wait_for_exit(&self, timeout: std::time::Duration) -> io::Result<bool> {
+        windows::wait(self, timeout)
+    }
+
+    /// Force the confirmed Windows process to stop, then wait on the same handle.
+    /// This is not a graceful termination signal. A different creation time
+    /// refuses before any action; `Ok(false)` means the wait bound elapsed.
+    #[cfg(windows)]
+    pub fn force_stop(
+        &self,
+        expected_start_time: u64,
+        timeout: std::time::Duration,
+    ) -> io::Result<bool> {
+        windows::force_stop(self, expected_start_time, timeout)
+    }
+
+    /// Windows resources read through the retained handle, not by reopening its PID.
+    #[cfg(windows)]
+    pub fn resource_usage(&self) -> Option<ResourceUsage> {
+        windows::resource_usage(self)
     }
 
     /// Send `signal` to the process.

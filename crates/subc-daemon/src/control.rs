@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant as StdInstant},
@@ -17,20 +18,23 @@ use subc_control::{
     SupervisorRescanResult, SupervisorRoute, SupervisorRouteConsumer, SupervisorRouteModule,
 };
 use subc_protocol::{
+    call_mode::{derive_call_mode, CALL_MODES_CAPABILITY},
     error_codes,
     manifest::{
-        validate_hello_capability_grammar, validate_hello_self_signal_declarations,
-        CapabilityDeclarations, CapabilityNeed, Concurrency, ManifestProvenance, ModuleManifest,
-        ProviderRole,
+        validate_hello_capability_grammar, validate_hello_event_declarations,
+        validate_hello_self_signal_declarations, CapabilityDeclarations, CapabilityNeed,
+        Concurrency, ManifestProvenance, ModuleManifest, ProviderRole,
     },
     scope::{
-        ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeSelector,
-        CAP_ROUTE_ROLE_VERSIONS_V1, CAP_SCOPES_V1, SCOPE_DESCRIBE_OP, SCOPE_SYNC_OP,
+        ScopeEnd, ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeSelector,
+        CAP_ROUTE_ROLE_VERSIONS_V1, CAP_SCOPES_V1, SCOPE_APPLY_OP, SCOPE_DESCRIBE_OP,
+        SCOPE_SYNC_OP,
     },
     session::{
         validate_role_versions, HealthReport, ModuleControlPush, ModuleControlRequest,
         ModuleControlRequestFromModule, ModuleControlResponse, ModuleControlResponseToModule,
-        MODULE_CONTROL_OP_HEALTH_CHECK, MODULE_TO_SUBC_OP_CATALOG_UPDATE, ROLE_VERSIONS_FIELD,
+        OperatorConfirmRequest, MODULE_CONTROL_OP_HEALTH_CHECK, MODULE_TO_SUBC_OP_CATALOG_UPDATE,
+        ROLE_VERSIONS_FIELD,
     },
     BindIdentity, ErrorBody, Flags, FrameType, ModuleHelloAckBody, ModuleHelloBody, Principal,
     Priority, RouteTarget, PROTOCOL_VERSION,
@@ -39,12 +43,13 @@ use tokio::time::{timeout_at, Instant};
 use tracing::{debug, info, warn};
 
 use crate::{
+    caller_identity::CallerIdentity,
     capability_requirements::{
         log_duplicate_claim_events, log_requirement_events, CapabilityRequirementEvaluator,
         CapabilityVerdict, DuplicateClaimSource, RegisteredModule, RequirementStatus,
         RuntimeModule,
     },
-    daemon_config::RestartRequiredSection,
+    daemon_config::{PrivilegedOperatorPrompt, RestartRequiredSection},
     forwarding::{
         CloseReason, EndpointRoute, ForwardingError, ForwardingTable, GoodbyeTarget,
         ModuleControlRpcCompletion, ModuleControlRpcOutcome, ModuleEndpointId,
@@ -53,12 +58,13 @@ use crate::{
     observability::{
         ROUTE_OPEN_REFUSED_DECLARED_NOT_READY, ROUTE_OPEN_REFUSED_REQUIRED_CAPABILITY_UNPROVIDED,
     },
+    privileged_prompt::{prompt_text, PrivilegedOperation},
     provenance::{
         process_start_time, spawned_file_identity, ExecutableIdentityProbe, SpawnedFileIdentity,
     },
-    registry::{ChannelState, ConnectionId, Registry, RegistryError},
+    registry::{ChannelState, ConnectionId, RegistrationEndReason, Registry, RegistryError},
     router::{RouteCtx, RouterError},
-    scopes::{BoundScope, HelloLaunchNonces, ScopeTable},
+    scopes::{HelloLaunchNonces, ScopeTable},
     server::MAX_PENDING_ROUTE_BINDS_PER_TARGET,
     stderr_tail::{CaptureState, TailEntry},
     supervise::{
@@ -82,6 +88,9 @@ const CAP_SESSION_ATTACH: &str = "session_attach_v1";
 const CAP_ADMISSION_FACTS_RELAY: &str = "admission_facts_relay_v1";
 
 const SUBC_CONTROL_OPS: &[&str] = &[
+    ops::ACTIVITY_RECORD,
+    ops::ACTIVITY_QUERY,
+    ops::ACTIVITY_SUBSCRIBE,
     ops::SERVER_DESCRIBE,
     ops::CATALOG_LIST,
     ops::ROUTE_OPEN,
@@ -109,7 +118,9 @@ const MODULE_TO_SUBC_CONTROL_OPS: &[&str] = &[
     MODULE_TO_SUBC_OP_CATALOG_UPDATE,
     "supervisor.live_roots",
     SCOPE_SYNC_OP,
+    SCOPE_APPLY_OP,
     SCOPE_DESCRIBE_OP,
+    "operator.confirm",
 ];
 
 /// Module-originated ops the daemon answers but does not advertise in
@@ -172,7 +183,9 @@ fn reload_verdict(
     image: subc_control::RunningImageAgreement,
 ) -> PendingReloadVerdict {
     let path = match spawned_from {
-        Some(spawned_from) if configured == spawned_from => ReloadPathAgreement::Match,
+        Some(spawned_from) if reload_paths_match(configured, spawned_from) => {
+            ReloadPathAgreement::Match
+        }
         Some(spawned_from) => ReloadPathAgreement::Mismatch {
             configured: configured.to_path_buf(),
             spawned_from: spawned_from.to_path_buf(),
@@ -191,6 +204,31 @@ fn reload_verdict(
         },
     };
     PendingReloadVerdict { path, image }
+}
+
+fn reload_paths_match(configured: &Path, spawned_from: &Path) -> bool {
+    if configured == spawned_from {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // Windows spawn records the resolved verbatim path (\\?\...), while
+        // configuration keeps its original spelling. Resolve both with the OS
+        // instead of stripping prefixes or folding case, which could conflate
+        // distinct names in case-sensitive directories. Different resolved
+        // paths still differ even if their files have identical content.
+        match (
+            std::fs::canonicalize(configured),
+            std::fs::canonicalize(spawned_from),
+        ) {
+            (Ok(configured), Ok(spawned_from)) => configured == spawned_from,
+            _ => false,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -232,6 +270,7 @@ struct SupervisorRescanContext {
     admission_facts_carrier_module_id: Option<String>,
     admission_facts_targets: Option<Vec<String>>,
     scope_authority_owners: Vec<String>,
+    privileged_operator_prompt: PrivilegedOperatorPrompt,
 }
 
 /// Refusal labels passed to `observe_route_open_refusal` that mean the target
@@ -266,6 +305,8 @@ const ROUTE_OPEN_NOT_SERVING_REASONS: &[&str] = &[
 #[derive(Clone)]
 pub struct ControlHandler {
     registry: Arc<Registry>,
+    activity: Option<crate::activity::ActivityLedger>,
+    activity_streams: Arc<Mutex<HashMap<(ConnectionId, u64), tokio::task::AbortHandle>>>,
     forwarding: Arc<ForwardingTable>,
     process_liveness: Option<Arc<dyn ModuleProcessLiveness>>,
     supervisor: SupervisorHandle,
@@ -307,9 +348,20 @@ pub struct ControlHandler {
     /// `crate::scopes`. Shared by clones of this handler, so every connection
     /// reads and writes one table.
     scopes: Arc<RwLock<ScopeTable>>,
+    /// Wakes the expiry loop when an accepted scope change may have added a
+    /// deadline, so the loop can wait without ticking while no live scope has
+    /// one. A permit is stored when nothing waits, so no wake is lost.
+    scope_deadline_added: Arc<tokio::sync::Notify>,
     /// The configured `scope_authority_owners`, kept so a rescan can report a
     /// changed value as needing a daemon restart; rescan never applies it.
     scope_authority_owners: Vec<String>,
+    /// Fixed at startup so rescan cannot change the policy that guards rescan itself.
+    privileged_operator_prompt: PrivilegedOperatorPrompt,
+    /// The local and peer address of each accepted TCP client connection, read
+    /// from the daemon's own socket, so a privileged request can name its caller.
+    caller_endpoints: Arc<Mutex<HashMap<ConnectionId, (SocketAddr, SocketAddr)>>>,
+    #[cfg(test)]
+    caller_lookup: Option<TestCallerLookup>,
     /// The launch nonce each module connection presented at HELLO, which is how
     /// a `scope.sync` is matched to the owner's current launch.
     hello_launch_nonces: Arc<Mutex<HelloLaunchNonces>>,
@@ -322,6 +374,18 @@ pub struct ControlHandler {
     control_dispatch_delay: Option<Duration>,
     #[cfg(test)]
     provenance_probe_override: Option<subc_control::RunningImageAgreement>,
+    /// Holds `route.open` after the route.bind is queued to the module and
+    /// before it is marked enqueued, so a test can make the module's reply (or
+    /// a client teardown) land exactly inside that window.
+    #[cfg(test)]
+    route_bind_relay_sent_hold: Option<Arc<tokio::sync::Barrier>>,
+    /// Holds a HELLO after its registry entry is reserved and before its
+    /// forwarding endpoint is installed, so a test can read the catalog and
+    /// open routes while the module is registered but not yet routable. A
+    /// blocking barrier because the HELLO handler is synchronous; the test
+    /// runs the HELLO on its own thread.
+    #[cfg(test)]
+    hello_registry_to_forwarding_hold: Option<Arc<std::sync::Barrier>>,
 }
 
 impl fmt::Debug for ControlHandler {
@@ -344,6 +408,65 @@ struct RouteOpenRequest {
     role_versions: Option<BTreeMap<String, String>>,
     admission_facts: Option<serde_json::Value>,
     scope: Option<ScopeSelector>,
+}
+
+#[derive(Clone, Copy)]
+enum RouteOpenPhase {
+    Admission,
+    ProjectRoot,
+    EgressReservation,
+    BindSend,
+    BindAckWait,
+}
+
+/// Store elapsed time for each route-open phase, including attempts that end
+/// in an early refusal or backend error. Admission also includes rechecks and
+/// commit bookkeeping performed between the other timed phases.
+struct RouteOpenTimings {
+    module_id: String,
+    principal: String,
+    admission: Duration,
+    project_root: Duration,
+    egress_reservation: Duration,
+    bind_send: Duration,
+    bind_ack_wait: Duration,
+    phase: Option<RouteOpenPhase>,
+    phase_started_at: Instant,
+}
+
+impl RouteOpenTimings {
+    fn new() -> Self {
+        Self {
+            module_id: String::new(),
+            // Refusals before attestation must not claim a verified principal.
+            principal: "unresolved".to_string(),
+            admission: Duration::ZERO,
+            project_root: Duration::ZERO,
+            egress_reservation: Duration::ZERO,
+            bind_send: Duration::ZERO,
+            bind_ack_wait: Duration::ZERO,
+            phase: Some(RouteOpenPhase::Admission),
+            phase_started_at: Instant::now(),
+        }
+    }
+
+    fn finish(&mut self) {
+        let elapsed = self.phase_started_at.elapsed();
+        match self.phase.take() {
+            Some(RouteOpenPhase::Admission) => self.admission += elapsed,
+            Some(RouteOpenPhase::ProjectRoot) => self.project_root += elapsed,
+            Some(RouteOpenPhase::EgressReservation) => self.egress_reservation += elapsed,
+            Some(RouteOpenPhase::BindSend) => self.bind_send += elapsed,
+            Some(RouteOpenPhase::BindAckWait) => self.bind_ack_wait += elapsed,
+            None => {}
+        }
+    }
+
+    fn enter(&mut self, phase: RouteOpenPhase) {
+        self.finish();
+        self.phase = Some(phase);
+        self.phase_started_at = Instant::now();
+    }
 }
 
 struct RouteBindReservationGuard {
@@ -853,6 +976,8 @@ impl ControlHandler {
         let route_outages = forwarding.route_outages();
         Self {
             registry,
+            activity: None,
+            activity_streams: Arc::new(Mutex::new(HashMap::new())),
             forwarding,
             process_liveness: None,
             supervisor: SupervisorHandle::new(),
@@ -864,6 +989,11 @@ impl ControlHandler {
                 CAP_ADMISSION_FACTS_RELAY.to_string(),
                 CAP_SCOPES_V1.to_string(),
                 CAP_ROUTE_ROLE_VERSIONS_V1.to_string(),
+                subc_protocol::manifest::CAP_CATALOG_EVENTS_V1.to_string(),
+                subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1.to_string(),
+                subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V2.to_string(),
+                subc_protocol::manifest::CAP_SCOPE_REPLACE_IF_IDLE_V1.to_string(),
+                subc_control::ACTIVITY_LEDGER_CAPABILITY.to_string(),
             ]),
             route_bind_relay_timeout: DEFAULT_ROUTE_BIND_RELAY_TIMEOUT,
             route_bind_relay_timeouts: BTreeMap::new(),
@@ -880,7 +1010,12 @@ impl ControlHandler {
             scopes: Arc::new(RwLock::new(ScopeTable::new(
                 crate::daemon_config::default_scope_authority_owners(),
             ))),
+            scope_deadline_added: Arc::new(tokio::sync::Notify::new()),
             scope_authority_owners: crate::daemon_config::default_scope_authority_owners(),
+            privileged_operator_prompt: PrivilegedOperatorPrompt::default(),
+            caller_endpoints: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            caller_lookup: None,
             hello_launch_nonces: Arc::new(Mutex::new(HelloLaunchNonces::default())),
             rescan: None,
             connected_clients: ConnectedClients::new(),
@@ -891,6 +1026,10 @@ impl ControlHandler {
             control_dispatch_delay: None,
             #[cfg(test)]
             provenance_probe_override: None,
+            #[cfg(test)]
+            route_bind_relay_sent_hold: None,
+            #[cfg(test)]
+            hello_registry_to_forwarding_hold: None,
         }
     }
 
@@ -901,6 +1040,17 @@ impl ControlHandler {
         storage_config: Option<crate::daemon_config::StorageConfig>,
     ) -> Self {
         self.storage_config = storage_config;
+        self
+    }
+
+    /// Open the ledger on its own writer thread; an unavailable sink does not
+    /// prevent the daemon from serving routing or supervisor requests.
+    pub fn with_activity_ledger(mut self, run_dir: &Path, incarnation: String) -> Self {
+        self.activity = Some(crate::activity::ActivityLedger::open(
+            run_dir.join("activity.jsonl"),
+            incarnation,
+        ));
+        self.supervisor.set_activity(self.activity.clone());
         self
     }
 
@@ -930,6 +1080,12 @@ impl ControlHandler {
     pub fn with_scope_authority_owners(mut self, owners: Vec<String>) -> Self {
         self.scopes = Arc::new(RwLock::new(ScopeTable::new(owners.iter().cloned())));
         self.scope_authority_owners = owners;
+        self
+    }
+
+    /// Set the startup policy before installing the rescan context or serving requests.
+    pub fn with_privileged_operator_prompt(mut self, mode: PrivilegedOperatorPrompt) -> Self {
+        self.privileged_operator_prompt = mode;
         self
     }
 
@@ -990,6 +1146,39 @@ impl ControlHandler {
         self
     }
 
+    /// `route.open` waits on `hold` twice after queueing a route.bind: once to
+    /// announce it is parked, once to be released. Build the barrier for two
+    /// parties, the test being the other one.
+    #[cfg(test)]
+    pub(crate) fn with_route_bind_relay_sent_hold(
+        mut self,
+        hold: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        self.route_bind_relay_sent_hold = Some(hold);
+        self
+    }
+
+    /// A HELLO waits on `hold` twice between reserving its registry entry and
+    /// installing its forwarding endpoint: once to announce it is parked, once
+    /// to be released. Build the barrier for two parties, the test being the
+    /// other one, and run the HELLO on a thread of its own.
+    #[cfg(test)]
+    pub(crate) fn with_hello_registry_to_forwarding_hold(
+        mut self,
+        hold: Arc<std::sync::Barrier>,
+    ) -> Self {
+        self.hello_registry_to_forwarding_hold = Some(hold);
+        self
+    }
+
+    #[cfg(test)]
+    fn hold_between_registry_and_forwarding(&self) {
+        if let Some(hold) = &self.hello_registry_to_forwarding_hold {
+            hold.wait();
+            hold.wait();
+        }
+    }
+
     pub fn with_process_liveness(
         mut self,
         process_liveness: Arc<dyn ModuleProcessLiveness>,
@@ -1000,6 +1189,7 @@ impl ControlHandler {
 
     pub fn with_supervisor(mut self, supervisor: SupervisorHandle) -> Self {
         self.supervisor = supervisor;
+        self.supervisor.set_activity(self.activity.clone());
         self
     }
 
@@ -1031,6 +1221,15 @@ impl ControlHandler {
 
     pub(crate) fn with_daemon_start_clock(mut self, clock: crate::clock::StartClock) -> Self {
         self.daemon_provenance.start_clock = Some(clock);
+        self
+    }
+
+    /// Inject the Unix wall-clock millisecond source used by every scope expiry check.
+    pub fn with_wall_clock(self, clock: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+        self.scopes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .set_wall_clock(Arc::new(clock));
         self
     }
 
@@ -1067,6 +1266,7 @@ impl ControlHandler {
             admission_facts_carrier_module_id: self.admission_facts_carrier_module_id.clone(),
             admission_facts_targets: self.admission_facts_targets.clone(),
             scope_authority_owners: self.scope_authority_owners.clone(),
+            privileged_operator_prompt: self.privileged_operator_prompt,
         });
         self
     }
@@ -1097,6 +1297,81 @@ impl ControlHandler {
         });
     }
 
+    /// The timer only prompts sweeps. Each sweep reads wall time again, so a
+    /// deadline passed during sleep is enforced on the first tick after wake.
+    /// While no live scope carries a deadline the loop waits for an accepted
+    /// scope change instead of ticking, so a daemon without deadlines never
+    /// wakes for expiry.
+    pub(crate) fn spawn_scope_expiry_loop(self: Arc<Self>) {
+        tokio::spawn(async move {
+            loop {
+                let has_deadlines = self
+                    .scopes
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .has_deadlines();
+                if !has_deadlines {
+                    self.scope_deadline_added.notified().await;
+                    continue;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if let Err(error) = self.sweep_expired_scopes() {
+                    warn!(%error, "scope expiry sweep failed");
+                }
+            }
+        });
+    }
+
+    pub(crate) fn sweep_expired_scopes(&self) -> Result<(), RouterError> {
+        let mut table = self
+            .scopes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let swept = table.sweep_expired();
+        let drained = self.publish_scope_changes(&swept.tag_changes, &swept.expired)?;
+        drop(table);
+        self.close_scope_drained_routes(drained);
+        Ok(())
+    }
+
+    fn publish_scope_changes(
+        &self,
+        changes: &[crate::scopes::ScopeTagChange],
+        expired: &[crate::scopes::ScopeExpired],
+    ) -> Result<Vec<crate::forwarding::ScopeDrainedRoute>, RouterError> {
+        if changes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let drained = self
+            .forwarding
+            .publish_scope_changes(changes)
+            .map_err(RouterError::Forwarding)?;
+        let mut counts = HashMap::new();
+        for route in &drained {
+            *counts
+                .entry((
+                    route.scope.owner.as_str(),
+                    route.scope.scope_ref.as_str(),
+                    route.scope.tag.scope_epoch,
+                ))
+                .or_insert(0usize) += 1;
+        }
+        for scope in expired {
+            let routes_closed = counts
+                .get(&(
+                    scope.owner.as_str(),
+                    scope.scope_ref.as_str(),
+                    scope.scope_epoch,
+                ))
+                .copied()
+                .unwrap_or(0);
+            warn!(owner = %scope.owner, scope_ref = %scope.scope_ref,
+                scope_epoch = scope.scope_epoch, expires_at_ms = scope.expires_at_ms,
+                routes_closed, "scope expired");
+        }
+        Ok(drained)
+    }
+
     fn runtime_capability_snapshot(
         &self,
     ) -> Result<(Vec<RuntimeModule>, Vec<RegisteredModule>), RouterError> {
@@ -1115,7 +1390,12 @@ impl ControlHandler {
                 })
             })
             .collect::<Result<Vec<_>, RouterError>>()?;
-        let (_, registrations) = self.registry.list_modules().map_err(|err| {
+        // Include every registration, published or not. The capability
+        // evaluator counts a module as providing its capabilities as soon as it
+        // has registered, even before `catalog.list` shows it, so a HELLO in
+        // progress does not change other modules' required-capability
+        // verdicts. See `Registry::list_registered_modules`.
+        let registrations = self.registry.list_registered_modules().map_err(|err| {
             RouterError::backend(
                 0,
                 0,
@@ -1182,7 +1462,7 @@ impl ControlHandler {
     /// or target claim was added. This is deliberately a control-plane census:
     /// the opaque forwarding hot path must not grow a per-frame capability check.
     fn enforce_capability_denies(&self) {
-        let (_, registrations) = match self.registry.list_modules() {
+        let registrations = match self.registry.list_registered_modules() {
             Ok(snapshot) => snapshot,
             Err(err) => {
                 warn!(error = %err, "failed to read registrations for capability deny census");
@@ -1352,13 +1632,15 @@ impl ControlHandler {
     /// registration-release watch. The signal is what the supervisor waits on
     /// before spawning a replacement, so it must only fire once forwarding
     /// teardown is also done (see [`Self::cleanup_connection`] /
-    /// [`Self::handle_goodbye`]). Used directly only where there is no forwarding
-    /// state to tear down (a HELLO that failed before module registration).
+    /// [`Self::handle_goodbye`]). Used directly only where a registry entry was
+    /// admitted but its forwarding endpoint could not be installed.
     fn deregister_connection(
         &self,
         connection_id: ConnectionId,
+        reason: RegistrationEndReason,
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
-        self.registry.deregister_connection(connection_id)
+        self.registry
+            .deregister_connection_with_reason(connection_id, reason)
     }
 
     pub(crate) fn route_open_target(&self, frame: &Frame) -> Option<String> {
@@ -1474,6 +1756,64 @@ impl ControlHandler {
         self.handle_control_frame_timed(ctx, frame, None).await
     }
 
+    pub(crate) fn record_caller_endpoints(
+        &self,
+        connection: ConnectionId,
+        endpoints: Option<(SocketAddr, SocketAddr)>,
+    ) {
+        let mut callers = self
+            .caller_endpoints
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        callers.remove(&connection);
+        if let Some(endpoints) = endpoints {
+            callers.insert(connection, endpoints);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_caller_lookup_for_test(
+        mut self,
+        lookup: impl Fn(Option<(SocketAddr, SocketAddr)>) -> CallerIdentity + Send + Sync + 'static,
+    ) -> Self {
+        self.caller_lookup = Some(Arc::new(lookup));
+        self
+    }
+
+    async fn resolve_caller(&self, connection: ConnectionId) -> CallerIdentity {
+        let endpoints = self
+            .caller_endpoints
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&connection)
+            .copied();
+        #[cfg(test)]
+        let lookup = self.caller_lookup.clone();
+        tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(lookup) = lookup {
+                return lookup(endpoints);
+            }
+            endpoints
+                .map(|(local, peer)| CallerIdentity::lookup_endpoints(local, peer))
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    pub(crate) fn defers_privileged_control(&self, ctx: &RouteCtx, frame: &Frame) -> bool {
+        frame.header.channel == 0
+            && frame.header.ty == FrameType::Request
+            && self
+                .forwarding
+                .module_endpoint_for_connection(ctx.connection_id)
+                .is_ok_and(|endpoint| endpoint.is_none())
+            && parse_client_control_request(&frame.body)
+                .ok()
+                .is_some_and(|request| privileged_operation(&request).is_some())
+    }
+
     pub(crate) async fn handle_control_frame_timed(
         &self,
         ctx: &RouteCtx,
@@ -1487,20 +1827,47 @@ impl ControlHandler {
             }
             FrameType::Goodbye => self.handle_goodbye(ctx.connection_id),
             FrameType::Cancel => {
+                // A Cancel on channel 0 names a waiting operator.confirm or a
+                // subscription. Successful cancellation has no ordinary reply.
                 if self
-                    .supervisor
-                    .cancel_spawn_subscription(ctx.connection_id, frame.header.corr)
+                    .forwarding
+                    .operator_confirms()
+                    .cancel(ctx.connection_id, frame.header.corr)
+                    || self
+                        .supervisor
+                        .cancel_spawn_subscription(ctx.connection_id, frame.header.corr)
+                    || self.cancel_activity_subscription(ctx, &frame)?
                 {
                     Ok(Vec::new())
                 } else {
                     Ok(vec![control_error_frame(
                         &frame,
                         "unknown_subscription",
-                        "no supervisor spawn subscription has this correlation id",
+                        "no subscription has this correlation id",
                     )?])
                 }
             }
             FrameType::Request => {
+                // This additive operation is not part of the existing exhaustive
+                // module-control enum. Probe the op before decoding that enum.
+                let op = serde_json::from_slice::<ControlOpProbe>(&frame.body).ok();
+                if op
+                    .as_ref()
+                    .is_some_and(|probe| probe.op == ops::ACTIVITY_RECORD)
+                {
+                    return self.handle_activity_record(ctx, frame).await;
+                }
+                if op.as_ref().is_some_and(|probe| {
+                    probe.op == ops::ACTIVITY_QUERY || probe.op == ops::ACTIVITY_SUBSCRIBE
+                }) {
+                    return self.handle_activity_read(ctx, frame).await;
+                }
+                if op
+                    .as_ref()
+                    .is_some_and(|probe| probe.op == "operator.confirm")
+                {
+                    return self.handle_operator_confirm(ctx, frame);
+                }
                 if self
                     .forwarding
                     .module_endpoint_for_connection(ctx.connection_id)
@@ -1536,7 +1903,13 @@ impl ControlHandler {
                     log_control_dispatch_arrival(op, ctx.connection_id, corr);
                     let result =
                         self.handle_module_control_request(ctx.connection_id, frame, request);
-                    log_slow_control_dispatch(dispatch_started_at, op, ctx.connection_id, corr);
+                    log_slow_control_dispatch(
+                        dispatch_started_at,
+                        op,
+                        ctx.connection_id,
+                        corr,
+                        None,
+                    );
                     return result;
                 }
 
@@ -1568,14 +1941,24 @@ impl ControlHandler {
                 let op = client_control_request_op(&request);
                 let corr = frame.header.corr;
                 log_control_dispatch_arrival(op, ctx.connection_id, corr);
+                let mut route_open_timings = (op == ops::ROUTE_OPEN).then(RouteOpenTimings::new);
                 #[cfg(test)]
                 if let Some(delay) = self.control_dispatch_delay {
                     tokio::time::sleep(delay).await;
                 }
                 let result = self
-                    .handle_client_control_request(ctx, frame, request)
+                    .handle_client_control_request(ctx, frame, request, &mut route_open_timings)
                     .await;
-                log_slow_control_dispatch(dispatch_started_at, op, ctx.connection_id, corr);
+                if let Some(timings) = route_open_timings.as_mut() {
+                    timings.finish();
+                }
+                log_slow_control_dispatch(
+                    dispatch_started_at,
+                    op,
+                    ctx.connection_id,
+                    corr,
+                    route_open_timings.as_ref(),
+                );
                 result
             }
             FrameType::Push => {
@@ -1613,6 +1996,33 @@ impl ControlHandler {
         &self,
         connection_id: ConnectionId,
     ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
+        self.caller_endpoints
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&connection_id);
+        self.forwarding
+            .operator_confirms()
+            .connection_closed(connection_id);
+        self.cleanup_connection_with_end_reason(
+            connection_id,
+            RegistrationEndReason::ConnectionClosed,
+        )
+    }
+
+    fn cleanup_connection_with_end_reason(
+        &self,
+        connection_id: ConnectionId,
+        requested_reason: RegistrationEndReason,
+    ) -> Result<Vec<crate::registry::ModuleRegistration>, RegistryError> {
+        let end_reason = if requested_reason == RegistrationEndReason::ConnectionClosed {
+            self.registry
+                .get_module_by_connection(connection_id)?
+                .and_then(|registration| self.supervisor.get(&registration.manifest.module_id))
+                .and_then(|module| module.registration_end_reason().ok().flatten())
+                .unwrap_or(requested_reason)
+        } else {
+            requested_reason
+        };
         let crash_closed = self
             .registry
             .get_module_by_connection(connection_id)?
@@ -1642,17 +2052,20 @@ impl ControlHandler {
             // The forwarding table gates all providers at the start of daemon
             // shutdown, before their connections are closed. An ordinary
             // module disconnect still reports crash if that gate is not set.
-            let reason = match self.forwarding.is_daemon_draining() {
-                Ok(true) => RouteCloseReason::Restart,
-                Ok(false) => RouteCloseReason::Crash,
+            let (reason, drained) = match self
+                .forwarding
+                .daemon_drain_result_for_connection(connection_id)
+            {
+                Ok(Some(drained)) => (RouteCloseReason::Restart, drained),
+                Ok(None) => (RouteCloseReason::Crash, false),
                 Err(err) => {
                     warn!(error = %err, "failed to read daemon drain state; reporting crash conservatively");
-                    RouteCloseReason::Crash
+                    (RouteCloseReason::Crash, false)
                 }
             };
-            (module_id, routes, reason, terminal)
+            (module_id, routes, reason, drained, terminal)
         });
-        let registrations = self.deregister_connection(connection_id);
+        let registrations = self.deregister_connection(connection_id, end_reason);
         let cleanup = if crash_closed.is_some() {
             self.forwarding.cleanup_connection_counted(connection_id)
         } else {
@@ -1672,7 +2085,7 @@ impl ControlHandler {
         // teardown knows how many pending route.bind relays it aborted. It still
         // goes out before the GOODBYEs for the released routes, and its targets
         // were captured above, before teardown removed those routes.
-        if let Some((module_id, routes, reason, terminal)) = crash_closed {
+        if let Some((module_id, routes, reason, drained, terminal)) = crash_closed {
             let abandoned = cleanup
                 .as_ref()
                 .map_or(0, |cleanup| cleanup.abandoned_relays);
@@ -1683,7 +2096,7 @@ impl ControlHandler {
                     module_id,
                     channels: Vec::new(),
                     reason,
-                    drained: false,
+                    drained,
                     abandoned,
                     excluded_subscriptions: 0,
                     terminal: Some(terminal),
@@ -1702,6 +2115,17 @@ impl ControlHandler {
             self.refresh_capability_requirements();
         }
         self.supervisor.remove_spawn_subscribers(connection_id);
+        self.activity_streams
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|(id, _), task| {
+                if *id == connection_id {
+                    task.abort();
+                    false
+                } else {
+                    true
+                }
+            });
         // Sync authority dies with its connection, so the owner's next
         // connection can take it; the owner's scopes stay as they are.
         self.hello_launch_nonces
@@ -1896,6 +2320,13 @@ impl ControlHandler {
                 err.to_string(),
             )?]);
         }
+        if let Err(err) = validate_hello_event_declarations(&hello_value) {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "invalid_event_declaration",
+                err.to_string(),
+            )?]);
+        }
         if let Some(provenance) = hello_value
             .get("manifest")
             .and_then(|manifest| manifest.get("provenance"))
@@ -2066,7 +2497,13 @@ impl ControlHandler {
                 hello_ack,
             );
         }
-        let registration = match self.registry.register_with_control_ops(
+        // Registered unpublished: the module id is claimed, so a duplicate HELLO
+        // is refused, but `catalog.list` does not show the module and the
+        // catalog generation does not move until it is published below, once
+        // its forwarding endpoint exists. Listing it now would advertise a
+        // module that `route.open` still refuses for having no forwarding
+        // connection.
+        let registration = match self.registry.register_unpublished_with_control_ops(
             hello.manifest,
             negotiated_ver,
             connection_id,
@@ -2097,6 +2534,8 @@ impl ControlHandler {
                 )?])
             }
         };
+        #[cfg(test)]
+        self.hold_between_registry_and_forwarding();
 
         let reply = if let Some(sink) = sink {
             // The forwarding table's module store is also the daemon-to-module
@@ -2124,9 +2563,16 @@ impl ControlHandler {
                 hello_ack,
             ) {
                 // Forwarding registration failed, so there is no forwarding
-                // state to tear down. Remove the registry entry and signal the
-                // release watch directly.
-                if matches!(self.deregister_connection(connection_id), Ok(r) if !r.is_empty()) {
+                // state to tear down. Remove the registry entry, which was never
+                // published and so never listed or counted in the catalog
+                // generation, and signal the release watch directly.
+                if matches!(
+                    self.deregister_connection(
+                        connection_id,
+                        RegistrationEndReason::RegistrationFailed,
+                    ),
+                    Ok(r) if !r.is_empty()
+                ) {
                     crate::supervise::notify_registration_release();
                 }
                 return Ok(vec![control_error_frame(
@@ -2146,6 +2592,22 @@ impl ControlHandler {
             vec![hello_ack]
         };
 
+        // The module is routable now (or, without a sink, as routable as it
+        // will ever be), so the catalog may list it. Publishing bumps the
+        // catalog generation in the same registry critical section that makes
+        // the module listed.
+        if !self
+            .registry
+            .publish_registration(connection_id)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+        {
+            debug!(
+                module_id = %registration.manifest.module_id,
+                connection_id = connection_id.get(),
+                "registration was removed before it could be published"
+            );
+        }
+
         // Exposure over assumption: Concurrency's serde default is pinned to the
         // pre-field behavior (ModuleManaged), so a management surface that is
         // genuinely Serial and just never declared it inherits concurrent
@@ -2162,6 +2624,9 @@ impl ControlHandler {
         }
 
         self.apply_registration_capabilities(&registration);
+
+        self.supervisor
+            .record_activity_registration(&registration.manifest.module_id);
 
         info!(
             module_id = %registration.manifest.module_id,
@@ -2180,10 +2645,17 @@ impl ControlHandler {
     /// connection (its `catalog.update` finds it) but by no by-id lookup, so
     /// nothing routes to it until the supervisor cuts over.
     ///
-    /// Registry first, then forwarding, the same order as an ordinary HELLO;
-    /// a forwarding failure removes the registry entry again. The capability
-    /// census is not run: it describes routable modules, and this one is not
-    /// routable until promotion.
+    /// Registry first (unpublished), then forwarding, then publication, the
+    /// same order as an ordinary HELLO; a forwarding failure removes the
+    /// registry entry again. The swap supervisor treats a published, ready
+    /// candidate as registered and promotes it, and promotion needs the
+    /// candidate's forwarding endpoint, so the candidate is published only
+    /// once that endpoint exists. Unlike an ordinary HELLO, this does not
+    /// recompute capability verdicts or run the capability deny census
+    /// (`enforce_capability_denies`): both are about the module in the active
+    /// slot, which `route.open` can target. A candidate sits in the candidate
+    /// slot, so it neither provides capabilities to other modules nor can be
+    /// routed to until promotion moves it into the active slot.
     #[allow(clippy::too_many_arguments)]
     fn register_swap_candidate(
         &self,
@@ -2196,7 +2668,7 @@ impl ControlHandler {
         hello_ack: Frame,
     ) -> Result<Vec<Frame>, RouterError> {
         let module_id = manifest.module_id.clone();
-        let registration = match self.registry.register_candidate_with_control_ops(
+        let registration = match self.registry.register_unpublished_candidate_with_control_ops(
             manifest,
             negotiated_ver,
             connection_id,
@@ -2227,6 +2699,8 @@ impl ControlHandler {
                 )?])
             }
         };
+        #[cfg(test)]
+        self.hold_between_registry_and_forwarding();
         let reply = if let Some(sink) = sink {
             // Same ordering as an ordinary HELLO: the forwarding table queues
             // the HELLO_ACK before the candidate endpoint is inserted, because
@@ -2240,7 +2714,13 @@ impl ControlHandler {
                 sink,
                 hello_ack,
             ) {
-                if matches!(self.deregister_connection(connection_id), Ok(r) if !r.is_empty()) {
+                if matches!(
+                    self.deregister_connection(
+                        connection_id,
+                        RegistrationEndReason::RegistrationFailed,
+                    ),
+                    Ok(r) if !r.is_empty()
+                ) {
                     crate::supervise::notify_registration_release();
                 }
                 return Ok(vec![control_error_frame(
@@ -2253,6 +2733,17 @@ impl ControlHandler {
         } else {
             vec![hello_ack]
         };
+        if !self
+            .registry
+            .publish_registration(connection_id)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?
+        {
+            debug!(
+                module_id = %module_id,
+                connection_id = connection_id.get(),
+                "swap candidate registration was removed before it could be published"
+            );
+        }
         self.supervisor.mark_swap_candidate_admitted(&module_id);
         info!(
             module_id = %module_id,
@@ -2306,7 +2797,32 @@ impl ControlHandler {
         ctx: &RouteCtx,
         frame: Frame,
         request: ClientControlRequest,
+        route_open_timings: &mut Option<RouteOpenTimings>,
     ) -> Result<Vec<Frame>, RouterError> {
+        if let Some(operation) = privileged_operation(&request) {
+            let caller = self.resolve_caller(ctx.connection_id).await;
+            let op = client_control_request_op(&request);
+            let text = prompt_text(operation, &caller);
+            match self.privileged_operator_prompt {
+                PrivilegedOperatorPrompt::Log => {
+                    info!(target: "subc_daemon::privileged_prompt", operation = op,
+                        target = ?operation, caller = %caller.description(), summary = %text,
+                        "privileged request would prompt the operator");
+                }
+                PrivilegedOperatorPrompt::Enforce => {
+                    let key =
+                        crate::operator_confirm::DeclineKey::for_caller(&caller, ctx.connection_id);
+                    let outcome = self
+                        .forwarding
+                        .operator_confirms()
+                        .approve_privileged(ctx, &frame, op, text, caller.description(), key)
+                        .await;
+                    if outcome.code != "confirmed" {
+                        return Ok(vec![outcome.frame(&frame)]);
+                    }
+                }
+            }
+        }
         match request {
             ClientControlRequest::ServerDescribe {} => self.handle_server_describe(frame),
             ClientControlRequest::CatalogList { module_id } => {
@@ -2333,6 +2849,7 @@ impl ControlHandler {
                         admission_facts,
                         scope,
                     },
+                    route_open_timings.get_or_insert_with(RouteOpenTimings::new),
                 )
                 .await
             }
@@ -2352,28 +2869,79 @@ impl ControlHandler {
                 module_id,
                 drain_timeout_ms,
             } => {
-                self.handle_supervisor_restart(frame, module_id, drain_timeout_ms)
+                self.log_supervisor_request_received(
+                    ctx,
+                    frame.header.corr,
+                    ops::SUPERVISOR_RESTART,
+                    Some(&module_id),
+                    None,
+                )?;
+                let requester = self.supervisor_requester(ctx, frame.header.corr)?;
+                self.handle_supervisor_restart(frame, module_id, drain_timeout_ms, requester)
                     .await
             }
             ClientControlRequest::SupervisorSwap {
                 module_id,
                 ready_timeout_ms,
             } => {
-                self.handle_supervisor_swap(frame, module_id, ready_timeout_ms)
+                self.log_supervisor_request_received(
+                    ctx,
+                    frame.header.corr,
+                    ops::SUPERVISOR_SWAP,
+                    Some(&module_id),
+                    None,
+                )?;
+                let requester = self.supervisor_requester(ctx, frame.header.corr)?;
+                self.handle_supervisor_swap(frame, module_id, ready_timeout_ms, requester)
                     .await
             }
             ClientControlRequest::SupervisorReload { module_id } => {
-                self.handle_supervisor_reload(frame, module_id).await
+                self.log_supervisor_request_received(
+                    ctx,
+                    frame.header.corr,
+                    ops::SUPERVISOR_RELOAD,
+                    Some(&module_id),
+                    None,
+                )?;
+                let requester = self.supervisor_requester(ctx, frame.header.corr)?;
+                self.handle_supervisor_reload(frame, module_id, requester)
+                    .await
             }
             ClientControlRequest::SupervisorRescan { preview } => {
-                self.handle_supervisor_rescan(frame, preview).await
+                if !preview {
+                    self.log_supervisor_request_received(
+                        ctx,
+                        frame.header.corr,
+                        ops::SUPERVISOR_RESCAN,
+                        None,
+                        None,
+                    )?;
+                }
+                let requester = self.supervisor_requester(ctx, frame.header.corr)?;
+                self.handle_supervisor_rescan(frame, preview, requester)
+                    .await
             }
             ClientControlRequest::SupervisorReleaseReserved { module_id } => {
+                self.log_supervisor_request_received(
+                    ctx,
+                    frame.header.corr,
+                    ops::SUPERVISOR_RELEASE_RESERVED,
+                    Some(&module_id),
+                    None,
+                )?;
                 self.handle_supervisor_release_reserved(frame, module_id)
                     .await
             }
             ClientControlRequest::SupervisorSetEnabled { module_id, enabled } => {
-                self.handle_supervisor_set_enabled(frame, module_id, enabled)
+                self.log_supervisor_request_received(
+                    ctx,
+                    frame.header.corr,
+                    ops::SUPERVISOR_SET_ENABLED,
+                    Some(&module_id),
+                    Some(enabled),
+                )?;
+                let requester = self.supervisor_requester(ctx, frame.header.corr)?;
+                self.handle_supervisor_set_enabled(frame, module_id, enabled, requester)
                     .await
             }
             ClientControlRequest::SupervisorHealthProbe { module_id } => {
@@ -2395,6 +2963,41 @@ impl ControlHandler {
                 self.handle_supervisor_terminals(frame, module_id).await
             }
         }
+    }
+
+    fn log_supervisor_request_received(
+        &self,
+        ctx: &RouteCtx,
+        corr: u64,
+        op: &'static str,
+        module_id: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<(), RouterError> {
+        let caller = self.supervisor_requester(ctx, corr)?;
+        let caller = principal_label(&caller);
+        // `Option` fields are recorded only when present, so a request with no
+        // module id (rescan) or no enabled flag simply omits that field.
+        info!(
+            target: "control",
+            op,
+            module_id,
+            enabled,
+            connection_id = ctx.connection_id.get(),
+            caller = %caller,
+            "supervisor request received"
+        );
+        Ok(())
+    }
+
+    fn supervisor_requester(&self, ctx: &RouteCtx, corr: u64) -> Result<Principal, RouterError> {
+        Ok(self
+            .registry
+            .get_module_by_connection(ctx.connection_id)
+            .map_err(|err| RouterError::backend(0, corr, err.to_string()))?
+            .map(|registration| Principal::Reserved {
+                module_id: registration.manifest.module_id,
+            })
+            .unwrap_or(Principal::Direct))
     }
 
     fn handle_module_control_request(
@@ -2430,10 +3033,63 @@ impl ControlHandler {
             ModuleControlRequestFromModule::ScopeSync { generation, scopes } => {
                 self.handle_scope_sync(connection_id, frame, generation, scopes)
             }
+            ModuleControlRequestFromModule::ScopeApply {
+                generation,
+                upsert,
+                end,
+            } => self.handle_scope_change(connection_id, frame, generation, upsert, Some(end)),
             ModuleControlRequestFromModule::ScopeDescribe { owner, scope_ref } => {
                 self.handle_scope_describe(connection_id, frame, owner, scope_ref)
             }
         }
+    }
+
+    fn handle_operator_confirm(
+        &self,
+        ctx: &RouteCtx,
+        frame: Frame,
+    ) -> Result<Vec<Frame>, RouterError> {
+        use crate::operator_confirm::{audit, Outcome};
+        let registration = self
+            .registry
+            .get_module_by_connection(ctx.connection_id)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        let Some(registration) = registration else {
+            let outcome = Outcome::refusal("not_registered");
+            audit("", "", "", outcome, Duration::ZERO, Duration::ZERO, false);
+            return Ok(vec![outcome.frame(&frame)]);
+        };
+        let request = match serde_json::from_slice::<OperatorConfirmRequest>(&frame.body) {
+            Ok(request) => request,
+            Err(_) => {
+                let outcome = Outcome::refusal("invalid_control_body");
+                audit("", "", "", outcome, Duration::ZERO, Duration::ZERO, false);
+                return Ok(vec![outcome.frame(&frame)]);
+            }
+        };
+        let module_id = registration.manifest.module_id;
+        // Read the launch nonce (under its own lock) before taking the forwarding
+        // table's lock below: holding forwarding while waiting on another daemon
+        // lock risks a lock-order deadlock with paths that take them the other way.
+        let nonce = self
+            .hello_launch_nonces
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .nonce(ctx.connection_id)
+            .map(str::to_owned);
+        let nonce_proven = nonce.as_deref().is_some_and(|nonce| {
+            self.supervisor
+                .spawned_consumer_authorized(&module_id, nonce)
+        });
+        let confirms = self.forwarding.operator_confirms();
+        self.forwarding
+            .with_operator_route(
+                ctx.connection_id,
+                request.route_channel,
+                request.route_epoch,
+                |binding| confirms.admit(ctx, frame, module_id, nonce_proven, request, binding),
+            )
+            .map_err(RouterError::Forwarding)
     }
 
     /// `scope.sync`: the owner is the module registered on this connection.
@@ -2446,6 +3102,18 @@ impl ControlHandler {
         generation: u64,
         scopes: Vec<ScopeRecord>,
     ) -> Result<Vec<Frame>, RouterError> {
+        self.handle_scope_change(connection_id, frame, generation, scopes, None)
+    }
+
+    fn handle_scope_change(
+        &self,
+        connection_id: ConnectionId,
+        frame: Frame,
+        generation: u64,
+        scopes: Vec<ScopeRecord>,
+        end: Option<Vec<ScopeEnd>>,
+    ) -> Result<Vec<Frame>, RouterError> {
+        let is_apply = end.is_some();
         let Some(registration) = self
             .registry
             .get_module_by_connection(connection_id)
@@ -2454,7 +3122,7 @@ impl ControlHandler {
             return Ok(vec![control_error_frame(
                 &frame,
                 "not_registered",
-                "scope.sync requires an active module registration owned by this connection",
+                "scope.sync and scope.apply require an active module registration owned by this connection",
             )?]);
         };
         let owner = registration.manifest.module_id;
@@ -2473,20 +3141,32 @@ impl ControlHandler {
             .scopes
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let outcome = table.sync(&owner, connection_id, is_current_launch, generation, scopes);
+        let outcome = match end {
+            Some(end) => table.apply(
+                &owner,
+                connection_id,
+                is_current_launch,
+                generation,
+                scopes,
+                end,
+            ),
+            None => table.sync(&owner, connection_id, is_current_launch, generation, scopes),
+        };
         let drained = match &outcome {
-            Ok(applied) => self
-                .forwarding
-                .publish_scope_changes(&applied.tag_changes)
-                .map_err(RouterError::Forwarding)?,
+            Ok(applied) => self.publish_scope_changes(&applied.tag_changes, &applied.expired)?,
             Err(_) => Vec::new(),
         };
+        let has_deadlines = outcome.is_ok() && table.has_deadlines();
         drop(table);
+        if has_deadlines {
+            self.scope_deadline_added.notify_one();
+        }
         match outcome {
             Ok(applied) => {
                 let counts = ScopeOutcomeCounts::of(&applied.results);
                 info!(
                     owner = %owner,
+                    op = if is_apply { SCOPE_APPLY_OP } else { SCOPE_SYNC_OP },
                     generation,
                     records = applied.results.len(),
                     created = counts.created,
@@ -2497,12 +3177,12 @@ impl ControlHandler {
                     ended = applied.ended.len(),
                     tag_changes = applied.tag_changes.len(),
                     routes_closed = drained.len(),
-                    "scope sync accepted"
+                    "scope change accepted"
                 );
-                // An accepted sync can still refuse individual records, and the
+                // An accepted scope change can still refuse individual records, and the
                 // owner is the only party that sees the reply. Name them here so
                 // an operator can tell a refused session from a missing one
-                // without the owner's logs. Capped so a sync that refuses
+                // without the owner's logs. Capped so a call that refuses
                 // thousands cannot flood the log; the count above is complete.
                 for refused in applied
                     .results
@@ -2520,23 +3200,33 @@ impl ControlHandler {
                     );
                 }
                 self.close_scope_drained_routes(drained);
-                let response = ModuleControlResponseToModule::ScopeSync {
-                    generation,
-                    results: applied.results,
-                    ended: applied.ended,
+                let response = if is_apply {
+                    ModuleControlResponseToModule::ScopeApply {
+                        generation,
+                        results: applied.results,
+                        end_results: applied.end_results,
+                        ended: applied.ended,
+                    }
+                } else {
+                    ModuleControlResponseToModule::ScopeSync {
+                        generation,
+                        results: applied.results,
+                        ended: applied.ended,
+                    }
                 };
                 Ok(vec![control_response_body_frame(
                     &frame,
                     &response,
-                    "ModuleControlResponseToModule::ScopeSync",
+                    "scope change response",
                 )?])
             }
             Err(refusal) => {
                 info!(
                     owner = %owner,
+                    op = if is_apply { SCOPE_APPLY_OP } else { SCOPE_SYNC_OP },
                     generation,
                     code = refusal.code,
-                    "scope sync refused"
+                    "scope change refused"
                 );
                 Ok(vec![control_error_frame(
                     &frame,
@@ -2748,6 +3438,330 @@ impl ControlHandler {
         .map(|frame| vec![frame])
     }
 
+    pub(crate) fn with_activity_ledger_config(
+        mut self,
+        run_dir: &Path,
+        incarnation: String,
+        config: crate::activity::ActivityConfig,
+    ) -> Self {
+        self.activity = Some(crate::activity::ActivityLedger::open_config(
+            run_dir.join("activity.jsonl"),
+            incarnation,
+            config,
+        ));
+        self.supervisor.set_activity(self.activity.clone());
+        self
+    }
+
+    pub(crate) async fn configure_activity(
+        &self,
+        config: crate::activity::ActivityConfig,
+    ) -> Result<(), &'static str> {
+        match &self.activity {
+            Some(ledger) => ledger.configure(config).await,
+            None => Ok(()),
+        }
+    }
+
+    fn cancel_activity_subscription(
+        &self,
+        ctx: &RouteCtx,
+        frame: &Frame,
+    ) -> Result<bool, RouterError> {
+        let task = self
+            .activity_streams
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&(ctx.connection_id, frame.header.corr));
+        let Some(task) = task else {
+            return Ok(false);
+        };
+        task.abort();
+        let end = Frame::build_with_version(
+            response_version(frame),
+            FrameType::StreamEnd,
+            control_flags(),
+            0,
+            0,
+            frame.header.corr,
+            Vec::new(),
+        )
+        .map_err(|error| RouterError::backend(0, frame.header.corr, error.to_string()))?;
+        let sink = ctx.egress.clone();
+        tokio::spawn(async move {
+            let _ = sink.send(end).await;
+        });
+        Ok(true)
+    }
+
+    async fn handle_activity_read(
+        &self,
+        ctx: &RouteCtx,
+        frame: Frame,
+    ) -> Result<Vec<Frame>, RouterError> {
+        use subc_control::{
+            ActivityQueryRequest, ActivitySubscribeRequest, ActivitySubscribeResponse,
+            ACTIVITY_MALFORMED, ACTIVITY_READ_FORBIDDEN, ACTIVITY_UNAVAILABLE,
+        };
+        #[derive(Deserialize)]
+        struct Identity {
+            #[serde(default)]
+            consumer_identity: Option<ConsumerIdentity>,
+        }
+        // A registered module connection already identifies its caller. Ignore
+        // consumer_identity there so a module cannot borrow a mirror's identity.
+        // Only separate consumer connections use the Direct/nonce trust boundary.
+        let principal = match self
+            .forwarding
+            .module_id_for_connection(ctx.connection_id)
+            .map_err(RouterError::Forwarding)?
+        {
+            Some(module_id) => Ok(Principal::Reserved { module_id }),
+            None => {
+                let identity: Identity = match serde_json::from_slice(&frame.body) {
+                    Ok(identity) => identity,
+                    Err(_) => {
+                        return Ok(vec![control_error_frame(
+                            &frame,
+                            ACTIVITY_MALFORMED,
+                            "malformed activity read",
+                        )?])
+                    }
+                };
+                self.route_open_principal(&frame, identity.consumer_identity)?
+            }
+        };
+        let admitted = matches!(principal, Ok(Principal::Direct))
+            || matches!(&principal, Ok(Principal::Reserved { module_id }) if module_id == "callosum" || module_id == "ckbus");
+        if !admitted {
+            return Ok(vec![control_error_frame(
+                &frame,
+                ACTIVITY_READ_FORBIDDEN,
+                "activity reads require an operator or trusted mirror principal",
+            )?]);
+        }
+        let Some(ledger) = &self.activity else {
+            return Ok(vec![control_error_frame(
+                &frame,
+                ACTIVITY_UNAVAILABLE,
+                "activity ledger unavailable",
+            )?]);
+        };
+        if serde_json::from_slice::<ControlOpProbe>(&frame.body)
+            .is_ok_and(|probe| probe.op == ops::ACTIVITY_QUERY)
+        {
+            let result = match serde_json::from_slice::<ActivityQueryRequest>(&frame.body) {
+                Ok(request) => ledger.query(request).await,
+                Err(_) => Err(ACTIVITY_MALFORMED),
+            };
+            return match result {
+                Ok(reply) => Ok(vec![control_response_body_frame(
+                    &frame,
+                    &reply,
+                    ops::ACTIVITY_QUERY,
+                )?]),
+                Err(code) => Ok(vec![control_error_frame(
+                    &frame,
+                    code,
+                    "activity query refused",
+                )?]),
+            };
+        }
+        let request: ActivitySubscribeRequest = match serde_json::from_slice(&frame.body) {
+            Ok(request) => request,
+            Err(_) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    ACTIVITY_MALFORMED,
+                    "malformed activity subscription",
+                )?])
+            }
+        };
+        let mut subscription = match ledger.subscribe(request.since).await {
+            Ok(subscription) => subscription,
+            Err(code) => {
+                return Ok(vec![control_error_frame(
+                    &frame,
+                    code,
+                    "activity subscription refused",
+                )?])
+            }
+        };
+        let key = (ctx.connection_id, frame.header.corr);
+        let sink = ctx.egress.clone();
+        let mut streams = self
+            .activity_streams
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        streams.retain(|_, task| !task.is_finished());
+        if streams.get(&key).is_some_and(|task| !task.is_finished()) {
+            return Ok(vec![control_error_frame(
+                &frame,
+                "duplicate_subscription",
+                "activity subscription correlation id already in use",
+            )?]);
+        }
+        let task = tokio::spawn(async move {
+            loop {
+                let entry = if let Some(entry) = subscription.replay.pop_front() {
+                    Some(entry)
+                } else {
+                    subscription.receiver.recv().await
+                };
+                let Some(entry) = entry else {
+                    break;
+                };
+                let Ok(body) = serde_json::to_vec(&ActivitySubscribeResponse { entry }) else {
+                    return;
+                };
+                let Ok(next) = Frame::build_with_version(
+                    response_version(&frame),
+                    FrameType::StreamData,
+                    control_flags(),
+                    0,
+                    0,
+                    frame.header.corr,
+                    body,
+                ) else {
+                    return;
+                };
+                if sink.send(next).await.is_err() {
+                    return;
+                }
+            }
+            // Dropping a full subscriber's sender drains its accepted entries
+            // before the terminal error, preserving their order on the wire.
+            if let Some(code) = subscription.terminal_code() {
+                if let Ok(end) =
+                    control_error_frame(&frame, code, "activity subscriber fell behind")
+                {
+                    let _ = sink.send(end).await;
+                }
+            }
+        });
+        streams.insert(key, task.abort_handle());
+        Ok(Vec::new())
+    }
+
+    async fn handle_activity_record(
+        &self,
+        ctx: &RouteCtx,
+        frame: Frame,
+    ) -> Result<Vec<Frame>, RouterError> {
+        use subc_control::{
+            ActivityRecordRequest, ActivityRecordResponse, ACTIVITY_ACTOR_UNKNOWN,
+            ACTIVITY_MALFORMED, ACTIVITY_UNAVAILABLE,
+        };
+        let result = async {
+            let module = self
+                .forwarding
+                .module_id_for_connection(ctx.connection_id)
+                .ok()
+                .flatten()
+                .ok_or(ACTIVITY_ACTOR_UNKNOWN)?;
+            let request: ActivityRecordRequest =
+                serde_json::from_slice(&frame.body).map_err(|_| ACTIVITY_MALFORMED)?;
+            crate::activity::validate(&module, &request)?;
+            let actor = self.activity_actor(ctx.connection_id, &module, request.on.as_ref())?;
+            let ledger = self.activity.as_ref().ok_or(ACTIVITY_UNAVAILABLE)?;
+            let at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            ledger.record(module, request, actor, at_ms).await
+        }
+        .await;
+        match result {
+            Ok(entry) => Ok(vec![control_response_body_frame(
+                &frame,
+                &ActivityRecordResponse { seq: entry.seq },
+                "activity.record",
+            )?]),
+            Err(code) => Ok(vec![control_error_frame(
+                &frame,
+                code,
+                "activity recording refused",
+            )?]),
+        }
+    }
+
+    fn activity_actor(
+        &self,
+        connection: ConnectionId,
+        module: &str,
+        on: Option<&subc_control::ActivityOn>,
+    ) -> Result<subc_control::ActivityActor, &'static str> {
+        use crate::forwarding::{DataRoute, DataRouteState};
+        use subc_control::{ActivityActor, ActivityOn, ACTIVITY_ACTOR_UNKNOWN};
+        let principal = |id: &str| Principal::Reserved {
+            module_id: id.to_owned(),
+        };
+        let mut actor = ActivityActor {
+            principal: principal(module),
+            scope_owner: None,
+            agent_id: None,
+            run_id: None,
+            flow_id: None,
+            project_root: None,
+        };
+        let scope = match on {
+            None => return Ok(actor),
+            Some(ActivityOn::Scope(scope)) => {
+                let selector = subc_protocol::scope::ScopeSelector::new(
+                    principal(module),
+                    scope.scope_ref.clone(),
+                    Some(scope.epoch),
+                );
+                self.scopes
+                    .read()
+                    .map_err(|_| ACTIVITY_ACTOR_UNKNOWN)?
+                    .attribute(&principal(module), module, &selector, true)
+                    .map_err(|_| ACTIVITY_ACTOR_UNKNOWN)?
+            }
+            Some(ActivityOn::Route(route)) => {
+                let DataRoute::Module(DataRouteState::Bound(binding)) = self
+                    .forwarding
+                    .lookup_data_route(connection, route.channel, route.epoch)
+                    .map_err(|_| ACTIVITY_ACTOR_UNKNOWN)?
+                else {
+                    return Err(ACTIVITY_ACTOR_UNKNOWN);
+                };
+                if binding.module_id != module {
+                    return Err(ACTIVITY_ACTOR_UNKNOWN);
+                }
+                actor.principal = binding.principal.clone();
+                actor.project_root = binding
+                    .project_root
+                    .as_ref()
+                    .map(|root| root.as_path().to_path_buf());
+                let Some(bound) = &binding.scope else {
+                    return Ok(actor);
+                };
+                let owner = principal(&bound.owner);
+                let selector = subc_protocol::scope::ScopeSelector::new(
+                    owner.clone(),
+                    bound.scope_ref.clone(),
+                    Some(bound.tag.scope_epoch),
+                );
+                let admitted = self
+                    .scopes
+                    .read()
+                    .map_err(|_| ACTIVITY_ACTOR_UNKNOWN)?
+                    .attribute(&owner, module, &selector, true)
+                    .map_err(|_| ACTIVITY_ACTOR_UNKNOWN)?;
+                if admitted.tag != bound.tag {
+                    return Err(ACTIVITY_ACTOR_UNKNOWN);
+                }
+                admitted
+            }
+        };
+        actor.scope_owner = Some(scope.stamp.owner);
+        actor.agent_id = scope.stamp.attributes.agent_id;
+        actor.run_id = scope.stamp.attributes.run_id;
+        actor.flow_id = scope.stamp.attributes.flow_id;
+        Ok(actor)
+    }
+
     fn handle_server_describe(&self, frame: Frame) -> Result<Vec<Frame>, RouterError> {
         self.refresh_capability_requirements();
         // A bare connection count is ambiguous between many clients holding a
@@ -2756,6 +3770,20 @@ impl ControlHandler {
         // diagnostic endpoint must still answer if the forwarding lock is
         // contended.
         let mut counters = self.counters.snapshot();
+        if let (Some(ledger), Some(obj)) = (&self.activity, counters.as_object_mut()) {
+            obj.insert(
+                "activity_unparseable_lines".into(),
+                ledger.read_errors().into(),
+            );
+            obj.insert(
+                "activity_lifecycle_append_failures".into(),
+                ledger.lifecycle_failures().into(),
+            );
+            obj.insert(
+                "activity_started_digest_skips".into(),
+                ledger.lifecycle_digest_skips().into(),
+            );
+        }
         if let (Ok((connections_with_routes, max)), Some(obj)) = (
             self.forwarding.client_route_concentration(),
             counters.as_object_mut(),
@@ -2814,16 +3842,17 @@ impl ControlHandler {
             .map(|registration| {
                 let not_ready = self.not_ready_reason(&registration);
                 let roles = registration.manifest.provides;
-                CatalogEntry {
-                    module_id: registration.manifest.module_id,
-                    ready: not_ready.is_none(),
-                    not_ready,
-                    module_version: Some(registration.manifest.module_version),
+                CatalogEntry::new(
+                    registration.manifest.module_id,
                     roles,
-                    control_ops: registration.control_ops,
-                    capabilities: registration.manifest.capabilities,
-                    self_signals: registration.manifest.self_signals,
-                }
+                    registration.control_ops,
+                )
+                .with_ready(not_ready.is_none())
+                .with_not_ready(not_ready)
+                .with_module_version(Some(registration.manifest.module_version))
+                .with_capabilities(registration.manifest.capabilities)
+                .with_self_signals(registration.manifest.self_signals)
+                .with_events(registration.manifest.events)
             })
             .collect();
         let response = ClientControlResponse::CatalogList {
@@ -3058,14 +4087,15 @@ impl ControlHandler {
         // safe to track.
         self.route_outages
             .record_not_serving(module_id, "supervised_not_registered");
-        control_error_frame(
-            frame,
-            code,
+        let message = if let Some(pid) = status.waiting_for_previous_pid {
+            format!("waiting: previous instance (pid {pid}) is still running but hidden; it cannot be identified")
+        } else {
             format!(
                 "module_id '{module_id}' is supervised but not available (state={}, enabled={}, live={})",
                 status.state, status.enabled, status.live
-            ),
-        )
+            )
+        };
+        control_error_frame(frame, code, message)
     }
 
     async fn handle_route_open(
@@ -3073,6 +4103,7 @@ impl ControlHandler {
         ctx: &RouteCtx,
         frame: Frame,
         request: RouteOpenRequest,
+        timings: &mut RouteOpenTimings,
     ) -> Result<Vec<Frame>, RouterError> {
         let RouteOpenRequest {
             target,
@@ -3084,6 +4115,7 @@ impl ControlHandler {
             scope,
         } = request;
         let target_module_id = target_module_id(&target).to_string();
+        timings.module_id.clone_from(&target_module_id);
         if self
             .registry
             .get_module_by_connection(ctx.connection_id)
@@ -3124,6 +4156,18 @@ impl ControlHandler {
                     detail: Some(serde_json::json!({ "field": ROLE_VERSIONS_FIELD })),
                 },
             )?]);
+        }
+
+        if let Some((status, _)) = self.supervisor_status(&target_module_id, frame.header.corr)? {
+            if status.waiting_for_previous_pid.is_some() {
+                return Ok(vec![self.supervised_absent_route_open_refusal_frame(
+                    ctx,
+                    &frame,
+                    &target_module_id,
+                    "module_warming",
+                    &status,
+                )?]);
+            }
         }
 
         // WHY THESE REPLIES DISCRIMINATE FREELY, since the usual rule is the
@@ -3389,6 +4433,7 @@ impl ControlHandler {
                 return Ok(vec![error]);
             }
         };
+        timings.principal = principal_label(&principal);
 
         // This is attested, control-plane policy for supervised module origins.
         // Keep it before route reservation and out of the opaque forwarding hot
@@ -3469,7 +4514,7 @@ impl ControlHandler {
         // compared with the published one at commit, so a sync between here
         // and the module's ack refuses the open instead of binding a stamp
         // that is no longer true.
-        let (bound_scope, scope_stamp) = match scope {
+        let (bound_scope, mut scope_stamp) = match &scope {
             None => (None, None),
             Some(selector) => {
                 let owner_configured = match &selector.owner {
@@ -3481,28 +4526,33 @@ impl ControlHandler {
                     Principal::Reserved { module_id } => self.supervisor.is_configured(module_id),
                     _ => false,
                 };
-                let admitted = self
+                let mut scopes = self
                     .scopes
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .admit(&principal, &target_module_id, &selector, owner_configured)
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let admitted = scopes
+                    .admit(&principal, &target_module_id, selector, owner_configured)
                     .and_then(|admission| {
                         crate::scopes::check_target_flow_support(
                             &admission.stamp,
                             &target_module_id,
                             registration.manifest.capabilities.as_ref(),
                         )?;
-                        Ok(admission)
+                        crate::scopes::check_target_agent_run_support(
+                            &admission.stamp,
+                            &target_module_id,
+                            registration.manifest.capabilities.as_ref(),
+                        )?;
+                        let bound = scopes.reserve_bind(
+                            &admission,
+                            &principal,
+                            ctx.connection_id,
+                            selector.hold_presence,
+                        );
+                        Ok((admission, bound))
                     });
                 match admitted {
-                    Ok(admission) => (
-                        Some(BoundScope {
-                            owner: admission.owner,
-                            scope_ref: admission.stamp.scope_ref.clone(),
-                            tag: admission.tag,
-                        }),
-                        Some(admission.stamp),
-                    ),
+                    Ok((admission, bound)) => (Some(bound), Some(admission.stamp)),
                     Err(refusal) => {
                         return Ok(vec![self.route_open_refusal_frame(
                             ctx,
@@ -3538,6 +4588,7 @@ impl ControlHandler {
         // admitted under. Lexical cleanup would mint a DIFFERENT identity for the
         // same caller the moment the directory vanished, which strands the run more
         // quietly than refusing it.
+        timings.enter(RouteOpenPhase::ProjectRoot);
         let project_root = match ProjectRootId::from_path_allowing_missing(&identity.project_root) {
             Ok(project_root) => project_root,
             Err(err) => {
@@ -3548,6 +4599,7 @@ impl ControlHandler {
                 )?])
             }
         };
+        timings.enter(RouteOpenPhase::Admission);
         identity.project_root = project_root.as_path().to_path_buf();
 
         // Last gate before any relay work, and deliberately after the cheap
@@ -3618,6 +4670,7 @@ impl ControlHandler {
         // daemons) wins over the daemon-wide default.
         let route_bind_relay_timeout = self.route_bind_relay_timeout_for(&target_module_id);
         let relay_deadline = Instant::now() + route_bind_relay_timeout;
+        timings.enter(RouteOpenPhase::EgressReservation);
         let pending = match self
             .forwarding
             .begin_route_bind_relay_for(
@@ -3645,6 +4698,7 @@ impl ControlHandler {
                 )?])
             }
         };
+        timings.enter(RouteOpenPhase::Admission);
         let crate::forwarding::PendingRouteBindRelay {
             endpoint,
             module_sink,
@@ -3660,24 +4714,52 @@ impl ControlHandler {
             RouteBindReservationGuard::new(Arc::clone(&self.forwarding), endpoint, relay_corr);
 
         // Reserving egress can wait while a module reconnects or a swap cuts
-        // over. Check the connection the relay actually captured, not the
-        // earlier by-id lookup: a flow-aware module must not vouch for a
-        // replacement. The captured sink cannot turn into another connection.
+        // over. Check the relay's captured connection, not the earlier by-id
+        // lookup: the original module's flow/run capabilities cannot authorize
+        // its replacement. The captured sink stays bound to that connection.
+        let relay_registration = self
+            .registry
+            .get_module_by_connection(endpoint.connection_id)
+            .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
+        let relay_capabilities = relay_registration
+            .as_ref()
+            .and_then(|registration| registration.manifest.capabilities.as_ref());
+        if let Some(selector) = &scope {
+            // Egress reservation may wait across a scope update. Recheck the
+            // proof against the current record before sending the captured bind.
+            if let Err(refusal) = self
+                .scopes
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .check_bind_proof(&principal, selector)
+            {
+                reservation.release_and_disarm();
+                return Ok(vec![self.route_open_refusal_frame(
+                    ctx,
+                    &frame,
+                    &target_module_id,
+                    refusal.code,
+                    refusal.code,
+                    refusal.message,
+                )?]);
+            }
+        }
         if let Some(stamp) = scope_stamp
             .as_ref()
-            .filter(|stamp| stamp.attributes.flow_id.is_some())
+            .filter(|stamp| stamp.attributes.flow_id.is_some() || stamp.attributes.run_id.is_some())
         {
-            let relay_registration = self
-                .registry
-                .get_module_by_connection(endpoint.connection_id)
-                .map_err(|err| RouterError::backend(0, frame.header.corr, err.to_string()))?;
             if let Err(refusal) = crate::scopes::check_target_flow_support(
                 stamp,
                 &target_module_id,
-                relay_registration
-                    .as_ref()
-                    .and_then(|registration| registration.manifest.capabilities.as_ref()),
-            ) {
+                relay_capabilities,
+            )
+            .and_then(|()| {
+                crate::scopes::check_target_agent_run_support(
+                    stamp,
+                    &target_module_id,
+                    relay_capabilities,
+                )
+            }) {
                 reservation.release_and_disarm();
                 return Ok(vec![self.route_open_refusal_frame(
                     ctx,
@@ -3690,6 +4772,19 @@ impl ControlHandler {
             }
         }
 
+        // Older readers may reject unknown fields. Select both new fields from
+        // the captured endpoint's declaration, including on unscoped binds.
+        let call_mode = if relay_capabilities
+            .is_some_and(|caps| caps.provides.iter().any(|cap| cap == CALL_MODES_CAPABILITY))
+        {
+            Some(derive_call_mode(scope_stamp.as_ref()))
+        } else {
+            if let Some(stamp) = scope_stamp.as_mut() {
+                stamp.expires_at_ms = None;
+            }
+            None
+        };
+
         debug!(
             connection_id = ctx.connection_id.get(),
             client_channel,
@@ -3700,11 +4795,7 @@ impl ControlHandler {
         );
         // Rendered BEFORE the move into the relay, because the accept arm below
         // is where it is logged and the principal is gone by then.
-        let principal_label = match &principal {
-            Principal::Reserved { module_id } => format!("reserved:{module_id}"),
-            Principal::Direct => "direct".to_string(),
-            other => format!("{other:?}"),
-        };
+        let principal_label = principal_label(&principal);
         let relay = ModuleControlRequest::RouteBind {
             route_channel: module_channel,
             epoch: module_epoch,
@@ -3715,6 +4806,7 @@ impl ControlHandler {
             role_versions,
             admission_facts,
             scope: scope_stamp,
+            call_mode,
         };
         let relay_body = serde_json::to_vec(&relay).map_err(|err| {
             RouterError::backend(
@@ -3734,7 +4826,10 @@ impl ControlHandler {
         )
         .map_err(RouterError::FrameBuild)?;
 
-        if let Err(err) = module_sink.send(relay_frame).await {
+        timings.enter(RouteOpenPhase::BindSend);
+        let sent = module_sink.send(relay_frame).await;
+        timings.enter(RouteOpenPhase::Admission);
+        if let Err(err) = sent {
             reservation.release_and_disarm();
             return Ok(vec![self.route_open_refusal_frame(
                 ctx,
@@ -3746,10 +4841,24 @@ impl ControlHandler {
             )?]);
         }
 
-        if !self
+        #[cfg(test)]
+        if let Some(hold) = &self.route_bind_relay_sent_hold {
+            // First wait: tell the test the bind is queued. Second wait: stay
+            // here until the test has driven whatever it wants to happen
+            // between queueing the bind and marking it enqueued.
+            hold.wait().await;
+            hold.wait().await;
+        }
+
+        // A missing relay is not by itself an abandoned bind: the module may
+        // already have acked it and the route may be committed. Only a relay
+        // dropped without any module reply needs this GOODBYE; one a reply
+        // settled has already had its GOODBYE decided by the reply path.
+        if self
             .forwarding
             .mark_route_bind_relay_enqueued(endpoint, relay_corr)
             .map_err(RouterError::Forwarding)?
+            == crate::forwarding::RouteBindRelayMark::ReleasedWithoutReply
         {
             self.send_abandoned_route_bind_goodbye(
                 &module_sink,
@@ -3759,7 +4868,10 @@ impl ControlHandler {
             );
         }
 
-        match timeout_at(relay_deadline, receiver).await {
+        timings.enter(RouteOpenPhase::BindAckWait);
+        let outcome = timeout_at(relay_deadline, receiver).await;
+        timings.enter(RouteOpenPhase::Admission);
+        match outcome {
             Ok(Ok(RouteBindRelayOutcome::Accepted)) => {
                 reservation.disarm();
                 if breaker.record_accepted() {
@@ -3971,32 +5083,36 @@ impl ControlHandler {
                 status.spawned_from.as_deref(),
                 image,
             ));
-            modules.push(SupervisorEntry {
-                // Keep the retired policy field on the wire for one release so
-                // existing status consumers still receive the platform policy.
-                launch_nonce_env: Some(!cfg!(unix)),
-                module_id: status.module_id,
-                state: status.state.to_string(),
-                enabled: status.enabled,
-                live: status.live,
-                protocol: status.protocol,
-                health: status.health.status,
-                pending_reload,
-                last_probe_ms: status.health.last_probe_ms,
-                last_exit_code: status.last_exit.as_ref().and_then(|e| e.code),
-                last_exit_signal: status.last_exit.as_ref().and_then(|e| e.signal),
-                last_exit_ms: status.last_exit.as_ref().map(|e| e.at_ms),
-                last_exit_kind: status.last_exit.as_ref().map(|e| e.kind.into()),
-                restart_count: Some(status.restart_count),
-                max_restarts: Some(status.max_restarts),
-                lifetime_restarts: Some(status.lifetime_restarts),
-                spawn_generation: Some(status.spawn_generation),
-                restart_window_secs: Some(status.restart_window.as_secs()),
-                drain_timeout_ms: Some(status.drain_timeout.as_millis() as u64),
-                restart_backoff_ms: Some(status.restart_backoff.as_millis() as u64),
-                restart_max_backoff_ms: Some(status.restart_max_backoff.as_millis() as u64),
-                resources,
-            });
+            // Keep the retired policy field on the wire for one release so
+            // existing status consumers still receive the platform policy.
+            modules.push(
+                SupervisorEntry::new(
+                    status.module_id,
+                    status.state.to_string(),
+                    status.enabled,
+                    status.live,
+                    status.health.status,
+                )
+                .with_launch_nonce_env(Some(!cfg!(unix)))
+                .with_launch_nonce_source(status.launch_nonce_source)
+                .with_waiting_for_previous_pid(status.waiting_for_previous_pid)
+                .with_protocol(status.protocol)
+                .with_pending_reload(pending_reload)
+                .with_last_probe_ms(status.health.last_probe_ms)
+                .with_last_exit_code(status.last_exit.as_ref().and_then(|e| e.code))
+                .with_last_exit_signal(status.last_exit.as_ref().and_then(|e| e.signal))
+                .with_last_exit_ms(status.last_exit.as_ref().map(|e| e.at_ms))
+                .with_last_exit_kind(status.last_exit.as_ref().map(|e| e.kind.into()))
+                .with_restart_count(Some(status.restart_count))
+                .with_max_restarts(Some(status.max_restarts))
+                .with_lifetime_restarts(Some(status.lifetime_restarts))
+                .with_spawn_generation(Some(status.spawn_generation))
+                .with_restart_window_secs(Some(status.restart_window.as_secs()))
+                .with_drain_timeout_ms(Some(status.drain_timeout.as_millis() as u64))
+                .with_restart_backoff_ms(Some(status.restart_backoff.as_millis() as u64))
+                .with_restart_max_backoff_ms(Some(status.restart_max_backoff.as_millis() as u64))
+                .with_resources(resources),
+            );
         }
         let response = ClientControlResponse::SupervisorList {
             generation,
@@ -4195,6 +5311,7 @@ impl ControlHandler {
                 module_id: status.module_id,
                 module_declared,
                 daemon_observed: SupervisorObservedProcess {
+                    launch_nonce_source: status.launch_nonce_source,
                     pid: status.pid,
                     spawned_at_ms: status.spawned_at_ms,
                     spawned_from: status.spawned_from,
@@ -4217,7 +5334,7 @@ impl ControlHandler {
                     .observe(
                         self.daemon_provenance.pid,
                         self.daemon_provenance.executable_path.as_deref(),
-                        self.daemon_provenance.executable_identity,
+                        self.daemon_provenance.executable_identity.clone(),
                         self.daemon_provenance.process_start_time,
                     )
                     .await,
@@ -4286,6 +5403,7 @@ impl ControlHandler {
         frame: Frame,
         module_id: String,
         drain_timeout_ms: Option<u64>,
+        requester: Principal,
     ) -> Result<Vec<Frame>, RouterError> {
         let operation_lock = self.supervisor.operation_lock();
         let _operation_guard = operation_lock.lock().await;
@@ -4298,7 +5416,10 @@ impl ControlHandler {
         };
 
         self.route_outages.mark_operator_action(&module_id);
-        if let Err(err) = module.restart(drain_timeout_ms).await {
+        if let Err(err) = module
+            .restart_requested(drain_timeout_ms, Some(requester))
+            .await
+        {
             self.route_outages
                 .operator_action_ended_unrefused(&module_id);
             let (code, message) = match err {
@@ -4335,6 +5456,7 @@ impl ControlHandler {
         frame: Frame,
         module_id: String,
         ready_timeout_ms: Option<u64>,
+        requester: Principal,
     ) -> Result<Vec<Frame>, RouterError> {
         // The daemon-wide operation lock is held only to resolve the handle,
         // not across the swap. The swap can take its whole readiness budget,
@@ -4357,7 +5479,7 @@ impl ControlHandler {
 
         self.route_outages.mark_operator_action(&module_id);
         if let Err(err) = module
-            .swap(ready_timeout_ms.map(Duration::from_millis))
+            .swap_requested(ready_timeout_ms.map(Duration::from_millis), Some(requester))
             .await
         {
             self.route_outages
@@ -4412,6 +5534,7 @@ impl ControlHandler {
         &self,
         frame: Frame,
         module_id: String,
+        requester: Principal,
     ) -> Result<Vec<Frame>, RouterError> {
         let operation_lock = self.supervisor.operation_lock();
         let _operation_guard = operation_lock.lock().await;
@@ -4424,7 +5547,7 @@ impl ControlHandler {
         };
 
         self.route_outages.mark_operator_action(&module_id);
-        if let Err(err) = module.reload().await {
+        if let Err(err) = module.reload_requested(Some(requester)).await {
             self.route_outages
                 .operator_action_ended_unrefused(&module_id);
             let (code, message) = match err {
@@ -4457,6 +5580,7 @@ impl ControlHandler {
         &self,
         frame: Frame,
         preview: bool,
+        requester: Principal,
     ) -> Result<Vec<Frame>, RouterError> {
         let Some(context) = self.rescan.clone() else {
             return Ok(vec![control_error_frame(
@@ -4468,7 +5592,7 @@ impl ControlHandler {
 
         let operation_lock = self.supervisor.operation_lock();
         let _operation_guard = operation_lock.lock().await;
-        let loaded = match crate::daemon_config::load(&context.config_path) {
+        let loaded = match crate::daemon_config::load_with_activity(&context.config_path) {
             Ok(config) => config,
             Err(err) => {
                 return Ok(vec![control_error_frame(
@@ -4485,7 +5609,7 @@ impl ControlHandler {
         // writing via write-new-then-rename, or a half-finished edit, is enough
         // to open that window. Refuse instead: a config that cannot be read
         // carries no instruction to remove anything.
-        let Some(config) = loaded else {
+        let Some((config, activity_config)) = loaded else {
             return Ok(vec![control_error_frame(
                 &frame,
                 "invalid_daemon_config",
@@ -4502,6 +5626,7 @@ impl ControlHandler {
             admission_facts_carrier_module_id,
             admission_facts_targets,
             scope_authority_owners,
+            privileged_operator_prompt,
             modules,
             reserved_capabilities,
         ) = (
@@ -4510,6 +5635,7 @@ impl ControlHandler {
             config.admission_facts_carrier_module_id,
             config.admission_facts_targets,
             config.scope_authority_owners,
+            config.privileged_operator_prompt,
             config.modules,
             config.reserved_capabilities,
         );
@@ -4535,6 +5661,9 @@ impl ControlHandler {
                 }
                 RestartRequiredSection::ScopeAuthorityOwners => {
                     scope_authority_owners != context.scope_authority_owners
+                }
+                RestartRequiredSection::PrivilegedOperatorPrompt => {
+                    privileged_operator_prompt != context.privileged_operator_prompt
                 }
             };
             if changed {
@@ -4589,7 +5718,7 @@ impl ControlHandler {
             Vec::new()
         };
         let result = match self
-            .reconcile_supervised_modules(&context.supervisor, modules, preview)
+            .reconcile_supervised_modules(&context.supervisor, modules, preview, requester.clone())
             .await
         {
             Ok(result) => result,
@@ -4598,6 +5727,15 @@ impl ControlHandler {
             }
         };
         if !preview {
+            if let Some(ledger) = &self.activity {
+                ledger.module_rescanned(&result.added, &result.removed, requester);
+            }
+            if let Err(code) = self.configure_activity(activity_config).await {
+                warn!(
+                    code,
+                    "activity retention could not be applied during rescan"
+                );
+            }
             self.capability_evaluator
                 .configure(configured_capabilities, reserved_capabilities);
             self.capability_evaluator.wake_deadline_loop();
@@ -4695,6 +5833,7 @@ impl ControlHandler {
         supervisor: &Supervisor,
         configured_modules: Vec<crate::daemon_config::ConfiguredModule>,
         preview: bool,
+        requester: Principal,
     ) -> Result<SupervisorRescanResult, String> {
         let mut current = BTreeMap::new();
         for module in self.supervisor.list() {
@@ -4790,9 +5929,12 @@ impl ControlHandler {
                 .get(module_id)
                 .expect("removed module came from current supervisor state")
                 .0;
-            module.retire().await.map_err(|err| {
-                format!("failed to retire module_id '{module_id}' during rescan: {err}")
-            })?;
+            module
+                .retire_requested(Some(requester.clone()))
+                .await
+                .map_err(|err| {
+                    format!("failed to retire module_id '{module_id}' during rescan: {err}")
+                })?;
             // TOMBSTONE BEFORE RETIRE, and the order is the whole fix.
             //
             // `handle_route_open` resolves an absent module in three steps:
@@ -4857,7 +5999,7 @@ impl ControlHandler {
                 // edit to the config, so the resulting outage was asked for.
                 self.route_outages.mark_operator_action(module_id);
                 module
-                    .set_enabled(configured_module.enabled)
+                    .set_enabled_requested(configured_module.enabled, Some(requester.clone()))
                     .await
                     .map_err(|err| {
                         self.route_outages.operator_action_ended_unrefused(module_id);
@@ -4874,12 +6016,13 @@ impl ControlHandler {
                 .get(module_id)
                 .expect("added module id came from configured map");
             supervisor
-                .supervise_configured_with_health(
+                .supervise_configured_requested(
                     configured_module.module_spec(),
                     configured_module.enabled,
                     configured_module.health.clone(),
                     configured_module.drain_timeout_ms,
                     configured_module.restart,
+                    Some(requester.clone()),
                 )
                 .map_err(|err| {
                     format!("failed to add module_id '{module_id}' during rescan: {err}")
@@ -4905,6 +6048,7 @@ impl ControlHandler {
         frame: Frame,
         module_id: String,
         enabled: bool,
+        requester: Principal,
     ) -> Result<Vec<Frame>, RouterError> {
         let operation_lock = self.supervisor.operation_lock();
         let _operation_guard = operation_lock.lock().await;
@@ -4919,7 +6063,7 @@ impl ControlHandler {
         // Enabling counts as well as disabling: a module an operator starts
         // is refused until it registers, and that wait was asked for.
         self.route_outages.mark_operator_action(&module_id);
-        let applied = match module.set_enabled(enabled).await {
+        let applied = match module.set_enabled_requested(enabled, Some(requester)).await {
             Ok(applied) => applied,
             Err(err) => {
                 self.route_outages
@@ -5562,8 +6706,11 @@ impl ControlHandler {
         // GOODBYE ends the connection's logical session even when its socket
         // stays open. Use disconnect teardown so verdicts, client notices and
         // scope authority are released at the same lifecycle boundary.
-        self.cleanup_connection(connection_id)
-            .map_err(|err| RouterError::backend(0, 0, err.to_string()))?;
+        self.cleanup_connection_with_end_reason(
+            connection_id,
+            RegistrationEndReason::ExplicitGoodbye,
+        )
+        .map_err(|err| RouterError::backend(0, 0, err.to_string()))?;
         Ok(Vec::new())
     }
 }
@@ -5728,12 +6875,31 @@ fn log_slow_control_dispatch(
     op: &'static str,
     connection_id: ConnectionId,
     corr: u64,
+    route_open_timings: Option<&RouteOpenTimings>,
 ) {
     let Some(dispatch_started_at) = dispatch_started_at else {
         return;
     };
-    let elapsed = dispatch_started_at.elapsed();
+    // Use the same monotonic clock as the phase timers and relay deadline.
+    let elapsed = Instant::from_std(dispatch_started_at).elapsed();
     if elapsed >= SLOW_CONTROL_DISPATCH_THRESHOLD {
+        if let Some(timings) = route_open_timings {
+            warn!(
+                op = %op,
+                connection_id = connection_id.get(),
+                corr,
+                elapsed_ms = elapsed.as_millis() as u64,
+                module_id = ?timings.module_id,
+                principal = %timings.principal,
+                admission_ms = timings.admission.as_millis() as u64,
+                project_root_ms = timings.project_root.as_millis() as u64,
+                egress_reservation_ms = timings.egress_reservation.as_millis() as u64,
+                bind_send_ms = timings.bind_send.as_millis() as u64,
+                bind_ack_wait_ms = timings.bind_ack_wait.as_millis() as u64,
+                "slow control dispatch"
+            );
+            return;
+        }
         warn!(
             op = %op,
             connection_id = connection_id.get(),
@@ -5741,6 +6907,55 @@ fn log_slow_control_dispatch(
             elapsed_ms = elapsed.as_millis() as u64,
             "slow control dispatch"
         );
+    }
+}
+
+/// A test stand-in for the OS caller lookup, given the recorded endpoints.
+#[cfg(test)]
+type TestCallerLookup =
+    Arc<dyn Fn(Option<(SocketAddr, SocketAddr)>) -> CallerIdentity + Send + Sync>;
+
+/// Every new client operation needs an explicit privilege decision here.
+fn privileged_operation(request: &ClientControlRequest) -> Option<PrivilegedOperation<'_>> {
+    match request {
+        ClientControlRequest::SupervisorRestart { module_id, .. } => {
+            Some(PrivilegedOperation::Restart { module_id })
+        }
+        ClientControlRequest::SupervisorSwap { module_id, .. } => {
+            Some(PrivilegedOperation::Swap { module_id })
+        }
+        ClientControlRequest::SupervisorReload { module_id } => {
+            Some(PrivilegedOperation::Reload { module_id })
+        }
+        ClientControlRequest::SupervisorRescan { preview } => {
+            if *preview {
+                None
+            } else {
+                Some(PrivilegedOperation::Rescan)
+            }
+        }
+        ClientControlRequest::SupervisorSetEnabled { module_id, enabled } => {
+            Some(PrivilegedOperation::SetEnabled {
+                module_id,
+                enabled: *enabled,
+            })
+        }
+        ClientControlRequest::SupervisorReleaseReserved { module_id } => {
+            Some(PrivilegedOperation::ReleaseReserved { module_id })
+        }
+        ClientControlRequest::ServerDescribe {}
+        | ClientControlRequest::CatalogList { .. }
+        | ClientControlRequest::RouteOpen { .. }
+        | ClientControlRequest::RoutePoll { .. }
+        | ClientControlRequest::SupervisorList {}
+        | ClientControlRequest::SupervisorHealth {}
+        | ClientControlRequest::SupervisorHealthProbe { .. }
+        | ClientControlRequest::SupervisorRoutes { .. }
+        | ClientControlRequest::SupervisorProvenance { .. }
+        | ClientControlRequest::SupervisorStderrTail { .. }
+        | ClientControlRequest::SupervisorTerminals { .. }
+        | ClientControlRequest::SupervisorSpawnSnapshot {}
+        | ClientControlRequest::SupervisorSpawnSubscribe { .. } => None,
     }
 }
 
@@ -5768,11 +6983,20 @@ fn client_control_request_op(request: &ClientControlRequest) -> &'static str {
     }
 }
 
+fn principal_label(principal: &Principal) -> String {
+    match principal {
+        Principal::Reserved { module_id } => format!("reserved:{module_id}"),
+        Principal::Direct => "direct".to_string(),
+        other => format!("{other:?}"),
+    }
+}
+
 fn module_control_request_op(request: &ModuleControlRequestFromModule) -> &'static str {
     match request {
         ModuleControlRequestFromModule::CatalogUpdate { .. } => MODULE_TO_SUBC_OP_CATALOG_UPDATE,
         ModuleControlRequestFromModule::LiveRoots {} => "supervisor.live_roots",
         ModuleControlRequestFromModule::ScopeSync { .. } => SCOPE_SYNC_OP,
+        ModuleControlRequestFromModule::ScopeApply { .. } => SCOPE_APPLY_OP,
         ModuleControlRequestFromModule::ScopeDescribe { .. } => SCOPE_DESCRIBE_OP,
     }
 }
@@ -6061,7 +7285,7 @@ fn pong(frame: &Frame) -> Result<Frame, RouterError> {
     .map_err(RouterError::FrameBuild)
 }
 
-fn control_error_frame(
+pub(crate) fn control_error_frame(
     frame: &Frame,
     code: &'static str,
     message: impl Into<String>,
@@ -6305,10 +7529,17 @@ pub(crate) fn send_route_control_pushes(
 
 #[cfg(test)]
 mod tests {
+    mod activity_read {
+        include!("activity_read_tests.rs");
+    }
+
+    mod lifecycle_activity {
+        include!("control_lifecycle_tests.rs");
+    }
     #[cfg(unix)]
     #[tokio::test]
     async fn rescan_health_only_is_live_but_launch_edits_need_reload() {
-        let dir = subc_test_support::TestTempDir::new("rescan-live-health");
+        let dir = cortexkit_test_support::ScratchDir::new("rescan-live-health");
         let path = dir.join("subc.jsonc");
         std::fs::write(&path, serde_json::json!({"version":1,"modules":{"stock":{
             "program":"/bin/sleep","args":["60"],"protocol":"none",
@@ -6338,7 +7569,12 @@ mod tests {
         configured.health.http = Some("http://127.0.0.1:1/healthz".into());
         configured.health.cadence = std::time::Duration::from_secs(3600);
         let health_only = handler
-            .reconcile_supervised_modules(&supervisor, vec![configured.clone()], false)
+            .reconcile_supervised_modules(
+                &supervisor,
+                vec![configured.clone()],
+                false,
+                Principal::Direct,
+            )
             .await
             .unwrap();
         assert!(
@@ -6352,7 +7588,7 @@ mod tests {
         );
         configured.args = vec!["61".into()];
         let launch = handler
-            .reconcile_supervised_modules(&supervisor, vec![configured], false)
+            .reconcile_supervised_modules(&supervisor, vec![configured], false, Principal::Direct)
             .await
             .unwrap();
         assert_eq!(launch.changed_pending_reload, ["stock"]);
@@ -6363,6 +7599,7 @@ mod tests {
         );
         module.drain().await.unwrap();
     }
+    use cortexkit_test_support::ScratchDir;
     use std::{
         collections::BTreeMap,
         fmt,
@@ -6370,7 +7607,6 @@ mod tests {
         sync::{Arc, Mutex},
         time::Duration,
     };
-    use subc_test_support::TestTempDir;
 
     use serde_json::{json, Value};
     use subc_protocol::{
@@ -6798,14 +8034,14 @@ mod tests {
         Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
     }
 
-    fn route_open_frame(corr: u64, module_id: &str, project_root: TestTempDir) -> Frame {
+    fn route_open_frame(corr: u64, module_id: &str, project_root: ScratchDir) -> Frame {
         route_open_frame_with_consumer_capabilities(corr, module_id, project_root, None)
     }
 
     fn route_open_frame_with_consumer_capabilities(
         corr: u64,
         module_id: &str,
-        project_root: TestTempDir,
+        project_root: ScratchDir,
         consumer_capabilities: Option<Vec<String>>,
     ) -> Frame {
         let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
@@ -6830,7 +8066,7 @@ mod tests {
     fn route_open_frame_with_role_versions(
         corr: u64,
         module_id: &str,
-        project_root: TestTempDir,
+        project_root: ScratchDir,
         role_versions: Option<BTreeMap<String, String>>,
     ) -> Frame {
         let body = serde_json::to_vec(&ClientControlRequest::RouteOpen {
@@ -6862,7 +8098,7 @@ mod tests {
     fn route_open_frame_with_admission_facts(
         corr: u64,
         module_id: &str,
-        project_root: TestTempDir,
+        project_root: ScratchDir,
         consumer_identity: Option<subc_control::ConsumerIdentity>,
         facts: Option<Value>,
     ) -> Frame {
@@ -6945,8 +8181,8 @@ mod tests {
         Frame::build(FrameType::Response, control_flags(), 0, 0, corr, body).unwrap()
     }
 
-    fn unique_project_root(label: &str) -> TestTempDir {
-        TestTempDir::new(label)
+    fn unique_project_root(label: &str) -> ScratchDir {
+        ScratchDir::new(label)
     }
 
     fn assert_route_poll_liveness(frame: &Frame, expected_live: bool) {
@@ -7129,7 +8365,7 @@ mod tests {
     /// running while the read is paused.
     #[tokio::test(flavor = "current_thread")]
     async fn supervisor_terminals_reads_the_journal_off_the_runtime_worker() {
-        let dir = TestTempDir::new("terminals-off-worker");
+        let dir = ScratchDir::new("terminals-off-worker");
         let journal_path = dir.join("terminals.jsonl");
         let registry = Arc::new(Registry::default());
         let supervisor_handle = SupervisorHandle::new();
@@ -8408,6 +9644,403 @@ mod tests {
             parse_error(&second_response[0])["code"],
             "target_unavailable"
         );
+    }
+
+    /// One `catalog.list` as a client sees it: the generation and the listed
+    /// module ids with their readiness.
+    async fn catalog_snapshot(
+        handler: &ControlHandler,
+        client_ctx: &RouteCtx,
+        corr: u64,
+    ) -> (u64, Vec<(String, bool)>) {
+        let body =
+            serde_json::to_vec(&ClientControlRequest::CatalogList { module_id: None }).unwrap();
+        let request = Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap();
+        let reply = handler
+            .handle_control_frame(client_ctx, request)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let ClientControlResponse::CatalogList {
+            generation,
+            modules,
+            ..
+        } = serde_json::from_slice(&reply.body).unwrap()
+        else {
+            panic!("not a catalog.list reply");
+        };
+        (
+            generation,
+            modules
+                .into_iter()
+                .map(|entry| (entry.module_id, entry.ready))
+                .collect(),
+        )
+    }
+
+    /// A handler whose HELLO for module "aft" on connection 40 is parked
+    /// between reserving its registry entry and installing its forwarding
+    /// endpoint. Returns the handler, the two-party barrier (wait once to know
+    /// the HELLO is parked, once more to release it), the HELLO's thread, and
+    /// the module's context and receiver.
+    fn hello_held_before_forwarding() -> (
+        ControlHandler,
+        Arc<std::sync::Barrier>,
+        std::thread::JoinHandle<Vec<Frame>>,
+        RouteCtx,
+        mpsc::Receiver<crate::router::OutboundFrame>,
+    ) {
+        let hold = Arc::new(std::sync::Barrier::new(2));
+        let handler = ControlHandler::with_forwarding(
+            Arc::new(Registry::default()),
+            Arc::new(ForwardingTable::default()),
+        )
+        .with_hello_registry_to_forwarding_hold(Arc::clone(&hold));
+        let (module_ctx, module_rx) = route_ctx(ConnectionId::new(40));
+        let hello = {
+            let handler = handler.clone();
+            let module_ctx = module_ctx.clone();
+            std::thread::spawn(move || {
+                handler
+                    .handle_hello(
+                        module_ctx.connection_id,
+                        Some(module_ctx.egress.clone()),
+                        hello_frame("aft", PROTOCOL_VERSION, 7),
+                    )
+                    .unwrap()
+            })
+        };
+        (handler, hold, hello, module_ctx, module_rx)
+    }
+
+    /// While a HELLO has reserved its registry entry but its forwarding
+    /// endpoint is not installed yet, `route.open` to the module can only be
+    /// refused. `catalog.list` must not list the module in that window: a
+    /// client that opens a route as soon as it sees a module listed and ready
+    /// would be refused for a module the daemon had just advertised. The
+    /// refusal in the window stays the retryable `target_unavailable`, never
+    /// `unknown_module`, and the id stays claimed against a duplicate HELLO.
+    /// Once the HELLO completes, the module is listed and a route to it opens.
+    #[tokio::test]
+    async fn module_is_listed_only_once_route_open_to_it_can_succeed() {
+        let (handler, hold, hello, module_ctx, mut module_rx) = hello_held_before_forwarding();
+        let client = ConnectionId::new(41);
+        let (client_ctx, mut client_rx) = route_ctx(client);
+
+        hold.wait();
+        // Parked: the registry holds "aft", forwarding has no endpoint for it.
+        assert!(handler.registry.get_module("aft").unwrap().is_some());
+        assert!(!handler
+            .forwarding
+            .has_live_module_connection("aft")
+            .unwrap());
+        let (_, listed) = catalog_snapshot(&handler, &client_ctx, 300).await;
+        assert!(
+            listed.is_empty(),
+            "catalog.list listed a module route.open cannot reach yet: {listed:?}"
+        );
+        let refused = handler
+            .handle_control_frame(
+                &client_ctx,
+                route_open_frame(301, "aft", unique_project_root("listed-window")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(parse_error(&refused[0])["code"], "target_unavailable");
+        let (duplicate_ctx, _duplicate_rx) = route_ctx(ConnectionId::new(42));
+        let duplicate = handler
+            .handle_control_frame(&duplicate_ctx, hello_frame("aft", PROTOCOL_VERSION, 8))
+            .await
+            .unwrap();
+        assert_eq!(parse_error(&duplicate[0])["code"], "duplicate_module_id");
+
+        hold.wait();
+        assert!(hello.join().unwrap().is_empty(), "HELLO succeeds");
+        let ack = module_rx.try_recv().unwrap().frame;
+        assert_eq!(ack.header.ty, FrameType::HelloAck);
+        let (_, listed) = catalog_snapshot(&handler, &client_ctx, 302).await;
+        assert_eq!(listed, vec![("aft".to_string(), true)]);
+
+        let (open_task, bind) = relay_route_open(
+            &handler,
+            client,
+            &client_ctx.egress,
+            &mut module_rx,
+            303,
+            "aft",
+            "listed-after",
+        )
+        .await;
+        assert!(handler
+            .handle_control_frame(&module_ctx, route_bind_ack(bind.header.corr))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(open_task.await.unwrap().is_empty(), "route.open accepted");
+        published_route(&client_rx.try_recv().unwrap().frame);
+    }
+
+    /// A catalog watcher keys on the generation: when it changes, it re-reads
+    /// the listing. So the generation must advance exactly when the module
+    /// appears. If it advanced while the module was still hidden, a watcher
+    /// would read the new generation without the module, and the module would
+    /// later appear under that same generation with nothing telling the
+    /// watcher to look again.
+    #[tokio::test]
+    async fn catalog_generation_advances_when_the_module_appears_and_not_before() {
+        let (handler, hold, hello, _module_ctx, _module_rx) = hello_held_before_forwarding();
+        let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(41));
+        let (before, _) = catalog_snapshot(&handler, &client_ctx, 300).await;
+
+        hold.wait();
+        let (during, listed) = catalog_snapshot(&handler, &client_ctx, 301).await;
+        assert!(listed.is_empty());
+        assert_eq!(
+            during, before,
+            "the generation moved while the module was not listed"
+        );
+
+        hold.wait();
+        assert!(hello.join().unwrap().is_empty(), "HELLO succeeds");
+        let (after, listed) = catalog_snapshot(&handler, &client_ctx, 302).await;
+        assert_eq!(listed, vec![("aft".to_string(), true)]);
+        assert_eq!(
+            after,
+            before + 1,
+            "the module appeared without exactly one generation bump"
+        );
+    }
+
+    /// A HELLO whose forwarding endpoint cannot be installed (here the
+    /// module's sink is already closed, so its HELLO_ACK cannot be queued) is
+    /// refused and leaves nothing behind: no registry entry, no catalog entry,
+    /// and the catalog generation where it was.
+    #[tokio::test]
+    async fn failed_forwarding_registration_leaves_no_registry_or_catalog_trace() {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::with_forwarding(
+            Arc::clone(&registry),
+            Arc::new(ForwardingTable::default()),
+        );
+        let (client_ctx, _client_rx) = route_ctx(ConnectionId::new(41));
+        let (before, _) = catalog_snapshot(&handler, &client_ctx, 300).await;
+        let (module_ctx, module_rx) = route_ctx(ConnectionId::new(40));
+        drop(module_rx);
+
+        let replies = handler
+            .handle_control_frame(&module_ctx, hello_frame("aft", PROTOCOL_VERSION, 7))
+            .await
+            .unwrap();
+        assert_eq!(replies[0].header.ty, FrameType::Error, "{replies:?}");
+        assert!(registry.get_module("aft").unwrap().is_none());
+        assert!(registry
+            .get_module_by_connection(module_ctx.connection_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            catalog_snapshot(&handler, &client_ctx, 301).await,
+            (before, Vec::new())
+        );
+    }
+
+    /// A handler whose `route.open` parks after queueing the route.bind and
+    /// before marking it enqueued, with module "aft" registered on connection
+    /// 40. Returns the two-party barrier that parks and releases it.
+    async fn route_open_held_after_bind_send() -> (
+        ControlHandler,
+        Arc<tokio::sync::Barrier>,
+        RouteCtx,
+        mpsc::Receiver<crate::router::OutboundFrame>,
+    ) {
+        let hold = Arc::new(tokio::sync::Barrier::new(2));
+        let handler = ControlHandler::with_forwarding(
+            Arc::new(Registry::default()),
+            Arc::new(ForwardingTable::default()),
+        )
+        .with_route_bind_relay_sent_hold(Arc::clone(&hold));
+        let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(40));
+        hello_via_sink(
+            &handler,
+            &module_ctx,
+            &mut module_rx,
+            hello_frame("aft", PROTOCOL_VERSION, 7),
+        )
+        .await;
+        (handler, hold, module_ctx, module_rx)
+    }
+
+    /// A fast module acks the route.bind, and the reader commits the route,
+    /// before `route.open` has marked the relay enqueued. The daemon used to
+    /// read the missing relay as an abandoned bind and send the module a
+    /// GOODBYE for the route it had just committed: the client was told its
+    /// route was open, the module unbound the channel, and the client's first
+    /// request was dropped on the module side as unbound.
+    #[tokio::test]
+    async fn bind_acked_before_the_enqueue_mark_commits_without_a_module_goodbye() {
+        let (handler, hold, module_ctx, mut module_rx) = route_open_held_after_bind_send().await;
+        let client = ConnectionId::new(41);
+        let (client_ctx, mut client_rx) = route_ctx(client);
+
+        let (open_task, bind) = relay_route_open(
+            &handler,
+            client,
+            &client_ctx.egress,
+            &mut module_rx,
+            200,
+            "aft",
+            "acked-before-mark",
+        )
+        .await;
+        let (module_channel, module_epoch) = route_bind_channel(&bind);
+        // route.open is now parked between queueing the bind and marking it.
+        hold.wait().await;
+
+        // The module answers inside that window, and the route commits.
+        assert!(handler
+            .handle_control_frame(&module_ctx, route_bind_ack(bind.header.corr))
+            .await
+            .unwrap()
+            .is_empty());
+        let (client_channel, client_epoch) = published_route(&client_rx.try_recv().unwrap().frame);
+
+        hold.wait().await;
+        assert!(
+            open_task.await.unwrap().is_empty(),
+            "route.open answers accepted"
+        );
+
+        // Every frame route.open could have sent is already queued, because it
+        // has returned; the module must have been sent nothing.
+        match module_rx.try_recv() {
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Ok(outbound) => panic!(
+                "module was sent {:?} on channel {} epoch {} for a route the daemon committed",
+                outbound.frame.header.ty,
+                outbound.frame.header.channel,
+                outbound.frame.header.epoch
+            ),
+            Err(err) => panic!("module egress closed: {err}"),
+        }
+
+        // The client's first request on the route is the next thing the module
+        // reads, on the binding it just created.
+        let router = Router::with_control_handler(Arc::new(handler.clone()));
+        let request = Frame::build(
+            FrameType::Request,
+            Flags::new(true, Priority::Interactive, false),
+            client_channel,
+            client_epoch,
+            201,
+            b"first request".to_vec(),
+        )
+        .unwrap();
+        router
+            .route_for_connection(&client_ctx, request)
+            .await
+            .unwrap();
+        let delivered = module_rx.try_recv().unwrap().frame;
+        assert_eq!(delivered.header.ty, FrameType::Request);
+        assert_eq!(
+            (delivered.header.channel, delivered.header.epoch),
+            (module_channel, module_epoch)
+        );
+        assert_eq!(delivered.body, b"first request");
+    }
+
+    /// The client goes away while `route.open` is still queueing the bind, so
+    /// the relay is dropped with no module reply. The teardown cannot send the
+    /// GOODBYE itself (it could reach the module ahead of the bind), so
+    /// `route.open` must send it once the bind is queued; otherwise the module
+    /// keeps a binding the daemon will never commit.
+    #[tokio::test]
+    async fn bind_released_before_the_enqueue_mark_still_sends_the_module_a_goodbye() {
+        let (handler, hold, _module_ctx, mut module_rx) = route_open_held_after_bind_send().await;
+        let client = ConnectionId::new(42);
+        let (client_ctx, _client_rx) = route_ctx(client);
+
+        let (open_task, bind) = relay_route_open(
+            &handler,
+            client,
+            &client_ctx.egress,
+            &mut module_rx,
+            300,
+            "aft",
+            "released-before-mark",
+        )
+        .await;
+        let (module_channel, module_epoch) = route_bind_channel(&bind);
+        hold.wait().await;
+
+        handler.cleanup_connection(client).unwrap();
+        assert!(
+            module_rx.try_recv().is_err(),
+            "client teardown must not GOODBYE a bind route.open is still queueing"
+        );
+
+        hold.wait().await;
+        let response = open_task.await.unwrap();
+        assert_eq!(response.len(), 1);
+        assert_eq!(parse_error(&response[0])["code"], "target_unavailable");
+
+        let goodbye = module_rx
+            .try_recv()
+            .expect("module is told to drop the binding the daemon abandoned")
+            .frame;
+        assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+        assert_eq!(
+            (goodbye.header.channel, goodbye.header.epoch),
+            (module_channel, module_epoch)
+        );
+        assert!(module_rx.try_recv().is_err(), "exactly one GOODBYE");
+    }
+
+    /// The module acks inside the same window, but the client's egress closed
+    /// first, so the reader refuses to commit. The ack proves the module holds
+    /// the binding, so the reader sends the GOODBYE, and `route.open` must not
+    /// send a second one.
+    #[tokio::test]
+    async fn bind_acked_for_a_gone_client_before_the_enqueue_mark_sends_exactly_one_goodbye() {
+        let (handler, hold, module_ctx, mut module_rx) = route_open_held_after_bind_send().await;
+        let client = ConnectionId::new(43);
+        let (client_ctx, client_rx) = route_ctx(client);
+
+        let (open_task, bind) = relay_route_open(
+            &handler,
+            client,
+            &client_ctx.egress,
+            &mut module_rx,
+            400,
+            "aft",
+            "gone-client-before-mark",
+        )
+        .await;
+        let (module_channel, module_epoch) = route_bind_channel(&bind);
+        hold.wait().await;
+
+        drop(client_rx);
+        assert!(client_ctx.egress.is_closed());
+        handler
+            .handle_control_frame(&module_ctx, route_bind_ack(bind.header.corr))
+            .await
+            .unwrap();
+
+        hold.wait().await;
+        let response = open_task.await.unwrap();
+        assert_eq!(response.len(), 1);
+        assert_eq!(parse_error(&response[0])["code"], "target_unavailable");
+
+        let goodbye = module_rx
+            .try_recv()
+            .expect("module is told to drop the binding it acked")
+            .frame;
+        assert_eq!(goodbye.header.ty, FrameType::Goodbye);
+        assert_eq!(
+            (goodbye.header.channel, goodbye.header.epoch),
+            (module_channel, module_epoch)
+        );
+        assert!(module_rx.try_recv().is_err(), "exactly one GOODBYE");
+        assert_eq!(handler.forwarding.active_binding_count().unwrap(), 0);
     }
 
     /// The fence at the module-loop boundary, stated as its own contract: which
@@ -9729,6 +11362,116 @@ mod tests {
         );
     }
 
+    /// `catalog-events/v1` is in `server.describe`, so a consumer can tell a
+    /// catalog entry without `events` (the module declares none) from a daemon
+    /// that never reports declared events.
+    #[tokio::test]
+    async fn catalog_events_capability_is_advertised() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let body = serde_json::to_vec(&ClientControlRequest::ServerDescribe {}).unwrap();
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 5, body).unwrap();
+        let reply = handler
+            .handle_control_frame(&route_ctx(ConnectionId::new(151)).0, frame)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let ClientControlResponse::ServerDescribe { capabilities, .. } =
+            serde_json::from_slice(&reply.body).unwrap()
+        else {
+            panic!("not a server.describe reply");
+        };
+        assert!(
+            capabilities
+                .iter()
+                .any(|c| c == subc_protocol::manifest::CAP_CATALOG_EVENTS_V1),
+            "{capabilities:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_bind_proof_capability_is_advertised_in_hello_ack_and_server_describe() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let (module, mut module_rx) = route_ctx(ConnectionId::new(152));
+        let ack = hello_via_sink(
+            &handler,
+            &module,
+            &mut module_rx,
+            hello_frame("scope-proof-owner", PROTOCOL_VERSION, 1),
+        )
+        .await;
+        let ack = parse_ack(&ack);
+        assert!(
+            ack.subc_capabilities
+                .iter()
+                .any(|c| c == subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1),
+            "{:?}",
+            ack.subc_capabilities
+        );
+        assert!(ack
+            .subc_capabilities
+            .iter()
+            .any(|c| c == subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V2));
+
+        let (client, _client_rx) = route_ctx(ConnectionId::new(153));
+        let body = serde_json::to_vec(&ClientControlRequest::ServerDescribe {}).unwrap();
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 5, body).unwrap();
+        let reply = handler
+            .handle_control_frame(&client, frame)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let ClientControlResponse::ServerDescribe { capabilities, .. } =
+            serde_json::from_slice(&reply.body).unwrap()
+        else {
+            panic!("not a server.describe reply");
+        };
+        assert!(
+            capabilities
+                .iter()
+                .any(|c| c == subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1),
+            "{capabilities:?}"
+        );
+        assert!(capabilities
+            .iter()
+            .any(|c| c == subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V2));
+    }
+
+    #[tokio::test]
+    async fn scope_replace_if_idle_capability_is_advertised_in_hello_ack_and_server_describe() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let (module, mut rx) = route_ctx(ConnectionId::new(154));
+        let ack = hello_via_sink(
+            &handler,
+            &module,
+            &mut rx,
+            hello_frame("idle-scope-owner", PROTOCOL_VERSION, 1),
+        )
+        .await;
+        assert!(parse_ack(&ack)
+            .subc_capabilities
+            .iter()
+            .any(|cap| cap == subc_protocol::manifest::CAP_SCOPE_REPLACE_IF_IDLE_V1));
+        let (client, _rx) = route_ctx(ConnectionId::new(155));
+        let body = serde_json::to_vec(&ClientControlRequest::ServerDescribe {}).unwrap();
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 5, body).unwrap();
+        let reply = handler
+            .handle_control_frame(&client, frame)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let ClientControlResponse::ServerDescribe { capabilities, .. } =
+            serde_json::from_slice(&reply.body).unwrap()
+        else {
+            panic!("not a server.describe reply")
+        };
+        assert!(capabilities
+            .iter()
+            .any(|cap| cap == subc_protocol::manifest::CAP_SCOPE_REPLACE_IF_IDLE_V1));
+    }
+
     #[tokio::test]
     async fn supervision_only_module_health_probe_does_not_enable_route_open_and_cleans_up() {
         let registry = Arc::new(Registry::default());
@@ -9966,6 +11709,277 @@ mod tests {
         assert_eq!(event.fields.get("in_flight"), Some(&limit.to_string()));
         assert_eq!(event.fields.get("limit"), Some(&limit.to_string()));
         drop(guards);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervisor_set_enabled_logs_request_received_with_direct_caller() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let capture = EventCapture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let (ctx, _rx) = route_ctx(ConnectionId::new(101));
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 1, Vec::new()).unwrap();
+
+        let _ = handler
+            .handle_client_control_request(
+                &ctx,
+                frame,
+                ClientControlRequest::SupervisorSetEnabled {
+                    module_id: "broca".to_string(),
+                    enabled: false,
+                },
+                &mut None,
+            )
+            .await
+            .unwrap();
+
+        let events = capture
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.target == "control"
+                    && event.fields.get("message").map(String::as_str)
+                        == Some("supervisor request received")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1, "one supervisor request log line");
+        let event = &events[0];
+        assert_eq!(event.level, tracing::Level::INFO);
+        assert_eq!(
+            event.fields.get("op"),
+            Some(&format!("{:?}", ops::SUPERVISOR_SET_ENABLED))
+        );
+        assert_eq!(
+            event.fields.get("module_id"),
+            Some(&"\"broca\"".to_string())
+        );
+        assert_eq!(event.fields.get("enabled"), Some(&"false".to_string()));
+        assert_eq!(event.fields.get("connection_id"), Some(&"101".to_string()));
+        assert_eq!(event.fields.get("caller"), Some(&"direct".to_string()));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervisor_request_from_a_registered_module_logs_its_reserved_principal() {
+        let registry = Arc::new(Registry::default());
+        let module_connection = ConnectionId::new(303);
+        registry
+            .register_with_control_ops(
+                manifest("aft", PROTOCOL_VERSION),
+                PROTOCOL_VERSION,
+                module_connection,
+                module_baseline_control_ops(),
+            )
+            .unwrap();
+        let handler = ControlHandler::new(registry);
+        let capture = EventCapture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let (ctx, _rx) = route_ctx(module_connection);
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 1, Vec::new()).unwrap();
+
+        let _ = handler
+            .handle_client_control_request(
+                &ctx,
+                frame,
+                ClientControlRequest::SupervisorSetEnabled {
+                    module_id: "broca".to_string(),
+                    enabled: false,
+                },
+                &mut None,
+            )
+            .await
+            .unwrap();
+
+        let callers = capture
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.fields.get("message").map(String::as_str)
+                    == Some("supervisor request received")
+            })
+            .map(|event| event.fields.get("caller").cloned())
+            .collect::<Vec<_>>();
+        assert_eq!(callers, vec![Some("reserved:aft".to_string())]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervisor_list_does_not_log_request_received() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let capture = EventCapture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let (ctx, _rx) = route_ctx(ConnectionId::new(102));
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 2, Vec::new()).unwrap();
+
+        handler
+            .handle_client_control_request(
+                &ctx,
+                frame,
+                ClientControlRequest::SupervisorList {},
+                &mut None,
+            )
+            .await
+            .unwrap();
+
+        assert!(capture.events().into_iter().all(|event| {
+            event.fields.get("message").map(String::as_str) != Some("supervisor request received")
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervisor_rescan_preview_does_not_log_request_received() {
+        let handler = ControlHandler::new(Arc::new(Registry::default()));
+        let capture = EventCapture::default();
+        let _subscriber =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        let (ctx, _rx) = route_ctx(ConnectionId::new(103));
+        let frame = Frame::build(FrameType::Request, control_flags(), 0, 0, 3, Vec::new()).unwrap();
+
+        handler
+            .handle_client_control_request(
+                &ctx,
+                frame,
+                ClientControlRequest::SupervisorRescan { preview: true },
+                &mut None,
+            )
+            .await
+            .unwrap();
+
+        assert!(capture.events().into_iter().all(|event| {
+            event.fields.get("message").map(String::as_str) != Some("supervisor request received")
+        }));
+    }
+
+    struct ApproveOperator;
+    impl crate::operator_confirm::OperatorProvider for ApproveOperator {
+        fn prompt(
+            &self,
+            _: &str,
+            _: Box<dyn FnOnce(Arc<dyn crate::operator_confirm::OperatorWithdraw>) + Send>,
+        ) -> crate::operator_confirm::ProviderResult {
+            crate::operator_confirm::ProviderResult::Approved
+        }
+    }
+
+    #[tokio::test]
+    async fn privileged_operator_prompt_rescan_reports_changes_without_changing_running_mode() {
+        assert_eq!(
+            ControlHandler::default().privileged_operator_prompt,
+            PrivilegedOperatorPrompt::Log
+        );
+        for (initial, changed, running) in [
+            ("log", "enforce", PrivilegedOperatorPrompt::Log),
+            ("enforce", "log", PrivilegedOperatorPrompt::Enforce),
+        ] {
+            let dir = ScratchDir::new("rescan-privileged-operator-prompt");
+            let path = dir.join("subc.jsonc");
+            std::fs::write(
+                &path,
+                json!({"version":1,"privileged_operator_prompt":initial}).to_string(),
+            )
+            .unwrap();
+            let config = crate::daemon_config::load(&path).unwrap().unwrap();
+            let registry = Arc::new(Registry::default());
+            let handle = SupervisorHandle::new();
+            let supervisor = Supervisor::new(registry.clone(), RestartPolicy::default())
+                .with_handle(handle.clone());
+            let handler = ControlHandler::new(registry)
+                .with_supervisor(handle)
+                .with_privileged_operator_prompt(config.privileged_operator_prompt)
+                .with_supervisor_rescan(supervisor, &path, config.port);
+            handler.forwarding.operator_confirms().configure(
+                Arc::new(ApproveOperator),
+                crate::operator_confirm::OperatorLimits::default(),
+            );
+            let (ctx, _rx) = route_ctx(ConnectionId::new(104));
+
+            for (disk_mode, needs_restart) in [
+                (Some(initial), false),
+                (Some(changed), true),
+                (Some(changed), true),
+                (None, running == PrivilegedOperatorPrompt::Enforce),
+                (Some(initial), false),
+            ] {
+                let mut doc = json!({"version":1});
+                if let Some(mode) = disk_mode {
+                    doc["privileged_operator_prompt"] = json!(mode);
+                }
+                std::fs::write(&path, doc.to_string()).unwrap();
+                for preview in [true, false] {
+                    let request = ClientControlRequest::SupervisorRescan { preview };
+                    let frame = Frame::build(
+                        FrameType::Request,
+                        control_flags(),
+                        0,
+                        0,
+                        1,
+                        serde_json::to_vec(&request).unwrap(),
+                    )
+                    .unwrap();
+                    let frames = handler.handle_control_frame(&ctx, frame).await.unwrap();
+                    assert_eq!(frames.len(), 1);
+                    let ClientControlResponse::SupervisorRescan { result } =
+                        serde_json::from_slice(&frames[0].body).unwrap()
+                    else {
+                        panic!("expected a rescan response");
+                    };
+                    let expected = if needs_restart {
+                        vec!["privileged_operator_prompt"]
+                    } else {
+                        Vec::new()
+                    };
+                    assert_eq!(result.restart_required, expected);
+                    assert_eq!(handler.privileged_operator_prompt, running);
+                    assert_eq!(
+                        handler.rescan.as_ref().unwrap().privileged_operator_prompt,
+                        running
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn privileged_operator_prompt_rescan_refuses_invalid_values() {
+        let dir = ScratchDir::new("rescan-invalid-privileged-operator-prompt");
+        let path = dir.join("subc.jsonc");
+        let registry = Arc::new(Registry::default());
+        let handle = SupervisorHandle::new();
+        let supervisor =
+            Supervisor::new(registry.clone(), RestartPolicy::default()).with_handle(handle.clone());
+        let handler = ControlHandler::new(registry)
+            .with_supervisor(handle)
+            .with_privileged_operator_prompt(PrivilegedOperatorPrompt::Enforce)
+            .with_supervisor_rescan(supervisor, &path, None);
+        handler.forwarding.operator_confirms().configure(
+            Arc::new(ApproveOperator),
+            crate::operator_confirm::OperatorLimits::default(),
+        );
+        let (ctx, _rx) = route_ctx(ConnectionId::new(105));
+        for preview in [true, false] {
+            std::fs::write(
+                &path,
+                r#"{"version":1,"privileged_operator_prompt":"unknown"}"#,
+            )
+            .unwrap();
+            let request = ClientControlRequest::SupervisorRescan { preview };
+            let frame = Frame::build(
+                FrameType::Request,
+                control_flags(),
+                0,
+                0,
+                1,
+                serde_json::to_vec(&request).unwrap(),
+            )
+            .unwrap();
+            let frames = handler.handle_control_frame(&ctx, frame).await.unwrap();
+            assert_eq!(frames.len(), 1);
+            assert_eq!(parse_error(&frames[0])["code"], "invalid_daemon_config");
+            assert_eq!(
+                handler.privileged_operator_prompt,
+                PrivilegedOperatorPrompt::Enforce
+            );
+        }
     }
 
     /// One wire code has several senders, so the refusal line names the check
@@ -11079,6 +13093,63 @@ mod tests {
         ));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_reload_path_matches_configured_and_verbatim_spawn_spellings() {
+        let dir = cortexkit_test_support::ScratchDir::new("windows-reload-path-spelling");
+        let configured = dir.join("module.exe");
+        std::fs::write(&configured, b"executable path fixture").unwrap();
+        let spawned = std::fs::canonicalize(&configured).unwrap();
+        assert_ne!(
+            configured, spawned,
+            "fixture must exercise different path spellings"
+        );
+        let forward_slashes = configured.to_string_lossy().replace('\\', "/");
+        let lower_case = configured.to_string_lossy().to_lowercase();
+        for spelling in [
+            &configured,
+            Path::new(&forward_slashes),
+            Path::new(&lower_case),
+        ] {
+            let verdict = reload_verdict(
+                spelling,
+                Some(&spawned),
+                subc_control::RunningImageAgreement::Unavailable {
+                    reason: subc_control::RunningImageUnavailableReason::ProcessIdentityUnconfirmed,
+                },
+            );
+            assert_eq!(
+                verdict.path,
+                ReloadPathAgreement::Match,
+                "configured {spelling:?}, spawned {spawned:?}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reload_path_keeps_different_existing_program_pending() {
+        let dir = cortexkit_test_support::ScratchDir::new("windows-reload-path-change");
+        let old = dir.join("old.exe");
+        let new = dir.join("new.exe");
+        std::fs::write(&old, b"same executable content").unwrap();
+        std::fs::copy(&old, &new).unwrap();
+        let spawned = std::fs::canonicalize(&old).unwrap();
+        let image = subc_control::RunningImageAgreement::Unavailable {
+            reason: subc_control::RunningImageUnavailableReason::ProcessIdentityUnconfirmed,
+        };
+        let verdict = reload_verdict(&new, Some(&spawned), image.clone());
+        assert!(
+            matches!(verdict.path, ReloadPathAgreement::Mismatch { configured, spawned_from }
+            if configured == new && spawned_from == spawned)
+        );
+        let missing = dir.join("missing.exe");
+        assert!(matches!(
+            reload_verdict(&missing, Some(&spawned), image).path,
+            ReloadPathAgreement::Mismatch { .. }
+        ));
+    }
+
     #[test]
     fn reload_verdict_detects_replaced_image_at_same_path() {
         let image = subc_control::RunningImageAgreement::Mismatch {
@@ -11183,6 +13254,7 @@ mod tests {
 
     #[tokio::test]
     async fn goodbye_tears_down_registration_and_later_channel_is_unknown() {
+        let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
         let registry = Arc::new(Registry::default());
         let control = Arc::new(ControlHandler::new(Arc::clone(&registry)));
         let router = Router::with_control_handler(Arc::clone(&control));
@@ -11211,6 +13283,19 @@ mod tests {
         let error_frame = rx.recv().await.unwrap();
         assert_eq!(error_frame.header.ty, FrameType::Error);
         assert_eq!(error_frame.header.channel, channel);
+        let captured = crate::router::test_log::captured_logs(&logs);
+        assert_eq!(
+            captured
+                .lines()
+                .filter(|line| {
+                    line.contains("module_id=aft")
+                        && line.contains("reason=explicit_goodbye")
+                        && line.contains("module registration ended")
+                })
+                .count(),
+            1,
+            "unexpected GOODBYE registry log: {captured}"
+        );
     }
 
     #[tokio::test]
@@ -11273,13 +13358,180 @@ mod tests {
         assert_eq!(handler.forwarding.active_binding_count().unwrap(), 0);
     }
 
+    struct RouteClosedFixture {
+        handler: ControlHandler,
+        #[cfg(unix)]
+        supervisor: Supervisor,
+        module_ctx: RouteCtx,
+        #[cfg(unix)]
+        module_rx: mpsc::Receiver<crate::router::OutboundFrame>,
+        client_rx: mpsc::Receiver<crate::router::OutboundFrame>,
+        route: Arc<crate::forwarding::RouteBinding>,
+    }
+
+    async fn route_closed_fixture() -> RouteClosedFixture {
+        let registry = Arc::new(Registry::default());
+        let handler = ControlHandler::new(Arc::clone(&registry));
+        #[cfg(unix)]
+        let supervisor = Supervisor::new(registry, RestartPolicy::default())
+            .with_forwarding(Arc::clone(&handler.forwarding));
+        let (module_ctx, mut module_rx) = route_ctx(ConnectionId::new(701));
+        register_capability_manifest(
+            &handler,
+            &module_ctx,
+            &mut module_rx,
+            capability_manifest("prov", &[], &[]),
+            1,
+        )
+        .await;
+        let (client_rx, bind) = open_route_for_capability_test(
+            &handler,
+            &module_ctx,
+            &mut module_rx,
+            702,
+            2,
+            "prov",
+            None,
+        )
+        .await;
+        let ModuleControlRequest::RouteBind {
+            route_channel: channel,
+            epoch: route_epoch,
+            ..
+        } = bind
+        else {
+            panic!("expected route.bind");
+        };
+        let crate::forwarding::DataRoute::Module(crate::forwarding::DataRouteState::Bound(route)) =
+            handler
+                .forwarding
+                .lookup_data_route(module_ctx.connection_id, channel, route_epoch)
+                .unwrap()
+        else {
+            panic!("the acknowledged route must be bound");
+        };
+        RouteClosedFixture {
+            handler,
+            #[cfg(unix)]
+            supervisor,
+            module_ctx,
+            #[cfg(unix)]
+            module_rx,
+            client_rx,
+            route,
+        }
+    }
+
+    impl RouteClosedFixture {
+        #[cfg(unix)]
+        async fn cut(&mut self) {
+            let notices = async {
+                let mut draining = self.module_rx.recv().await.unwrap();
+                assert!(matches!(
+                    serde_json::from_slice::<subc_protocol::session::ModuleControlCommand>(
+                        &draining.body
+                    )
+                    .unwrap(),
+                    subc_protocol::session::ModuleControlCommand::Draining {
+                        reason: RouteCloseReason::Restart,
+                        ..
+                    }
+                ));
+                draining.flushed.take().unwrap().send(()).unwrap();
+                let mut closing = self.client_rx.recv().await.unwrap();
+                assert!(matches!(
+                    serde_json::from_slice::<ClientControlPush>(&closing.body).unwrap(),
+                    ClientControlPush::RouteClosing {
+                        reason: RouteCloseReason::Restart,
+                        ..
+                    }
+                ));
+                closing.flushed.take().unwrap().send(()).unwrap();
+            };
+            let (result, ()) = tokio::join!(self.supervisor.drain_for_daemon_shutdown(), notices);
+            result.unwrap();
+        }
+
+        fn disconnect(&mut self) -> ClientControlPush {
+            self.handler
+                .cleanup_connection(self.module_ctx.connection_id)
+                .unwrap();
+            let closed = self.client_rx.try_recv().unwrap();
+            assert_eq!(closed.header.ty, FrameType::Push);
+            let push = serde_json::from_slice::<ClientControlPush>(&closed.body).unwrap();
+            assert!(matches!(
+                &push,
+                ClientControlPush::RouteClosed { channels, abandoned: 0, .. }
+                    if channels == &[self.route.client_channel]
+            ));
+            assert_eq!(
+                self.client_rx.try_recv().unwrap().header.ty,
+                FrameType::Goodbye
+            );
+            assert_eq!(self.handler.forwarding.active_binding_count().unwrap(), 0);
+            push
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn daemon_cut_quiet_routes_report_restart_and_drained() {
+        let mut fixture = route_closed_fixture().await;
+        fixture.cut().await;
+        assert!(matches!(
+            fixture.disconnect(),
+            ClientControlPush::RouteClosed {
+                reason: RouteCloseReason::Restart,
+                drained: true,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn daemon_cut_in_flight_past_budget_reports_restart_and_not_drained() {
+        let mut fixture = route_closed_fixture().await;
+        fixture.route.flow.acquire_tagged(99, false).await.unwrap();
+        let started = tokio::time::Instant::now();
+        fixture.cut().await;
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert_eq!(fixture.route.flow.in_flight(), 1);
+        assert!(matches!(
+            fixture.disconnect(),
+            ClientControlPush::RouteClosed {
+                reason: RouteCloseReason::Restart,
+                drained: false,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn module_connection_crash_reports_crash_and_not_drained() {
+        let mut fixture = route_closed_fixture().await;
+        // The server calls cleanup_connection on module EOF. Without a planned
+        // daemon shutdown, that disconnect must remain a crash with no prior
+        // route.closing notice, even when the route has no in-flight calls.
+        assert!(matches!(
+            fixture.disconnect(),
+            ClientControlPush::RouteClosed {
+                reason: RouteCloseReason::Crash,
+                drained: false,
+                ..
+            }
+        ));
+    }
+
     #[tokio::test]
     async fn dropping_router_connection_releases_registration() {
+        let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
         let registry = Arc::new(Registry::default());
         let control = Arc::new(ControlHandler::new(Arc::clone(&registry)));
-        let router = Router::with_control_handler(control);
+        let router = Router::with_control_handler(Arc::clone(&control));
         let connection = router.begin_connection();
-        let (ctx, mut rx) = route_ctx(connection.id());
+        let connection_id = connection.id();
+        let (ctx, mut rx) = route_ctx(connection_id);
 
         router
             .route_for_connection(&ctx, hello_frame("aft", PROTOCOL_VERSION, 31))
@@ -11294,6 +13546,68 @@ mod tests {
 
         assert!(registry.get_module("aft").unwrap().is_none());
         assert_eq!(registry.active_registration_count().unwrap(), 0);
+
+        control
+            .cleanup_connection(ConnectionId::new(u64::MAX))
+            .unwrap();
+        let captured = crate::router::test_log::captured_logs(&logs);
+        println!("captured registry lifecycle logs:\n{captured}");
+        let events: Vec<_> = captured
+            .lines()
+            .filter(|line| {
+                line.contains("module registered module_id=aft ")
+                    || line.contains("module registration ended")
+            })
+            .collect();
+        assert_eq!(
+            events.len(),
+            2,
+            "unexpected registry lifecycle logs: {captured}"
+        );
+        assert!(events[0].contains("module registered module_id=aft "));
+        assert!(events[0].contains(&format!("connection_id={}", connection_id.get())));
+        assert!(events[1].contains(&format!(
+            "module_id=aft connection_id={}",
+            connection_id.get()
+        )));
+        assert!(events[1].contains("reason=connection_closed"));
+        assert!(events[1].contains("module registration ended"));
+        assert_eq!(
+            captured
+                .lines()
+                .filter(|line| line.contains("module registered module_id=aft "))
+                .count(),
+            1,
+            "legacy registration admission line must appear once: {captured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hello_registration_keeps_legacy_module_registered_line_once() {
+        let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
+        let registry = Arc::new(Registry::default());
+        let control = ControlHandler::new(Arc::clone(&registry));
+        let (ctx, mut rx) = route_ctx(ConnectionId::new(777));
+        hello_via_sink(
+            &control,
+            &ctx,
+            &mut rx,
+            hello_frame("prefrontal-host:test", PROTOCOL_VERSION, 1),
+        )
+        .await;
+
+        let captured = crate::router::test_log::captured_logs(&logs);
+        let admissions: Vec<_> = captured
+            .lines()
+            .filter(|line| line.contains("module registered module_id=prefrontal-host:test "))
+            .collect();
+        assert_eq!(
+            admissions.len(),
+            1,
+            "legacy admission line must remain exactly once: {captured}"
+        );
+        assert!(admissions[0].contains("routable_provider=true"));
+        assert!(admissions[0].contains("connection_id=777"));
     }
 
     fn capability_manifest(
@@ -11902,11 +14216,159 @@ mod tests {
             cutover.incumbent.unwrap()
         }
 
+        /// A swap candidate's HELLO reserves its candidate registry entry
+        /// before installing its candidate forwarding endpoint. The swap
+        /// supervisor promotes a ready candidate as soon as it reads it as
+        /// registered, and promotion cuts forwarding over to the candidate
+        /// endpoint, so the lookup the supervisor reads
+        /// (`Registry::published_registration`) must not return the candidate
+        /// until that endpoint exists. Otherwise the cutover finds no candidate
+        /// endpoint and the swap fails as if the candidate had disconnected.
+        #[tokio::test]
+        async fn swap_candidate_is_published_only_after_its_forwarding_endpoint_exists() {
+            let mut swap = swap_with_incumbent().await;
+            let hold = Arc::new(std::sync::Barrier::new(2));
+            let handler = swap
+                .handler
+                .clone()
+                .with_hello_registry_to_forwarding_hold(Arc::clone(&hold));
+            handler
+                .supervisor
+                .open_swap("aft", "candidate-nonce".to_string());
+            let hello = {
+                let handler = handler.clone();
+                let candidate_ctx = swap.candidate_ctx.clone();
+                std::thread::spawn(move || {
+                    handler
+                        .handle_hello(
+                            candidate_ctx.connection_id,
+                            Some(candidate_ctx.egress.clone()),
+                            hello_frame_with_nonce(
+                                "aft",
+                                PROTOCOL_VERSION,
+                                8,
+                                Some("candidate-nonce"),
+                            ),
+                        )
+                        .unwrap()
+                })
+            };
+
+            hold.wait();
+            // Parked: the candidate slot is claimed but not published, and
+            // forwarding has no candidate endpoint.
+            assert!(swap
+                .registry
+                .registration(crate::registry::RegistrationSlot::Candidate("aft"))
+                .unwrap()
+                .is_some());
+            assert!(swap
+                .registry
+                .published_registration(crate::registry::RegistrationSlot::Candidate("aft"))
+                .unwrap()
+                .is_none());
+            assert!(swap
+                .forwarding
+                .module_endpoint_for_connection(CANDIDATE)
+                .unwrap()
+                .is_none());
+
+            hold.wait();
+            assert!(hello.join().unwrap().is_empty(), "candidate HELLO succeeds");
+            assert_eq!(
+                swap.candidate_rx.try_recv().unwrap().frame.header.ty,
+                FrameType::HelloAck
+            );
+            let published = swap
+                .registry
+                .published_registration(crate::registry::RegistrationSlot::Candidate("aft"))
+                .unwrap()
+                .expect("candidate is published once its HELLO completes");
+            assert_eq!(published.connection_id, CANDIDATE);
+            assert!(swap
+                .forwarding
+                .module_endpoint_for_connection(CANDIDATE)
+                .unwrap()
+                .is_some());
+        }
+
         fn keyed_total(counters: &Value, key: &str) -> u64 {
             counters[key]
                 .as_object()
                 .map(|counts| counts.values().filter_map(Value::as_u64).sum())
                 .unwrap_or(0)
+        }
+
+        #[tokio::test]
+        async fn replacement_logs_old_end_and_new_admission_once() {
+            let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
+            let mut swap = swap_with_incumbent().await;
+            swap.handler
+                .supervisor
+                .open_swap("aft", "candidate-nonce".to_string());
+            hello_via_sink(
+                &swap.handler,
+                &swap.candidate_ctx,
+                &mut swap.candidate_rx,
+                hello_frame_with_nonce("aft", PROTOCOL_VERSION, 8, Some("candidate-nonce")),
+            )
+            .await;
+            cutover(&swap);
+            swap.handler.cleanup_connection(INCUMBENT).unwrap();
+
+            let captured = crate::router::test_log::captured_logs(&logs);
+            println!("captured replacement registry logs:\n{captured}");
+            let new_admissions: Vec<_> = captured
+                .lines()
+                .filter(|line| {
+                    line.contains("connection_id=40")
+                        && line.contains("swap candidate registered; not routable until cutover")
+                })
+                .collect();
+            assert_eq!(
+                new_admissions.len(),
+                1,
+                "unexpected admission logs: {captured}"
+            );
+            assert!(new_admissions[0].contains("module_id=aft"));
+            assert!(new_admissions[0].contains("connection_id=40"));
+            assert!(
+                new_admissions[0].contains("swap candidate registered; not routable until cutover")
+            );
+            assert!(new_admissions[0].contains("ready=true"));
+
+            let old_admissions: Vec<_> = captured
+                .lines()
+                .filter(|line| {
+                    line.contains("module registered module_id=aft ")
+                        && line.contains("connection_id=30")
+                })
+                .collect();
+            assert_eq!(
+                old_admissions.len(),
+                1,
+                "unexpected incumbent admission: {captured}"
+            );
+
+            let old_ends: Vec<_> = captured
+                .lines()
+                .filter(|line| {
+                    line.contains("connection_id=30") && line.contains("module registration ended")
+                })
+                .collect();
+            assert_eq!(old_ends.len(), 1, "unexpected end logs: {captured}");
+            assert!(old_ends[0].contains("module_id=aft"));
+            assert!(old_ends[0].contains("connection_id=30"));
+            assert!(old_ends[0].contains("reason=replaced"));
+            assert!(old_ends[0].contains("replaced_by_connection_id=40"));
+            assert_eq!(
+                captured
+                    .lines()
+                    .filter(|line| line.contains("module registration promoted"))
+                    .count(),
+                1,
+                "unexpected promotion logs: {captured}"
+            );
         }
 
         /// An ack from the incumbent for a bind it was sent before cutover,
@@ -12295,6 +14757,24 @@ mod tests {
     /// may sync is decided by the registration and launch nonce of the module
     /// connection, never by the request body.
     mod scopes {
+        mod idle_tests {
+            use super::*;
+            include!("scope_idle_tests.rs");
+        }
+        mod route_open_timings {
+            use super::*;
+            include!("route_open_timing_tests.rs");
+        }
+        mod activity {
+            include!("activity_scope_tests.rs");
+        }
+        mod delta {
+            include!("scope_handler_delta_tests.rs");
+        }
+        mod call_modes {
+            include!("scope_call_mode_tests.rs");
+        }
+
         use subc_protocol::scope::{
             ParentState, ScopeCarrier, ScopeKind, ScopeParent, ScopeRecordOutcome, ScopeStamp,
             ScopeStatus,
@@ -12305,15 +14785,7 @@ mod tests {
         const OWNER: &str = "prefrontal-core";
 
         fn head(scope_ref: &str, scope_epoch: u64) -> ScopeRecord {
-            ScopeRecord {
-                scope_ref: scope_ref.to_string(),
-                scope_epoch,
-                kind: ScopeKind::Head,
-                parent: None,
-                child_owners: Vec::new(),
-                carriers: Vec::new(),
-                attributes: Default::default(),
-            }
+            ScopeRecord::new(scope_ref, scope_epoch, ScopeKind::Head)
         }
 
         async fn call(
@@ -12370,6 +14842,30 @@ mod tests {
                 parse_error(&reply)
             );
             serde_json::from_slice(&reply.body).unwrap()
+        }
+
+        #[tokio::test]
+        async fn scope_describe_never_echoes_bind_proof_or_hash() {
+            const PROOF: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
+            const HASH: &str = "4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0";
+            let mut rig = rig().await;
+            rig.sync(vec![session(1).with_bind_proof_sha256(Some(HASH.into()))])
+                .await;
+            let _bound = rig
+                .bound(
+                    Some(AFT),
+                    PLEXUS,
+                    Some(
+                        rig.selector("s", Some(1))
+                            .with_bind_proof(Some(PROOF.into())),
+                    ),
+                )
+                .await;
+            let reply = describe(&rig.handler, &rig.owner, OWNER, "s").await;
+            let output = serde_json::to_string(&reply).unwrap();
+            assert!(output.contains("\"status\":\"live\""));
+            assert!(!output.contains(PROOF));
+            assert!(!output.contains(HASH));
         }
 
         /// Register `module_id` on `connection` with `nonce`, returning its ctx.
@@ -12720,6 +15216,39 @@ mod tests {
         }
 
         async fn rig_with_flow_support(flow_support: bool) -> Rig {
+            rig_with_scope_capabilities(flow_support, false).await
+        }
+
+        async fn rig_with_scope_capabilities(flow_support: bool, run_support: bool) -> Rig {
+            let mut provides = Vec::new();
+            if flow_support {
+                provides.push("flow-scopes/v1");
+            }
+            if run_support {
+                provides.push("agent-run-scopes/v1");
+            }
+            rig_with_target_capabilities(&provides).await
+        }
+
+        fn hello_with_capabilities(module_id: &str, connection: u64, provides: &[&str]) -> Frame {
+            let hello = hello_frame(module_id, PROTOCOL_VERSION, connection);
+            let mut body: Value = serde_json::from_slice(&hello.body).unwrap();
+            // Decoder versions alone cannot admit scoped calls: only a capability
+            // declaration promises the required run or flow behaviour.
+            body["manifest"]["provenance"] = serde_json::json!({"wire_crate_version": "0.29.0"});
+            body["manifest"]["capabilities"] = serde_json::json!({"provides": provides});
+            Frame::build(
+                FrameType::Hello,
+                control_flags(),
+                0,
+                0,
+                connection,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap()
+        }
+
+        async fn rig_with_target_capabilities(provides: &[&str]) -> Rig {
             let registry = Arc::new(Registry::default());
             let forwarding = Arc::new(ForwardingTable::default());
             let supervisor_handle = SupervisorHandle::new();
@@ -12758,26 +15287,7 @@ mod tests {
             let mut modules = BTreeMap::new();
             for (connection, module_id) in [(2, PLEXUS), (3, OTHER)] {
                 let (ctx, mut rx) = wide_ctx(connection);
-                let hello = hello_frame(module_id, PROTOCOL_VERSION, connection);
-                let mut body: Value = serde_json::from_slice(&hello.body).unwrap();
-                // A decoder version alone must not admit flow routes. Every
-                // target here declares wire crate version 0.29.0; only one that
-                // declares `flow-scopes/v1` promises flow behaviour.
-                body["manifest"]["provenance"] =
-                    serde_json::json!({"wire_crate_version": "0.29.0"});
-                if flow_support {
-                    body["manifest"]["capabilities"] =
-                        serde_json::json!({"provides": ["flow-scopes/v1"]});
-                }
-                let hello = Frame::build(
-                    FrameType::Hello,
-                    control_flags(),
-                    0,
-                    0,
-                    connection,
-                    serde_json::to_vec(&body).unwrap(),
-                )
-                .unwrap();
+                let hello = hello_with_capabilities(module_id, connection, provides);
                 hello_via_sink(&handler, &ctx, &mut rx, hello).await;
                 modules.insert(module_id.to_string(), (ctx, rx));
             }
@@ -12794,12 +15304,10 @@ mod tests {
         }
 
         fn carrier(module_id: &str, targets: Option<&[&str]>) -> ScopeCarrier {
-            ScopeCarrier {
-                principal: Principal::Reserved {
-                    module_id: module_id.to_string(),
-                },
-                targets: targets.map(|targets| targets.iter().map(|t| t.to_string()).collect()),
-            }
+            ScopeCarrier::new(Principal::Reserved {
+                module_id: module_id.to_string(),
+            })
+            .with_targets(targets.map(|targets| targets.iter().map(|t| t.to_string()).collect()))
         }
 
         /// The scope most tests open under: aft carries to any module, broca
@@ -12821,13 +15329,13 @@ mod tests {
             }
 
             fn selector(&self, scope_ref: &str, scope_epoch: Option<u64>) -> ScopeSelector {
-                ScopeSelector {
-                    owner: Principal::Reserved {
+                ScopeSelector::new(
+                    Principal::Reserved {
                         module_id: OWNER.to_string(),
                     },
-                    scope_ref: scope_ref.to_string(),
+                    scope_ref.to_string(),
                     scope_epoch,
-                }
+                )
             }
 
             fn open_frame(
@@ -13087,13 +15595,13 @@ mod tests {
         }
 
         fn rig_selector(scope_ref: &str, scope_epoch: Option<u64>) -> ScopeSelector {
-            ScopeSelector {
-                owner: Principal::Reserved {
+            ScopeSelector::new(
+                Principal::Reserved {
                     module_id: OWNER.to_string(),
                 },
-                scope_ref: scope_ref.to_string(),
+                scope_ref.to_string(),
                 scope_epoch,
-            }
+            )
         }
 
         #[tokio::test]
@@ -13121,13 +15629,13 @@ mod tests {
             assert!(subc_protocol::error_codes::is_retryable_route_open(&code));
 
             // An owner that is not configured will never sync: terminal.
-            let ghost = ScopeSelector {
-                owner: Principal::Reserved {
+            let ghost = ScopeSelector::new(
+                Principal::Reserved {
                     module_id: "ghost".to_string(),
                 },
-                scope_ref: "s".to_string(),
-                scope_epoch: Some(1),
-            };
+                "s".to_string(),
+                Some(1),
+            );
             assert_eq!(
                 rig.refused(Some(AFT), PLEXUS, Some(ghost)).await,
                 error_codes::SCOPE_NOT_LIVE
@@ -13182,13 +15690,13 @@ mod tests {
             sync(&rig.handler, &broca, 1, vec![head("b", 1)])
                 .await
                 .unwrap();
-            let own = ScopeSelector {
-                owner: Principal::Reserved {
+            let own = ScopeSelector::new(
+                Principal::Reserved {
                     module_id: BROCA.to_string(),
                 },
-                scope_ref: "b".to_string(),
-                scope_epoch: Some(1),
-            };
+                "b".to_string(),
+                Some(1),
+            );
             let route = rig.bound(Some(BROCA), PLEXUS, Some(own)).await;
             assert!(!route.stamp().unwrap().owner_authorized);
         }
@@ -13317,6 +15825,130 @@ mod tests {
                 .get_module_by_connection(replacement.connection_id)
                 .unwrap()
                 .is_some());
+        }
+
+        #[tokio::test]
+        async fn scope_bind_proof_rechecks_current_hash_before_captured_relay() {
+            use std::future::Future;
+            const PROOF: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
+            const HASH: &str = "4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0";
+            const NEXT_HASH: &str =
+                "2578ccf8645b2d1dc10c465eff843585970f3a7e22296a92cad55d489a272072";
+            let mut rig = rig().await;
+            let mut record = session(1).with_bind_proof_sha256(Some(HASH.into()));
+            record.carriers.push(ScopeCarrier::new(Principal::Direct));
+            rig.sync(vec![record.clone()]).await;
+            let (client, mut rx, frame) = rig.open_frame(
+                None,
+                PLEXUS,
+                Some(
+                    rig.selector("s", Some(1))
+                        .with_bind_proof(Some(PROOF.into())),
+                ),
+            );
+            // Hold egress reservation while the scope owner changes its bind-proof
+            // hash, so a proof valid at admission must be checked again at relay.
+            for _ in 0..64 {
+                client.egress.try_send(route_bind_ack(1)).unwrap();
+            }
+            let handler = rig.handler.clone();
+            let mut open = Box::pin(handler.handle_control_frame(&client, frame));
+            std::future::poll_fn(|cx| {
+                assert!(open.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            record.bind_proof_sha256 = Some(NEXT_HASH.into());
+            rig.sync(vec![record]).await;
+            rx.try_recv().unwrap();
+            let replies = tokio::time::timeout(Duration::from_secs(2), open)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                parse_error(&replies[0])["code"],
+                error_codes::SCOPE_BIND_PROOF_MISMATCH
+            );
+            assert!(!String::from_utf8_lossy(&replies[0].body).contains(PROOF));
+            assert!(rig.modules.get_mut(PLEXUS).unwrap().1.try_recv().is_err());
+            assert_eq!(rig.forwarding.reserved_route_count().unwrap(), (0, 0));
+        }
+
+        #[tokio::test]
+        async fn scope_bind_proof_reserved_openers_ignore_proof() {
+            const HASH: &str = "4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0";
+            let mut rig = rig().await;
+            rig.sync(vec![session(1).with_bind_proof_sha256(Some(HASH.into()))])
+                .await;
+            for opener in [OWNER, AFT] {
+                for proof in [None, Some("malformed+proof=")] {
+                    let route = rig
+                        .bound(
+                            Some(opener),
+                            PLEXUS,
+                            Some(
+                                rig.selector("s", Some(1))
+                                    .with_bind_proof(proof.map(str::to_string)),
+                            ),
+                        )
+                        .await;
+                    assert!(rig.live(&route));
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn scope_bind_proof_reserved_opener_passes_hash_change_before_captured_relay() {
+            use std::future::Future;
+            const HASH: &str = "4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0";
+            const NEXT_HASH: &str =
+                "2578ccf8645b2d1dc10c465eff843585970f3a7e22296a92cad55d489a272072";
+            let mut rig = rig().await;
+            rig.sync(vec![session(1).with_bind_proof_sha256(Some(HASH.into()))])
+                .await;
+            let (client, mut rx, frame) =
+                rig.open_frame(Some(AFT), PLEXUS, Some(rig.selector("s", Some(1))));
+            for _ in 0..64 {
+                client.egress.try_send(route_bind_ack(1)).unwrap();
+            }
+            let handler = rig.handler.clone();
+            let mut open = Box::pin(handler.handle_control_frame(&client, frame));
+            std::future::poll_fn(|cx| {
+                assert!(open.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            rig.sync(vec![
+                session(1).with_bind_proof_sha256(Some(NEXT_HASH.into()))
+            ])
+            .await;
+            rx.try_recv().unwrap();
+            let (_, module_rx) = rig.modules.get_mut(PLEXUS).unwrap();
+            let bind = std::future::poll_fn(|cx| {
+                assert!(open.as_mut().poll(cx).is_pending());
+                module_rx.poll_recv(cx)
+            })
+            .await
+            .unwrap()
+            .frame;
+            handler
+                .handle_control_frame(&rig.modules[PLEXUS].0, route_bind_ack(bind.header.corr))
+                .await
+                .unwrap();
+            let replies = tokio::time::timeout(Duration::from_secs(2), open)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(replies.len(), 1);
+            // Proof rechecking allowed the relay. Independent tag settlement
+            // still asks the opener to retry after any same-epoch content change.
+            assert_eq!(parse_error(&replies[0])["code"], error_codes::SCOPE_CHANGED);
+            assert_eq!(rig.forwarding.reserved_route_count().unwrap(), (0, 0));
+            while rig.modules.get_mut(PLEXUS).unwrap().1.try_recv().is_ok() {}
+            let route = rig
+                .bound(Some(AFT), PLEXUS, Some(rig.selector("s", Some(1))))
+                .await;
+            assert!(rig.live(&route));
         }
 
         #[tokio::test]
@@ -13582,13 +16214,13 @@ mod tests {
             let mut child = session(1);
             child.scope_ref = "child".to_string();
             child.kind = ScopeKind::Worker;
-            child.parent = Some(ScopeParent {
-                owner: Principal::Reserved {
+            child.parent = Some(ScopeParent::new(
+                Principal::Reserved {
                     module_id: OWNER.to_string(),
                 },
-                scope_ref: "s".to_string(),
-                scope_epoch: 1,
-            });
+                "s".to_string(),
+                1,
+            ));
             rig.sync(vec![session(1), child.clone()]).await;
             let mut child_route = rig
                 .bound(Some(AFT), PLEXUS, Some(rig_selector("child", Some(1))))

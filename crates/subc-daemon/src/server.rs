@@ -1,12 +1,18 @@
 use std::{
+    any::Any,
     error::Error,
     fmt, io,
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
-use subc_transport::{authenticate_server, AuthError, DAEMON_ID_LEN, WATCHDOG_CLIENT_ROLE};
+use subc_transport::{
+    authenticate_server, AuthError, AuthStage, DAEMON_ID_LEN, WATCHDOG_CLIENT_ROLE,
+};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter},
     net::TcpListener,
@@ -14,7 +20,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
     time::timeout,
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     forwarding::{CloseReason, ConnectionCloseReceiver},
@@ -63,6 +69,177 @@ pub const DEFAULT_AUTH_DEADLINE: Duration = Duration::from_secs(2);
 // HMAC exchanges; the deadline, not the permit count, is the DoS bound.
 pub const DEFAULT_MAX_UNAUTHENTICATED_CONNECTIONS: usize = 256;
 const CLOSE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+const PRE_AUTH_REJECT_LOG_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug)]
+enum PreAuthRejectStage {
+    WaitingForHandshakeSlot,
+    HandshakeDeadline,
+    InvalidProof,
+    MalformedMessage,
+    PeerClosed,
+    OtherAuthenticationFailure,
+}
+
+impl PreAuthRejectStage {
+    const fn index(self) -> usize {
+        match self {
+            Self::WaitingForHandshakeSlot => 0,
+            Self::HandshakeDeadline => 1,
+            Self::InvalidProof => 2,
+            Self::MalformedMessage => 3,
+            Self::PeerClosed => 4,
+            Self::OtherAuthenticationFailure => 5,
+        }
+    }
+
+    const fn stage(self) -> &'static str {
+        match self {
+            Self::WaitingForHandshakeSlot => "waiting_for_handshake_slot",
+            Self::HandshakeDeadline => "handshake_deadline",
+            Self::InvalidProof => "client_authentication",
+            Self::MalformedMessage => "malformed_message",
+            Self::PeerClosed => "peer_closed",
+            Self::OtherAuthenticationFailure => "authentication",
+        }
+    }
+
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::WaitingForHandshakeSlot => "capacity_wait_timed_out",
+            Self::HandshakeDeadline => "handshake_deadline_expired",
+            Self::InvalidProof => "client_proof_mismatch",
+            Self::MalformedMessage => "malformed_or_oversized_message",
+            Self::PeerClosed => "peer_closed_before_authentication_completed",
+            Self::OtherAuthenticationFailure => "authentication_failed_before_routing",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PreAuthRejectRateLimit {
+    next_allowed_ns: AtomicU64,
+    suppressed: AtomicU64,
+}
+
+impl PreAuthRejectRateLimit {
+    const fn new() -> Self {
+        Self {
+            next_allowed_ns: AtomicU64::new(0),
+            suppressed: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Rate-limit state for pre-authentication rejection logs, owned by one
+/// `ServerAuth` so each listener (and each test) counts only its own rejects.
+#[derive(Debug)]
+struct PreAuthRejectLog {
+    epoch: Instant,
+    limiter: PreAuthRejectLimiter,
+}
+
+impl PreAuthRejectLog {
+    fn new() -> Self {
+        Self {
+            epoch: Instant::now(),
+            limiter: PreAuthRejectLimiter::new(),
+        }
+    }
+}
+
+// Report accumulated rejects on the next allowed line instead of running a timer task.
+#[derive(Debug)]
+struct PreAuthRejectLimiter {
+    stages: [PreAuthRejectRateLimit; 6],
+}
+
+impl PreAuthRejectLimiter {
+    fn new() -> Self {
+        Self {
+            stages: std::array::from_fn(|_| PreAuthRejectRateLimit::new()),
+        }
+    }
+
+    fn allow_at(&self, stage: PreAuthRejectStage, now: Duration) -> Option<u64> {
+        let slot = &self.stages[stage.index()];
+        let now_ns = now.as_nanos().min(u64::MAX as u128) as u64;
+        let interval_ns = PRE_AUTH_REJECT_LOG_INTERVAL.as_nanos() as u64;
+        let mut next_allowed_ns = slot.next_allowed_ns.load(AtomicOrdering::Relaxed);
+
+        loop {
+            if now_ns < next_allowed_ns {
+                slot.suppressed.fetch_add(1, AtomicOrdering::Relaxed);
+                return None;
+            }
+
+            match slot.next_allowed_ns.compare_exchange_weak(
+                next_allowed_ns,
+                now_ns.saturating_add(interval_ns),
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            ) {
+                Ok(_) => return Some(slot.suppressed.swap(0, AtomicOrdering::Relaxed)),
+                Err(actual) => next_allowed_ns = actual,
+            }
+        }
+    }
+}
+
+fn log_pre_auth_rejection(
+    error: &ConnectionError,
+    peer_addr: SocketAddr,
+    elapsed: Duration,
+    now: Duration,
+    limiter: &PreAuthRejectLimiter,
+) {
+    let Some(stage) = error.pre_auth_reject_stage() else {
+        return;
+    };
+    let Some(suppressed_since_last) = limiter.allow_at(stage, now) else {
+        return;
+    };
+    let elapsed_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+
+    info!(
+        peer_addr = %peer_addr,
+        elapsed_ms,
+        stage = stage.stage(),
+        reason = stage.reason(),
+        auth_stage = ?error.auth_stage(),
+        suppressed_since_last,
+        error = %error,
+        "subc TCP connection rejected before routing"
+    );
+}
+
+async fn handle_accepted_connection<S>(
+    stream: S,
+    router: Arc<Router>,
+    auth: ServerAuth,
+    peer_addr: SocketAddr,
+    accepted_at: Instant,
+) -> Result<(), ConnectionError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let reject_log = Arc::clone(&auth.pre_auth_reject_log);
+    let result = handle_connection(stream, router, auth).await;
+    if let Err(error) = &result {
+        if error.is_quiet_reject() {
+            log_pre_auth_rejection(
+                error,
+                peer_addr,
+                accepted_at.elapsed(),
+                reject_log.epoch.elapsed(),
+                &reject_log.limiter,
+            );
+        } else {
+            warn!(?peer_addr, error = %error, "subc connection ended with error");
+        }
+    }
+    result
+}
 
 /// Authentication material and DoS bounds applied before a TCP connection may
 /// reach the frame router.
@@ -74,6 +251,7 @@ pub struct ServerAuth {
     deadline: Duration,
     unauthenticated: Arc<Semaphore>,
     connected_clients: ConnectedClients,
+    pre_auth_reject_log: Arc<PreAuthRejectLog>,
 }
 
 impl ServerAuth {
@@ -106,6 +284,7 @@ impl ServerAuth {
             deadline,
             unauthenticated: Arc::new(Semaphore::new(max_unauthenticated.max(1))),
             connected_clients: ConnectedClients::new(),
+            pre_auth_reject_log: Arc::new(PreAuthRejectLog::new()),
         }
     }
 
@@ -174,6 +353,7 @@ where
                 return Err(ServerError::Accept { local_addr, source });
             }
         };
+        let accepted_at = Instant::now();
         // Every route frame is a discrete message whose reply the peer is waiting
         // for, so there is never a later write for Nagle to coalesce with -- it can
         // only hold a frame back until an ACK arrives.
@@ -196,13 +376,7 @@ where
         let router = Arc::clone(&router);
         let auth = auth.clone();
         tokio::spawn(async move {
-            if let Err(err) = handle_connection(stream, router, auth).await {
-                if err.is_quiet_reject() {
-                    debug!(?peer_addr, error = %err, "subc TCP connection rejected before routing");
-                } else {
-                    warn!(?peer_addr, error = %err, "subc connection ended with error");
-                }
-            }
+            let _ = handle_accepted_connection(stream, router, auth, peer_addr, accepted_at).await;
         });
     }
 }
@@ -289,8 +463,9 @@ enum ConnectionLoopExit {
 /// Every accepted TCP connection must complete the key-auth prelude before any
 /// envelope bytes are read by the router. Outbound frames flow through a bounded
 /// [`FrameSink`] drained by one writer task. Inbound dispatch remains serial for
-/// every frame except `route.open`; only that bind wait runs in a connection-owned
-/// task so it cannot hold unrelated frames behind a slow target module.
+/// every frame except `route.open`, activity operations and privileged requests;
+/// their bind, file and operator waits run in connection-owned tasks so
+/// unrelated frames can keep flowing.
 pub async fn handle_connection<S>(
     mut stream: S,
     router: Arc<Router>,
@@ -299,6 +474,11 @@ pub async fn handle_connection<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    // Capture only socket facts here. Process-table lookup happens lazily on a
+    // blocking thread when privileged dispatch needs a caller description.
+    let endpoints = (&stream as &dyn Any)
+        .downcast_ref::<tokio::net::TcpStream>()
+        .and_then(|tcp| tcp.local_addr().ok().zip(tcp.peer_addr().ok()));
     // Over-cap connections WAIT for a handshake slot (bounded by the auth deadline)
     // instead of being reset. A restart herd — every client and supervised child
     // re-dialing the fresh daemon at once — otherwise loses supervised modules to
@@ -342,6 +522,7 @@ where
 
     let mut connection = router.begin_connection();
     let connection_id = connection.id();
+    router.record_caller_endpoints(connection_id, endpoints);
     // `authenticated.role` is CLIENT-SUPPLIED and unverified -- the handshake
     // proves possession of the connection key, nothing about who is calling. So
     // this exclusion is safe ONLY while the role decides a reporting question and
@@ -378,12 +559,14 @@ where
     };
 
     let mut route_open_tasks = JoinSet::new();
+    let mut privileged_tasks = JoinSet::new();
     let loop_result = connection_loop(
         &mut read_half,
         Arc::clone(&router),
         ctx.clone(),
         close_receiver,
         &mut route_open_tasks,
+        &mut privileged_tasks,
     )
     .await;
 
@@ -395,6 +578,9 @@ where
     // cleanup has cleared it, with nothing left to refuse it and nothing to
     // clean it up. shutdown() aborts and then waits.
     route_open_tasks.shutdown().await;
+    // Abort held approvals and wait for their withdrawal guards before lifting
+    // this connection's cleanup state or removing its caller endpoints.
+    privileged_tasks.shutdown().await;
 
     drop(ctx);
     drop(egress);
@@ -507,11 +693,19 @@ async fn connection_loop<R>(
     ctx: RouteCtx,
     mut close_receiver: ConnectionCloseReceiver,
     route_open_tasks: &mut JoinSet<Result<(), RouterError>>,
+    privileged_tasks: &mut JoinSet<Result<(), RouterError>>,
 ) -> Result<ConnectionLoopExit, ConnectionError>
 where
     R: AsyncRead + Unpin,
 {
+    let mut activity_tasks = JoinSet::new();
     loop {
+        while let Some(result) = activity_tasks.try_join_next() {
+            finish_route_open_task(result)?;
+        }
+        while let Some(result) = privileged_tasks.try_join_next() {
+            finish_route_open_task(result)?;
+        }
         while let Some(result) = route_open_tasks.try_join_next() {
             finish_route_open_task(result)?;
         }
@@ -530,6 +724,12 @@ where
                         result.expect("a non-empty route.open JoinSet has a next task")
                     )?;
                 }
+                result = activity_tasks.join_next(), if !activity_tasks.is_empty() => {
+                    finish_route_open_task(result.expect("non-empty activity task set"))?;
+                }
+                result = privileged_tasks.join_next(), if !privileged_tasks.is_empty() => {
+                    finish_route_open_task(result.expect("non-empty privileged task set"))?;
+                }
                 result = &mut read => {
                     break match result.map_err(ConnectionError::FrameIo)? {
                         Some(frame) => frame,
@@ -538,6 +738,44 @@ where
                 }
             }
         };
+
+        if frame.header.channel == 0
+            && frame.header.ty == subc_protocol::FrameType::Request
+            && serde_json::from_slice::<serde_json::Value>(&frame.body)
+                .ok()
+                .is_some_and(|body| {
+                    matches!(
+                        body["op"].as_str(),
+                        Some(
+                            subc_control::ops::ACTIVITY_RECORD
+                                | subc_control::ops::ACTIVITY_QUERY
+                                | subc_control::ops::ACTIVITY_SUBSCRIBE
+                        )
+                    )
+                })
+        {
+            // Bound outstanding activity tasks as well as the disk queue,
+            // so the reader never waits for either capacity when the disk stalls.
+            if activity_tasks.len() >= 128 {
+                let response = crate::control::control_error_frame(
+                    &frame,
+                    subc_control::ACTIVITY_UNAVAILABLE,
+                    "activity queue full",
+                )
+                .map_err(ConnectionError::Router)?;
+                ctx.egress
+                    .send(response)
+                    .await
+                    .map_err(ConnectionError::Router)?;
+            } else {
+                let task_router = Arc::clone(&router);
+                let task_ctx = ctx.clone();
+                activity_tasks.spawn(async move {
+                    route_open_tail(task_router, task_ctx, frame, Instant::now()).await
+                });
+            }
+            continue;
+        }
 
         if let Some(target_module_id) = router.route_open_target(&frame) {
             // A task can finish while the reader is waiting for the next frame.
@@ -580,8 +818,17 @@ where
             continue;
         }
 
-        // Every non-route.open frame keeps the original serial dispatch path,
-        // including read backpressure and close-cancellation coupling.
+        if router.defers_privileged_control(&ctx, &frame) {
+            let task_router = Arc::clone(&router);
+            let task_ctx = ctx.clone();
+            let started = Instant::now();
+            privileged_tasks
+                .spawn(async move { route_open_tail(task_router, task_ctx, frame, started).await });
+            continue;
+        }
+
+        // Other frames still route serially: routing can backpressure reads,
+        // and a connection close cancels the in-progress route.
         let route_result = tokio::select! {
             close = &mut close_receiver => {
                 return Ok(ConnectionLoopExit::CloseRequested(close_reason(close)));
@@ -812,6 +1059,59 @@ impl ConnectionError {
     fn is_quiet_reject(&self) -> bool {
         matches!(self, Self::Auth(_) | Self::UnauthenticatedCapacity)
     }
+
+    fn pre_auth_reject_stage(&self) -> Option<PreAuthRejectStage> {
+        match self {
+            Self::UnauthenticatedCapacity => Some(PreAuthRejectStage::WaitingForHandshakeSlot),
+            Self::Auth(AuthError::Timeout { .. }) => Some(PreAuthRejectStage::HandshakeDeadline),
+            Self::Auth(
+                AuthError::InvalidClientAuth
+                | AuthError::InvalidServerProof
+                | AuthError::DaemonIdMismatch,
+            ) => Some(PreAuthRejectStage::InvalidProof),
+            Self::Auth(AuthError::MessageTooLarge { .. } | AuthError::JsonDecode { .. }) => {
+                Some(PreAuthRejectStage::MalformedMessage)
+            }
+            Self::Auth(AuthError::UnexpectedEof { .. }) => Some(PreAuthRejectStage::PeerClosed),
+            Self::Auth(AuthError::Io { source, .. })
+                if matches!(
+                    source.kind(),
+                    io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                Some(PreAuthRejectStage::PeerClosed)
+            }
+            Self::Auth(_) => Some(PreAuthRejectStage::OtherAuthenticationFailure),
+            Self::FrameIo(_) | Self::Router(_) | Self::WriterTask(_) => None,
+        }
+    }
+
+    fn auth_stage(&self) -> Option<AuthStage> {
+        match self {
+            Self::Auth(
+                AuthError::Io { stage, .. }
+                | AuthError::Timeout { stage, .. }
+                | AuthError::UnexpectedEof { stage, .. }
+                | AuthError::MessageTooLarge { stage, .. }
+                | AuthError::JsonEncode { stage, .. }
+                | AuthError::JsonDecode { stage, .. },
+            ) => Some(*stage),
+            Self::Auth(
+                AuthError::Random(_)
+                | AuthError::KeyTooShort { .. }
+                | AuthError::InvalidServerProof
+                | AuthError::DaemonIdMismatch
+                | AuthError::InvalidClientAuth,
+            )
+            | Self::UnauthenticatedCapacity
+            | Self::FrameIo(_)
+            | Self::Router(_)
+            | Self::WriterTask(_) => None,
+        }
+    }
 }
 
 impl fmt::Display for ConnectionError {
@@ -850,12 +1150,16 @@ mod tests {
     };
 
     use super::*;
+    use serde::{de::DeserializeOwned, Serialize};
     use subc_protocol::{
         DecodeError, ErrorBody, Flags, FrameType, Priority, HEADER_LEN, PROTOCOL_VERSION,
     };
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, ReadBuf};
 
-    use subc_transport::{authenticate_client, ConnectionInfo, Endpoint, SCHEMA_VERSION};
+    use subc_transport::{
+        authenticate_client, compute_proof, ClientAuth, ClientHello, ConnectionInfo, Endpoint,
+        ServerProof, CLIENT_AUTH_DOMAIN, NONCE_LEN, SCHEMA_VERSION,
+    };
 
     use crate::{ControlHandler, EchoBackend, Frame, ReadStage, Registry};
 
@@ -1065,6 +1369,13 @@ mod tests {
     }
 
     fn test_auth_with_limit(max_unauthenticated: usize) -> (ServerAuth, ConnectionInfo) {
+        test_auth_with_deadline_and_limit(TEST_DEADLINE, max_unauthenticated)
+    }
+
+    fn test_auth_with_deadline_and_limit(
+        deadline: Duration,
+        max_unauthenticated: usize,
+    ) -> (ServerAuth, ConnectionInfo) {
         let key = vec![0x42; 32];
         let daemon_id = [0x24; 16];
         let conn = ConnectionInfo {
@@ -1084,7 +1395,7 @@ mod tests {
                 key,
                 daemon_id,
                 TEST_DAEMON_VER,
-                TEST_DEADLINE,
+                deadline,
                 max_unauthenticated,
             ),
             conn,
@@ -1098,6 +1409,341 @@ mod tests {
         authenticate_client(stream, conn, TEST_DEADLINE)
             .await
             .expect("test client should authenticate")
+    }
+
+    async fn write_auth_message<S, T>(stream: &mut S, value: &T)
+    where
+        S: AsyncWrite + Unpin,
+        T: Serialize,
+    {
+        let body = serde_json::to_vec(value).expect("auth message encodes");
+        stream
+            .write_all(&(body.len() as u32).to_le_bytes())
+            .await
+            .expect("auth message length writes");
+        stream
+            .write_all(&body)
+            .await
+            .expect("auth message body writes");
+    }
+
+    async fn read_auth_message<S, T>(stream: &mut S) -> T
+    where
+        S: AsyncRead + Unpin,
+        T: DeserializeOwned,
+    {
+        let mut length = [0; 4];
+        stream
+            .read_exact(&mut length)
+            .await
+            .expect("auth message length reads");
+        let mut body = vec![0; u32::from_le_bytes(length) as usize];
+        stream
+            .read_exact(&mut body)
+            .await
+            .expect("auth message body reads");
+        serde_json::from_slice(&body).expect("auth message decodes")
+    }
+
+    async fn send_wrong_key_client_auth<S>(stream: &mut S, conn: &ConnectionInfo)
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let hello = ClientHello {
+            client_nonce: [0x57; NONCE_LEN],
+            role: "client".to_owned(),
+        };
+        write_auth_message(stream, &hello).await;
+        let proof: ServerProof = read_auth_message(stream).await;
+        let mut wrong_key = conn.key.clone();
+        wrong_key[0] ^= 0xff;
+        let client_auth = ClientAuth {
+            client_auth: compute_proof(
+                &wrong_key,
+                CLIENT_AUTH_DOMAIN,
+                &hello.client_nonce,
+                &proof.server_nonce,
+                &conn.daemon_id,
+            ),
+        };
+        write_auth_message(stream, &client_auth).await;
+    }
+
+    fn assert_pre_auth_log(logs: &Arc<std::sync::Mutex<Vec<u8>>>, stage: &str, port: u16) {
+        let captured = crate::router::test_log::captured_logs(logs);
+        assert!(
+            captured.contains(&format!("stage=\"{stage}\"")),
+            "expected rejection stage {stage}, got: {captured}"
+        );
+        assert!(
+            captured.contains(&format!("peer_addr=127.0.0.1:{port}")),
+            "expected peer address, got: {captured}"
+        );
+        assert!(
+            captured.contains("elapsed_ms=") && captured.contains("suppressed_since_last="),
+            "expected elapsed time and suppression count, got: {captured}"
+        );
+        assert!(
+            !captured.contains("WARN"),
+            "pre-auth rejection must not be logged as a warning: {captured}"
+        );
+    }
+
+    #[tokio::test]
+    async fn logs_handshake_deadline_pre_auth_rejection() {
+        let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
+        let deadline = Duration::from_millis(60);
+        let (auth, _) = test_auth_with_deadline_and_limit(deadline, 4);
+        let (client, server_stream) = duplex(512);
+        let port = 41001;
+        let server = handle_accepted_connection(
+            server_stream,
+            echo_router(),
+            auth,
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            Instant::now(),
+        );
+
+        let error = tokio::time::timeout(deadline * 3, server)
+            .await
+            .expect("idle handshake should end at its deadline")
+            .expect_err("idle handshake must be rejected");
+        drop(client);
+        assert!(matches!(
+            error,
+            ConnectionError::Auth(AuthError::Timeout {
+                stage: AuthStage::ClientHello,
+                ..
+            })
+        ));
+        let captured = crate::router::test_log::captured_logs(&logs);
+        assert!(
+            captured.contains("reason=\"handshake_deadline_expired\""),
+            "{captured}"
+        );
+        assert_pre_auth_log(&logs, "handshake_deadline", port);
+    }
+
+    #[tokio::test]
+    async fn logs_invalid_client_proof_pre_auth_rejection() {
+        let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
+        let (auth, conn) = test_auth_with_deadline_and_limit(Duration::from_millis(200), 4);
+        let (mut client, server_stream) = duplex(512);
+        let port = 41002;
+        let server = handle_accepted_connection(
+            server_stream,
+            echo_router(),
+            auth,
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            Instant::now(),
+        );
+
+        let (error, ()) = tokio::join!(server, send_wrong_key_client_auth(&mut client, &conn));
+        assert!(matches!(
+            error,
+            Err(ConnectionError::Auth(AuthError::InvalidClientAuth))
+        ));
+        let captured = crate::router::test_log::captured_logs(&logs);
+        assert!(
+            captured.contains("reason=\"client_proof_mismatch\""),
+            "{captured}"
+        );
+        assert_pre_auth_log(&logs, "client_authentication", port);
+    }
+
+    #[tokio::test]
+    async fn logs_malformed_pre_auth_message() {
+        let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
+        let (auth, _) = test_auth_with_deadline_and_limit(Duration::from_millis(200), 4);
+        let (mut client, server_stream) = duplex(512);
+        let port = 41003;
+        let server = handle_accepted_connection(
+            server_stream,
+            echo_router(),
+            auth,
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            Instant::now(),
+        );
+        let send_malformed_message = async {
+            let body = b"{";
+            client
+                .write_all(&(body.len() as u32).to_le_bytes())
+                .await
+                .expect("message length writes");
+            client.write_all(body).await.expect("message body writes");
+        };
+
+        let (error, ()) = tokio::join!(server, send_malformed_message);
+        assert!(matches!(
+            error,
+            Err(ConnectionError::Auth(AuthError::JsonDecode {
+                stage: AuthStage::ClientHello,
+                ..
+            }))
+        ));
+        let captured = crate::router::test_log::captured_logs(&logs);
+        assert!(
+            captured.contains("reason=\"malformed_or_oversized_message\""),
+            "{captured}"
+        );
+        assert_pre_auth_log(&logs, "malformed_message", port);
+    }
+
+    #[tokio::test]
+    async fn logs_peer_close_during_handshake() {
+        let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
+        let (auth, _) = test_auth_with_deadline_and_limit(Duration::from_millis(200), 4);
+        let (client, server_stream) = duplex(512);
+        let port = 41004;
+        drop(client);
+
+        let error = handle_accepted_connection(
+            server_stream,
+            echo_router(),
+            auth,
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            Instant::now(),
+        )
+        .await
+        .expect_err("closed peer must be rejected");
+        assert!(matches!(
+            error,
+            ConnectionError::Auth(AuthError::UnexpectedEof {
+                stage: AuthStage::ClientHello,
+                actual: 0,
+                ..
+            })
+        ));
+        let captured = crate::router::test_log::captured_logs(&logs);
+        assert!(
+            captured.contains("reason=\"peer_closed_before_authentication_completed\""),
+            "{captured}"
+        );
+        assert_pre_auth_log(&logs, "peer_closed", port);
+    }
+
+    // Rejection-log rate limits belong to one listener. A process-wide limiter
+    // let one listener's rejects silence another's for a second, which hid the
+    // second listener's first rejection entirely.
+    #[tokio::test]
+    async fn each_listener_rate_limits_its_own_rejection_logs() {
+        let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
+        for port in [41011, 41012] {
+            let (auth, _) = test_auth_with_deadline_and_limit(Duration::from_millis(200), 4);
+            let (client, server_stream) = duplex(512);
+            drop(client);
+            handle_accepted_connection(
+                server_stream,
+                echo_router(),
+                auth,
+                SocketAddr::from(([127, 0, 0, 1], port)),
+                Instant::now(),
+            )
+            .await
+            .expect_err("closed peer must be rejected");
+        }
+        let captured = crate::router::test_log::captured_logs(&logs);
+        for port in [41011, 41012] {
+            assert!(
+                captured.contains(&format!("127.0.0.1:{port}")),
+                "listener on port {port} logged nothing: {captured}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn logs_unauthenticated_capacity_rejection() {
+        let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
+        let deadline = Duration::from_millis(60);
+        let (auth, _) = test_auth_with_deadline_and_limit(deadline, 1);
+        let held_slot = auth
+            .unauthenticated
+            .clone()
+            .try_acquire_owned()
+            .expect("the only pre-auth slot is available");
+        let (client, server_stream) = duplex(512);
+        let port = 41005;
+        let server = handle_accepted_connection(
+            server_stream,
+            echo_router(),
+            auth,
+            SocketAddr::from(([127, 0, 0, 1], port)),
+            Instant::now(),
+        );
+
+        let error = tokio::time::timeout(deadline * 3, server)
+            .await
+            .expect("queued connection should end at the capacity deadline")
+            .expect_err("connection without a free slot must be rejected");
+        drop(held_slot);
+        drop(client);
+        assert!(matches!(error, ConnectionError::UnauthenticatedCapacity));
+        let captured = crate::router::test_log::captured_logs(&logs);
+        assert!(
+            captured.contains("reason=\"capacity_wait_timed_out\""),
+            "{captured}"
+        );
+        assert_pre_auth_log(&logs, "waiting_for_handshake_slot", port);
+    }
+
+    #[test]
+    fn pre_auth_rejection_limiter_suppresses_bursts_and_reports_count() {
+        let (logs, _guard) = crate::router::test_log::log_capture(tracing::Level::INFO);
+        let limiter = PreAuthRejectLimiter::new();
+        let capacity = ConnectionError::UnauthenticatedCapacity;
+        let handshake_timeout = ConnectionError::Auth(AuthError::Timeout {
+            stage: AuthStage::ClientHello,
+            deadline: Duration::from_millis(200),
+        });
+        let peer_addr = SocketAddr::from(([127, 0, 0, 1], 41006));
+
+        log_pre_auth_rejection(
+            &capacity,
+            peer_addr,
+            Duration::from_millis(1),
+            Duration::ZERO,
+            &limiter,
+        );
+        for _ in 0..4 {
+            log_pre_auth_rejection(
+                &capacity,
+                peer_addr,
+                Duration::from_millis(2),
+                Duration::from_millis(100),
+                &limiter,
+            );
+        }
+        log_pre_auth_rejection(
+            &handshake_timeout,
+            peer_addr,
+            Duration::from_millis(3),
+            Duration::from_millis(100),
+            &limiter,
+        );
+        log_pre_auth_rejection(
+            &capacity,
+            peer_addr,
+            Duration::from_millis(4),
+            Duration::from_secs(1),
+            &limiter,
+        );
+
+        let captured = crate::router::test_log::captured_logs(&logs);
+        assert_eq!(
+            captured
+                .matches("subc TCP connection rejected before routing")
+                .count(),
+            3,
+            "one line per stage in a burst, then a later capacity line: {captured}"
+        );
+        assert!(
+            captured.contains("suppressed_since_last=4"),
+            "later capacity line should report the four hidden rejects: {captured}"
+        );
+        assert!(
+            captured.contains("stage=\"handshake_deadline\""),
+            "{captured}"
+        );
     }
 
     #[tokio::test]

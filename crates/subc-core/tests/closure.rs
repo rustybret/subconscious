@@ -1,3 +1,4 @@
+use cortexkit_test_support::ScratchDir;
 use std::{
     collections::BTreeSet,
     ops::Deref,
@@ -5,7 +6,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use subc_test_support::TestTempDir;
 
 use subc_control::{ops, ClientControlRequest, ClientControlResponse, ModuleProtocol, PollKind};
 use subc_daemon::{
@@ -412,7 +412,14 @@ async fn assert_supervisor_provenance_reads_empty_supervisor(
                 daemon.daemon_observed.running_image,
                 subc_control::RunningImageAgreement::Match { .. }
             ));
-            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            #[cfg(windows)]
+            assert!(matches!(
+                daemon.daemon_observed.running_image,
+                subc_control::RunningImageAgreement::Unavailable {
+                    reason: subc_control::RunningImageUnavailableReason::ProcessIdentityUnconfirmed
+                }
+            ));
+            #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
             assert!(matches!(
                 daemon.daemon_observed.running_image,
                 subc_control::RunningImageAgreement::Unavailable {
@@ -697,7 +704,7 @@ fn supervisor(server: &TestServer, max_restarts: u32, backoff: Duration) -> Supe
         Arc::clone(&server.registry),
         RestartPolicy::new(max_restarts, backoff),
     )
-    .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
+    .with_privacy_trampoline(common::ckdev_subc())
     .with_process_liveness(Arc::clone(&server.process_liveness))
     .with_handle(server.supervisor_handle.clone())
     .with_drain_timeout(Duration::from_millis(25))
@@ -773,6 +780,9 @@ fn thin_core_ops() -> BTreeSet<&'static str> {
         ops::SUPERVISOR_PROVENANCE,
         ops::SUPERVISOR_SPAWN_SNAPSHOT,
         ops::SUPERVISOR_SPAWN_SUBSCRIBE,
+        ops::ACTIVITY_RECORD,
+        ops::ACTIVITY_QUERY,
+        ops::ACTIVITY_SUBSCRIBE,
     ])
 }
 
@@ -808,13 +818,13 @@ fn embedding_payload() -> Vec<u8> {
 }
 
 struct TestProject {
-    temp: TestTempDir,
+    temp: ScratchDir,
 }
 
 impl TestProject {
     fn new(label: &str) -> Self {
         Self {
-            temp: TestTempDir::new(label),
+            temp: ScratchDir::new(label),
         }
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "subc-os"
-version = "0.1.9"
+version = "0.1.17"
 edition = "2021"
 license = "MIT"
 publish = true
@@ -19,6 +19,7 @@ required-features = ["test-support"]
 # carries no version on purpose: a path-only dev-dependency is dropped when the
 # crate is packaged, so publishing never looks for this version on crates.io.
 [dev-dependencies]
+cortexkit-test-support = "0.1.3"
 subc-os = { path = ".", features = ["test-support"] }
 
 # The launch-nonce handoff (dup2 and fcntl between fork and exec) and its
@@ -31,6 +32,21 @@ rustix = { version = "1", default-features = false, features = ["event", "param"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 rustix = { version = "1", default-features = false, features = ["process", "std"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
 
 # Tests measure busy work on the thread's own CPU clock, a reading independent
 # of the process-usage API they check.

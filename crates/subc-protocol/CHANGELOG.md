@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.32.4
+
+- Add terminal `error_codes::FRAME_TOO_LARGE` (`frame_too_large`) for a module reply whose header plus body exceeds the client connection's egress budget. It does not mark the established route dead: Rust and TypeScript SDKs return the request error without reopening or retrying; Swift already throws on route ERRORs without retrying. Retrying the same request could repeat module side effects and produce the same oversized reply. No envelope or protocol-version change.
+
+## 0.32.3
+
+- Add `manifest::CAP_SCOPE_BIND_PROOF_V2` (`scope-bind-proof/v2`): bind proofs are required only from non-attested openers; reserved modules are exempt. Owners relying on reserved modules opening without proofs should set hashes only after discovering v2. The daemon continues advertising v1.
+
+## 0.32.2
+
+- Add optional `ScopeRecord.replace_only_if_idle` and `ScopeSelector.hold_presence`, with builder setters and false omitted from wire bytes. Both types remain non-exhaustive. Add `manifest::CAP_SCOPE_REPLACE_IF_IDLE_V1` (`scope-replace-if-idle/v1`) covering atomic idle-only rotation and connection-held presence; send these fields only after capability discovery. Add terminal `SCOPE_EPOCH_IN_USE` (`scope_epoch_in_use`) for per-record conditional replacement refusal.
+
+## 0.32.1
+
+- Add `manifest::CAP_SCOPE_BIND_PROOF_V1` (`scope-bind-proof/v1`). A daemon advertising it stores scope bind-proof hashes and enforces proofs on scoped route opens; owners set `bind_proof_sha256` only when their connected daemon advertises it.
+
+## 0.32.0
+
+- **Breaking.** Add optional `ScopeSelector.bind_proof` and `ScopeRecord.bind_proof_sha256`. Selectors are non-exhaustive: use `ScopeSelector::new` and `with_bind_proof`. Validate hashes as 64 lowercase hexadecimal characters. Add terminal `scope_bind_proof_required` and `scope_bind_proof_mismatch` codes. Proofs are redacted in Debug/Display; unset fields preserve existing wire bytes.
+
+## 0.31.0
+
+- **Breaking.** Add `call_mode::CallMode` (`classic`, `codemode`, `flow`, or a preserved `Unknown(String)`), `CALL_MODES_CAPABILITY` (`call-modes/v1`), and `derive_call_mode`. Providers must refuse unknown modes. Declare the capability only when reading the mode on every bind and handling all three known modes.
+- **Breaking.** `ModuleControlRequest::RouteBind` gains `call_mode: Option<CallMode>`. Rust constructors must supply it; wire readers receiving an absent field must derive the mode from the bind's scope, not always choose classic. Daemons send it only to targets declaring `call-modes/v1`, including on classic routes.
+- **Breaking.** `ScopeStamp` gains `expires_at_ms: Option<u64>` and becomes `#[non_exhaustive]`: replace struct literals with `ScopeStamp::new` and the `with_*` setters. The deadline is absolute Unix wall-clock milliseconds and fixed per epoch. Both new wire fields are omitted when absent, so binds to older providers keep their existing shape.
+- Run scope records may now delegate. `scope_run_id_delegates` remains a stable code for older peers, but validation no longer emits it. To migrate providers to `call-modes/v1`, this release keeps the legacy run and flow capabilities working: non-delegating run scopes can bind to `agent-run-scopes/v1` or `call-modes/v1` targets, while delegating run scopes require `call-modes/v1`. Flow scopes can bind to `flow-scopes/v1` or `call-modes/v1` targets. Unsupported targets retain the terminal `target_agent_run_unsupported` and `target_flow_unsupported` refusals.
+
+## 0.30.2
+
+- Recognize `pipe` as a launch-nonce provenance source for Windows named-pipe readers while preserving unknown-source compatibility.
+
+## 0.30.1
+
+- Add `manifest::CAP_CATALOG_EVENTS_V1` (`catalog-events/v1`), the `server.describe` capability a daemon advertises when `catalog.list` carries modules' declared `events`.
+
+## 0.30.0
+
+- **Breaking.** `ScopeRecord` gains `expires_at_ms: Option<u64>`, an absolute Unix wall-clock deadline in milliseconds that the daemon enforces itself: at the deadline the scope ends as if its owner had removed it, routes under it close with `scope_ended`, and that ref at that epoch can never return (`scope_expired`). The deadline is fixed for the epoch (`scope_expiry_immutable`) and at most `MAX_SCOPE_EXPIRY_AHEAD_MS` (24 hours) ahead (`scope_expiry_too_far`).
+- **Breaking.** `ScopeAttributes` gains `run_id`, marking a scope as one agent run. It requires `agent_id` and refuses `flow_id` and `delegates` (`scope_run_id_without_agent`, `scope_run_id_with_flow_id`, `scope_run_id_delegates`). A route under such a scope binds only to a target that declares `AGENT_RUN_SCOPES_CAPABILITY` (`agent-run-scopes/v1`); otherwise route.open is refused with the terminal `target_agent_run_unsupported`.
+- **Breaking.** New `scope.apply` module control operation (`ScopeApply` request and response variants, `ScopeEnd`, `ScopeEndOutcome`, `ScopeEndResult`): add or end individual scopes without resending the owner's whole set. It shares `scope.sync`'s generation, and needs one accepted full `scope.sync` per daemon incarnation first (`scope_sync_required`).
+- `ScopeRecord`, `ScopeAttributes`, `ScopeCarrier`, `ScopeParent`, `ScopeEnd` and `ScopeEndResult` are `#[non_exhaustive]`; build them with `new` and the `with_*` setters, so later fields are not breaking. Wire bytes of existing records are unchanged.
+
+## 0.29.4
+
+- Add standalone, `#[non_exhaustive]` `session::OperatorConfirmRequest` and `session::OperatorConfirmReply` bodies for the module-to-daemon `operator.confirm` control operation, with constructors. The request carries the summary and the caller's route channel/epoch on the module connection; the successful reply carries `outcome: "confirmed"`. Refusals use the new `operator_declined`, `operator_presence_unavailable`, `operator_summary_invalid` and `operator_request_not_permitted` error codes. All four are terminal in the route-open retry predicate but are not route-open refusals, so the route-open decision table is unchanged. Additive: neither existing module-control enum changes, and no consumer code change is needed.
+
+## 0.29.3
+
+- Add optional `ModuleManifest.events: Option<Vec<EventDeclaration>>` and its builder setter. `EventDeclaration` is non-exhaustive, constructor-built, and declares a name, version, filter headers and optional consent-card summary. An absent block means undeclared; an empty list affirms no events. Existing manifests keep their wire bytes.
+- Validate names against the `cortexkit-bus-naming` 0.2.0 event token rule, positive u32 versions, unique (name, version) pairs, bounded unique headers, and bounded control-free summaries. HELLO refusals name the malformed field. Headers are filter hints, never authority; the bus transports a notice and the publisher serves its body.
+- Declarations are validated and retained by the new daemon but **not yet served** by `catalog.list`, `server.describe`, or `ck catalog`. Serving them needs a field in subc-control's `CatalogEntry`, which is exhaustive, so it waits for a breaking subc-control release; emitting the field on the wire without the type would leave every Rust reader silently dropping it. Readers come first: older daemons silently drop `events`, and publishers must not rely on declaration discovery before the serving daemon release is deployed.
+
+## 0.29.2
+
+- `CallOrigin` gains an optional `message_position: { message_id, index }`, where the call sits among the tool calls of one model message (0-based, in the order the model wrote them). A host may run one message's calls concurrently, so a provider that must follow the model's order reads it to sequence them. Absent means unknown. The id and the index travel together: a position missing either one does not decode. `validate_call_origin` also refuses a message id that breaks the call-key rule (empty, over 256 bytes, or outside printable non-space ASCII), naming the field `origin.message_position.message_id` (`ORIGIN_MESSAGE_ID_FIELD`) for the provider's `invalid_request` reply. Additive: `CallOrigin` is `#[non_exhaustive]`, an origin without a position keeps its existing bytes, and readers that predate it ignore the member.
+
 ## 0.29.1
 
 - Add `scope::FLOW_SCOPES_CAPABILITY` (`flow-scopes/v1`). A module that declares it in `capabilities.provides` promises to recognise a scope carrying `flow_id` and to apply flow behaviour, never owner-agent behaviour. Add the terminal route-open code `target_flow_unsupported`; the shared retry predicate and the golden decision table classify it as terminal. Additive: no existing type changes.

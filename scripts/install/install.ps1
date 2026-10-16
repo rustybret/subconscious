@@ -57,7 +57,7 @@ function Test-FileBytesEqual {
 }
 
 function Ensure-UserPath {
-    param([Parameter(Mandatory = $true)][string]$BinDir)
+    param([Parameter(Mandatory = $true)][string]$CmdDir)
 
     $environmentKey = 'HKCU:\Environment'
     $key = $null
@@ -82,27 +82,81 @@ function Ensure-UserPath {
     if (-not [string]::IsNullOrWhiteSpace($currentPath)) {
         $entries = @($currentPath -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     }
-    $containsBinDir = $false
+    $containsCmdDir = $false
     foreach ($entry in $entries) {
         $comparisonEntry = $entry
         if ($pathKind -eq [Microsoft.Win32.RegistryValueKind]::ExpandString) {
             $comparisonEntry = [Environment]::ExpandEnvironmentVariables($entry)
         }
-        if ([string]::Equals($comparisonEntry, $BinDir, [System.StringComparison]::OrdinalIgnoreCase)) {
-            $containsBinDir = $true
+        if ([string]::Equals($comparisonEntry, $CmdDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $containsCmdDir = $true
             break
         }
     }
-    if ($containsBinDir) {
+    if (-not $containsCmdDir) {
+        $updatedPath = @($entries + $CmdDir) -join ';'
+        try {
+            Set-ItemProperty -Path $environmentKey -Name Path -Value $updatedPath -Type $pathKind -ErrorAction Stop
+        }
+        catch {
+            Refuse 'path-update-failed' "could not update HKCU\\Environment PATH ($($_.Exception.Message))"
+        }
+        # The PATH is already saved at this point. A failed broadcast only means
+        # windows opened before the install may not see it until the next sign-in,
+        # so it warns instead of refusing.
+        try {
+            Broadcast-EnvironmentChange
+        }
+        catch {
+            Write-Warning "PATH was saved, but other open windows were not told about it ($($_.Exception.Message)). Windows opened before this install may need a sign-out to find ck."
+        }
+    }
+
+    $sessionEntries = @()
+    if (-not [string]::IsNullOrWhiteSpace($env:Path)) {
+        $sessionEntries = @($env:Path -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    }
+    $sessionContainsCmdDir = $false
+    foreach ($entry in $sessionEntries) {
+        if ([string]::Equals($entry, $CmdDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $sessionContainsCmdDir = $true
+            break
+        }
+    }
+    if (-not $sessionContainsCmdDir) {
+        $env:Path = (@($CmdDir) + $sessionEntries) -join ';'
+    }
+}
+
+# A direct registry write preserves both the raw PATH text and its value kind,
+# but broadcasting WM_SETTINGCHANGE is what tells Explorer to refresh its copy.
+function Broadcast-EnvironmentChange {
+    if ([Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
         return
     }
 
-    $updatedPath = @($entries + $BinDir) -join ';'
-    try {
-        Set-ItemProperty -Path $environmentKey -Name Path -Value $updatedPath -Type $pathKind -ErrorAction Stop
+    if (-not ('CortexKit.EnvironmentBroadcast' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace CortexKit {
+    public static class EnvironmentBroadcast {
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        public static extern IntPtr SendMessageTimeout(
+            IntPtr hWnd, uint message, UIntPtr wParam, string lParam,
+            uint flags, uint timeout, out UIntPtr result);
     }
-    catch {
-        Refuse 'path-update-failed' "could not update HKCU\\Environment PATH ($($_.Exception.Message))"
+}
+'@ -ErrorAction Stop
+    }
+
+    $broadcastResult = [UIntPtr]::Zero
+    $sent = [CortexKit.EnvironmentBroadcast]::SendMessageTimeout(
+        [IntPtr]0xffff, 0x001a, [UIntPtr]::Zero, 'Environment', 0x0002, 5000, [ref]$broadcastResult)
+    if ($sent -eq [IntPtr]::Zero) {
+        $errorCode = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw [System.ComponentModel.Win32Exception]::new($errorCode)
     }
 }
 
@@ -112,7 +166,7 @@ function Write-InstallerManifest {
         [Parameter(Mandatory = $true)][string]$Binary,
         [Parameter(Mandatory = $true)][string]$BinaryDigest,
         [Parameter(Mandatory = $true)][string]$ArchiveDigest,
-        [Parameter(Mandatory = $true)][string]$BinDir,
+        [Parameter(Mandatory = $true)][string]$CmdDir,
         [Parameter(Mandatory = $true)][string]$Arch
     )
 
@@ -133,7 +187,7 @@ function Write-InstallerManifest {
                 kind = 'user-path-registry'
                 registry_key = 'HKCU\Environment'
                 registry_value = 'Path'
-                path = $BinDir
+                path = $CmdDir
             },
             [ordered]@{
                 kind = 'ownership-record'
@@ -205,8 +259,8 @@ if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
 $os = 'windows'
 $archiveName = "ck-$os-$arch.zip"
 $dataDir = Join-Path $env:LOCALAPPDATA 'cortexkit'
-$binDir = Join-Path $dataDir 'bin'
-$destination = Join-Path $binDir 'ck.exe'
+$cmdDir = Join-Path $dataDir 'cmd'
+$destination = Join-Path $cmdDir 'ck.exe'
 $manifest = Join-Path $dataDir 'installer-manifest.json'
 $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ("ck-install-" + [System.Guid]::NewGuid().ToString('N'))
 $archivePath = Join-Path $tempDir $archiveName
@@ -261,8 +315,8 @@ try {
     }
     else {
         try {
-            New-Item -ItemType Directory -Path $binDir -Force -ErrorAction Stop | Out-Null
-            $temporaryDestination = Join-Path $binDir '.ck.exe.tmp'
+            New-Item -ItemType Directory -Path $cmdDir -Force -ErrorAction Stop | Out-Null
+            $temporaryDestination = Join-Path $cmdDir '.ck.exe.tmp'
             Copy-Item -LiteralPath $candidate -Destination $temporaryDestination -Force -ErrorAction Stop
             Move-Item -LiteralPath $temporaryDestination -Destination $destination -Force -ErrorAction Stop
         }
@@ -272,8 +326,8 @@ try {
         Write-Output "Installed ck at $destination."
     }
 
-    Ensure-UserPath -BinDir $binDir
-    Write-InstallerManifest -Manifest $manifest -Binary $destination -BinaryDigest $candidateDigest -ArchiveDigest $expectedDigest -BinDir $binDir -Arch $arch
+    Ensure-UserPath -CmdDir $cmdDir
+    Write-InstallerManifest -Manifest $manifest -Binary $destination -BinaryDigest $candidateDigest -ArchiveDigest $expectedDigest -CmdDir $cmdDir -Arch $arch
     Write-Output 'Next: ck setup'
 }
 finally {

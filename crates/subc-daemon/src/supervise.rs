@@ -20,7 +20,7 @@ use subc_protocol::{
         HealthReport, HealthStatus, ModuleControlCommand, ModuleControlRequest,
         MODULE_CONTROL_OP_HEALTH_CHECK,
     },
-    Flags, FrameType, Priority, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
+    Flags, FrameType, Principal, Priority, SUBC_LAUNCH_NONCE_ENV, SUBC_MODULE_ID_ENV,
 };
 use tokio::{
     process::{Child, Command},
@@ -39,8 +39,8 @@ use crate::{
         CloseReason, ForwardingError, ForwardingTable, GoodbyeTarget, ModuleControlRpcOutcome,
         ModuleDrainTarget, PendingModuleControlRpc,
     },
-    provenance::{spawned_file_identity, ExecutableIdentityProbe, SpawnedFileIdentity},
-    registry::{ConnectionId, RegistryError},
+    provenance::{ExecutableIdentityProbe, SpawnedFileIdentity},
+    registry::{ConnectionId, RegistrationEndReason, RegistryError},
     stderr_tail::{
         pump_stderr_to, pump_stdout_to, ChildOutputSink, StderrRing, StderrTailConfig,
         StderrTailSnapshot,
@@ -49,8 +49,14 @@ use crate::{
     Frame, FrameSink, Registry,
 };
 
+#[cfg(not(windows))]
+use crate::provenance::spawned_file_identity;
+
 #[path = "supervise_swap.rs"]
 mod swap;
+
+#[path = "supervise_activity.rs"]
+mod activity;
 
 /// Command-line flag used by supervised modules to find subc.
 ///
@@ -81,8 +87,8 @@ const REGISTRY_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
 const REGISTRY_RELEASE_POLL: Duration = Duration::from_millis(10);
 /// How long a restart waits for the exited process's output readers.
 ///
-/// The restart does not depend on the stderr reader finishing. A reader still
-/// running at this bound is left running, and whatever it delivers later goes
+/// The restart does not depend on either output reader finishing. A stderr
+/// reader still running at this bound is left running, and its later output goes
 /// into the exited process's own section of the stderr ring (see
 /// `StderrRing::push_line_from`), ending naturally at EOF on its pipe. So the
 /// bound no longer decides whether a crash's last lines are kept: under load
@@ -97,9 +103,10 @@ const REGISTRY_RELEASE_POLL: Duration = Duration::from_millis(10);
 /// exits. Under load a slow reader can show `Incomplete` briefly; it returns to
 /// `Captured` at EOF with nothing lost.
 ///
-/// The stdout reader carries no ring, only the capture file, and is still
-/// stopped at this bound so an old process's stdout cannot trail into the file
-/// after its successor starts.
+/// The stdout reader carries no ring, only the capture file. It also continues
+/// to EOF after this bound: child exit closes the writer but does not mean the
+/// reader has consumed all buffered bytes. Late output from either pipe can
+/// therefore reach the shared capture file after the successor starts.
 const STDERR_PUMP_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 /// Maximum number of supervised process spawn/exit facts retained per daemon incarnation.
 pub const SPAWN_EVENT_RING_CAPACITY: usize = 4096;
@@ -275,6 +282,8 @@ fn privacy_command(
 
 struct SupervisedChild {
     child: Child,
+    #[cfg(windows)]
+    nonce_delivery: Option<subc_os::LaunchNoncePipeDelivery>,
     #[cfg(target_os = "macos")]
     privacy_exec: Option<PrivacyExec>,
     /// Set once this launch's exec acknowledgement confirms the module image.
@@ -509,21 +518,8 @@ impl SupervisedChild {
     }
 
     async fn drain_stderr(&mut self, module_id: &str) {
-        if let Some(mut pump) = self.stdout_pump.take() {
-            match timeout(STDERR_PUMP_DRAIN_TIMEOUT, &mut pump).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    warn!(module_id, error = %error, "stdout pump ended unexpectedly");
-                }
-                Err(_) => {
-                    pump.abort();
-                    warn!(
-                        module_id,
-                        waited = ?STDERR_PUMP_DRAIN_TIMEOUT,
-                        "stdout pump did not drain before restart; stopped it before the next process"
-                    );
-                }
-            }
+        if let Some(pump) = self.stdout_pump.take() {
+            settle_stdout_pump(module_id, pump, STDERR_PUMP_DRAIN_TIMEOUT).await;
         }
 
         let Some(pump) = self.stderr_pump.take() else {
@@ -536,6 +532,26 @@ impl SupervisedChild {
             STDERR_PUMP_DRAIN_TIMEOUT,
         )
         .await;
+    }
+}
+
+/// Bound the restart's wait, not the lifetime of the exited child's stdout
+/// reader. Slow pipe reads or capture writes must not turn the bound into lost
+/// output; dropping the handle lets the reader finish at EOF, like stderr.
+async fn settle_stdout_pump(module_id: &str, mut pump: JoinHandle<()>, bound: Duration) {
+    match timeout(bound, &mut pump).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            warn!(module_id, error = %error, "stdout pump ended unexpectedly");
+        }
+        Err(_) => {
+            drop(pump);
+            warn!(
+                module_id,
+                waited = ?bound,
+                "stdout pipe of the exited process has not drained; its reader keeps running without delaying the restart"
+            );
+        }
     }
 }
 
@@ -990,6 +1006,13 @@ pub struct ExitReport {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModuleStatus {
     pub module_id: String,
+    /// A previous daemon's hidden process, not a child owned by this supervisor.
+    pub waiting_for_previous_pid: Option<u32>,
+    /// The daemon's Windows per-spawn record: `pipe` after the process it
+    /// spawned read all nonce bytes, otherwise `env` for the offered copy.
+    /// List/status reports use this record, not the source the module sends
+    /// in its registration message's manifest.provenance.launch_nonce_source.
+    pub launch_nonce_source: Option<String>,
     pub state: ModuleState,
     pub enabled: bool,
     pub process_alive: bool,
@@ -1046,13 +1069,33 @@ pub struct ModuleStatus {
     pub health: ModuleHealthStatus,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ActorSelectCheckpoint {
+    generation: u64,
+    turn: u64,
+    registered_connection: Option<ConnectionId>,
+    next_probe_at: Option<Instant>,
+    wake_after: Option<Duration>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct SupervisorSnapshot {
+    #[cfg(windows)]
+    pipe_consumed: Option<Arc<OnceLock<()>>>,
+    /// Counts running-child loop turns, not executor polls of a parked wait.
+    #[cfg(test)]
+    actor_turns: u64,
+    /// Running select after exec confirmation and with no unconsumed registry
+    /// event. Recording a spawn or starting a loop turn is not this barrier.
+    #[cfg(test)]
+    actor_select: Option<ActorSelectCheckpoint>,
     state: ModuleState,
     enabled: bool,
     process_alive: bool,
     spawned_protocol: Option<ModuleProtocol>,
     spawn_failure: Option<String>,
+    waiting_for_previous_pid: Option<u32>,
     /// When each crash restart was spent, oldest first. This IS the crash
     /// budget: its in-window length is the count an operator sees and the count
     /// the restart decision is made against, so there is no second counter that
@@ -1074,7 +1117,7 @@ struct SupervisorSnapshot {
     report_ready: Option<Arc<OnceLock<()>>>,
     /// Last reaped child, retained after current process facts are cleared.
     reaped_pid: Option<u32>,
-    /// Whether the command-serving supervision loop has a scheduled respawn.
+    /// Whether a replacement has already been scheduled for the current process.
     respawn_pending: bool,
     /// A second restart is waiting for the replacement already scheduled.
     coalesced_restart_pending: bool,
@@ -1130,10 +1173,6 @@ impl SupervisorSnapshot {
 
     fn disabled() -> Self {
         Self::new(ModuleState::Disabled, false)
-    }
-
-    fn failed() -> Self {
-        Self::new(ModuleState::Failed, true)
     }
 
     /// Crash restarts still inside `window`, having dropped the ones that are
@@ -1192,11 +1231,18 @@ impl SupervisorSnapshot {
 
     fn new(state: ModuleState, enabled: bool) -> Self {
         Self {
+            #[cfg(test)]
+            actor_turns: 0,
+            #[cfg(test)]
+            actor_select: None,
             state,
             enabled,
             process_alive: false,
+            #[cfg(windows)]
+            pipe_consumed: None,
             spawned_protocol: None,
             spawn_failure: None,
+            waiting_for_previous_pid: None,
             crash_restarts: VecDeque::new(),
             lifetime_restarts: 0,
             spawn_generation: 0,
@@ -1261,7 +1307,10 @@ impl Default for SpawnEventState {
 }
 
 #[derive(Debug, Clone, Default)]
-struct SpawnEventFeed(Arc<Mutex<SpawnEventState>>);
+struct SpawnEventFeed(
+    Arc<Mutex<SpawnEventState>>,
+    #[cfg(test)] Arc<Mutex<Option<std::net::TcpStream>>>,
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SpawnSubscribeRefusal {
@@ -1715,6 +1764,9 @@ type ReloadReply = oneshot::Sender<Result<(), SuperviseError>>;
 
 #[derive(Debug, Clone)]
 struct SupervisorRuntimeConfig {
+    start_requester: Option<Principal>,
+    pending_activity_restart: bool,
+    provenance_probe: ExecutableIdentityProbe,
     /// Restart operations hand their backoff to the loop, which keeps serving commands.
     scheduled_respawn: Arc<Mutex<Option<PendingRespawn>>>,
     /// A reload acknowledges completion only after its replacement registers.
@@ -1767,6 +1819,8 @@ struct SupervisedConfiguration {
 /// launch nonces recorded at spawn are checked by the same daemon instance.
 #[derive(Debug, Clone, Default)]
 pub struct SupervisorHandle {
+    activity: Arc<Mutex<Option<crate::activity::ActivityLedger>>>,
+    activity_images: Arc<Mutex<HashMap<String, activity::ActivityImage>>>,
     modules: Arc<Mutex<HashMap<String, SupervisedModule>>>,
     /// Module ids the supervisor has taken on. An id is added BEFORE the
     /// module's first process is spawned and removed only when the module
@@ -2379,6 +2433,10 @@ impl SupervisorHandle {
     }
 
     pub(crate) fn retire(&self, module_id: &str) -> Option<SupervisedModule> {
+        self.activity_images
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(module_id);
         self.spawn_nonces
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2478,6 +2536,16 @@ pub struct Supervisor {
     test_after_first_spawn: AfterFirstSpawnHook,
 }
 
+/// A roster entry whose monitor and first process have not started yet.
+/// Keeping the command receiver here lets discovery serve status immediately
+/// while start/stop requests wait until bootstrap has published the connection file.
+pub(crate) struct RegisteredConfiguredModule {
+    spec: ModuleSpec,
+    runtime: SupervisorRuntimeConfig,
+    module: SupervisedModule,
+    commands: mpsc::Receiver<SupervisorCommand>,
+}
+
 /// Test-only hook run on the path that takes on a new module, right after its
 /// first `spawn_child` returns (the process exists and could already be
 /// registering) and before that process is handed to the module's supervise
@@ -2560,16 +2628,16 @@ impl Supervisor {
         let Some(forwarding) = &self.forwarding else {
             return Ok(());
         };
-        let module_ids = forwarding
+        let modules = forwarding
             .begin_daemon_drain()
             .map_err(SuperviseError::Forwarding)?;
         let deadline_ms =
             unix_ms_now().saturating_add((NOTICE_BUDGET + DRAIN_BUDGET).as_millis() as u64);
         let mut notices = tokio::task::JoinSet::new();
         let mut drains = Vec::new();
-        for module_id in module_ids {
+        for (module_id, endpoint) in modules {
             let Some(target) = forwarding
-                .begin_module_drain(&module_id, RouteCloseReason::Restart)
+                .begin_endpoint_drain(endpoint, RouteCloseReason::Restart)
                 .map_err(SuperviseError::Forwarding)?
             else {
                 continue;
@@ -2646,16 +2714,26 @@ impl Supervisor {
             let mut runtime = self.runtime_config();
             runtime.health.cadence = Duration::from_millis(100);
             waits.spawn(async move {
-                wait_for_forwarding_quiescence(
+                let wait_result = wait_for_forwarding_quiescence(
                     &forwarding,
                     &module_id,
                     &runtime,
                     endpoint,
                     deadline,
                     &gauges,
-                    DrainScope::Active,
+                    DrainScope::Endpoint(endpoint),
                 )
-                .await
+                .await;
+                // Store the measurement before the task returns: quiescence
+                // may be reached just as the deadline stops the join loop from
+                // collecting results. Unfinished or failed waits report false.
+                forwarding
+                    .record_daemon_drain_result(
+                        endpoint,
+                        drained_after_quiescence_wait(&wait_result),
+                    )
+                    .map_err(SuperviseError::Forwarding)?;
+                wait_result
             });
         }
         while let Ok(Some(result)) = timeout_at(deadline, waits.join_next()).await {
@@ -2838,6 +2916,7 @@ impl Supervisor {
 
         let runtime = self.runtime_config();
         let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let activity_spawn = runtime.begin_activity_spawn(&spec.module_id);
         let spawned = spawn_child(
             &spec,
             runtime.connection_file_path.as_deref(),
@@ -2860,6 +2939,9 @@ impl Supervisor {
             }
         };
         self.mark_first_process_running(&spec, &runtime, &snapshot, &child)?;
+        if let Some(spawn) = activity_spawn {
+            spawn.complete(&snapshot);
+        }
 
         Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
     }
@@ -2919,44 +3001,14 @@ impl Supervisor {
         spec: ModuleSpec,
         enabled: bool,
     ) -> Result<SupervisedModule, SuperviseError> {
-        validate_spec(&spec)?;
-        self.establish_identity(&spec);
-
-        let runtime = self.runtime_config();
-        if !enabled {
-            let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::disabled()));
-            return Ok(self.supervised_module(spec, runtime, snapshot, None));
-        }
-
-        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
-        let spawned = spawn_child(
-            &spec,
-            runtime.connection_file_path.as_deref(),
-            self.supervisor_handle.as_ref(),
-            &runtime.stderr_ring,
-            runtime.capture_logs_dir.as_deref(),
-            &runtime.child_roster,
-            #[cfg(target_os = "linux")]
-            runtime.cgroup_placement.as_ref(),
-        );
-        #[cfg(test)]
-        self.test_after_first_spawn.run(&spec.module_id);
-        match spawned {
-            Ok(child) => {
-                self.mark_first_process_running(&spec, &runtime, &snapshot, &child)?;
-                Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
-            }
-            Err(err) => {
-                error!(
-                    module_id = %spec.module_id,
-                    program = %spec.program.display(),
-                    error = %err,
-                    "configured module failed to spawn; marking failed and continuing"
-                );
-                let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::failed()));
-                Ok(self.supervised_module(spec, runtime, snapshot, None))
-            }
-        }
+        self.supervise_configured_requested(
+            spec,
+            enabled,
+            self.health.clone(),
+            None,
+            self.restart_policy,
+            None,
+        )
     }
 
     /// Supervise a configured module with its own health, drain, and crash
@@ -2972,11 +3024,52 @@ impl Supervisor {
         drain_timeout_ms: Option<u64>,
         restart_policy: RestartPolicy,
     ) -> Result<SupervisedModule, SuperviseError> {
+        self.supervise_configured_requested(
+            spec,
+            enabled,
+            health,
+            drain_timeout_ms,
+            restart_policy,
+            None,
+        )
+    }
+
+    pub(crate) fn supervise_configured_requested(
+        &self,
+        spec: ModuleSpec,
+        enabled: bool,
+        health: HealthConfig,
+        drain_timeout_ms: Option<u64>,
+        restart_policy: RestartPolicy,
+        requester: Option<Principal>,
+    ) -> Result<SupervisedModule, SuperviseError> {
+        let registered = self.register_configured_with_health(
+            spec,
+            enabled,
+            health,
+            drain_timeout_ms,
+            restart_policy,
+        )?;
+        self.start_registered_configured(registered, requester)
+    }
+
+    /// Record a configured module as starting or disabled, without launching a
+    /// process or running its monitor. Bootstrap registers the entire roster
+    /// before publishing discovery, then activates it once children can read
+    /// the connection file passed in their `--subc` argument.
+    pub(crate) fn register_configured_with_health(
+        &self,
+        spec: ModuleSpec,
+        enabled: bool,
+        health: HealthConfig,
+        drain_timeout_ms: Option<u64>,
+        restart_policy: RestartPolicy,
+    ) -> Result<RegisteredConfiguredModule, SuperviseError> {
         validate_spec(&spec)?;
         self.establish_identity(&spec);
 
         let mut runtime = self.runtime_config();
-        runtime.health = health.clone();
+        runtime.health = health;
         runtime.restart_policy = restart_policy;
         if let Some(ms) = drain_timeout_ms {
             runtime.drain_timeout = Duration::from_millis(ms);
@@ -2985,54 +3078,107 @@ impl Supervisor {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = runtime.drain_timeout;
         }
-        if !enabled {
-            let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::disabled()));
-            return Ok(self.supervised_module(spec, runtime, snapshot, None));
-        }
+        let snapshot = if enabled {
+            SupervisorSnapshot::starting()
+        } else {
+            SupervisorSnapshot::disabled()
+        };
+        #[cfg(target_os = "linux")]
+        let snapshot = {
+            let mut snapshot = snapshot;
+            if enabled {
+                snapshot.waiting_for_previous_pid =
+                    runtime.child_roster.previous_instance_pid(&spec.module_id);
+            }
+            snapshot
+        };
+        let (module, commands) =
+            self.register_module(&spec, &runtime, Arc::new(Mutex::new(snapshot)));
+        Ok(RegisteredConfiguredModule {
+            spec,
+            runtime,
+            module,
+            commands,
+        })
+    }
 
-        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
-        let spawned = spawn_child(
-            &spec,
-            runtime.connection_file_path.as_deref(),
-            self.supervisor_handle.as_ref(),
-            &runtime.stderr_ring,
-            runtime.capture_logs_dir.as_deref(),
-            &runtime.child_roster,
-            #[cfg(target_os = "linux")]
-            runtime.cgroup_placement.as_ref(),
-        );
-        #[cfg(test)]
-        self.test_after_first_spawn.run(&spec.module_id);
-        match spawned {
-            Ok(child) => {
-                self.mark_first_process_running(&spec, &runtime, &snapshot, &child)?;
-                Ok(self.supervised_module(spec, runtime, snapshot, Some(child)))
-            }
-            Err(err) => {
-                if health.critical {
-                    error!(
-                        module_id = %spec.module_id,
-                        program = %spec.program.display(),
-                        error = %err,
-                        "critical configured module failed to spawn; marking failed and alerting"
-                    );
-                } else {
-                    error!(
-                        module_id = %spec.module_id,
-                        program = %spec.program.display(),
-                        error = %err,
-                        "configured module failed to spawn; marking failed and continuing"
-                    );
+    /// Activate a previously registered module. Queued control requests are
+    /// served by the monitor after the initial configured spawn has settled.
+    pub(crate) fn start_registered_configured(
+        &self,
+        registered: RegisteredConfiguredModule,
+        requester: Option<Principal>,
+    ) -> Result<SupervisedModule, SuperviseError> {
+        let RegisteredConfiguredModule {
+            spec,
+            mut runtime,
+            module,
+            commands,
+        } = registered;
+        runtime.start_requester = requester;
+        let snapshot = &module.inner.snapshot;
+        let should_spawn = {
+            let state = lock_snapshot(snapshot)?;
+            state.enabled && state.waiting_for_previous_pid.is_none()
+        };
+        let child = if should_spawn {
+            let activity_spawn = runtime.begin_activity_spawn(&spec.module_id);
+            let spawned = spawn_child(
+                &spec,
+                runtime.connection_file_path.as_deref(),
+                self.supervisor_handle.as_ref(),
+                &runtime.stderr_ring,
+                runtime.capture_logs_dir.as_deref(),
+                &runtime.child_roster,
+                #[cfg(target_os = "linux")]
+                runtime.cgroup_placement.as_ref(),
+            );
+            #[cfg(test)]
+            self.test_after_first_spawn.run(&spec.module_id);
+            match spawned {
+                Ok(child) => {
+                    self.mark_first_process_running(&spec, &runtime, snapshot, &child)?;
+                    if let Some(spawn) = activity_spawn {
+                        spawn.complete(snapshot);
+                    }
+                    Some(child)
                 }
-                let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::failed()));
-                Ok(self.supervised_module(spec, runtime, snapshot, None))
+                Err(err) => {
+                    if runtime.health.critical {
+                        error!(
+                            module_id = %spec.module_id,
+                            program = %spec.program.display(),
+                            error = %err,
+                            "critical configured module failed to spawn; marking failed and alerting"
+                        );
+                    } else {
+                        error!(
+                            module_id = %spec.module_id,
+                            program = %spec.program.display(),
+                            error = %err,
+                            "configured module failed to spawn; marking failed and continuing"
+                        );
+                    }
+                    update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                        state.state = ModuleState::Failed;
+                        clear_current_process_facts(state);
+                    })?;
+                    None
+                }
             }
-        }
+        } else {
+            None
+        };
+        self.start_monitor(spec, runtime, &module, child, commands);
+        Ok(module)
     }
 
     fn runtime_config(&self) -> SupervisorRuntimeConfig {
         let effective_drain_timeout = Arc::new(Mutex::new(self.drain_timeout));
         SupervisorRuntimeConfig {
+            start_requester: None,
+            pending_activity_restart: false,
+            provenance_probe: self.provenance_probe.clone(),
             scheduled_respawn: Arc::default(),
             deferred_reload_reply: Arc::default(),
             restart_policy: self.restart_policy,
@@ -3076,6 +3222,17 @@ impl Supervisor {
         snapshot: SharedSnapshot,
         child: Option<SupervisedChild>,
     ) -> SupervisedModule {
+        let (module, commands) = self.register_module(&spec, &runtime, snapshot);
+        self.start_monitor(spec, runtime, &module, child, commands);
+        module
+    }
+
+    fn register_module(
+        &self,
+        spec: &ModuleSpec,
+        runtime: &SupervisorRuntimeConfig,
+        snapshot: SharedSnapshot,
+    ) -> (SupervisedModule, mpsc::Receiver<SupervisorCommand>) {
         let configuration = Arc::new(Mutex::new(SupervisedConfiguration {
             spec: spec.clone(),
             health: runtime.health.clone(),
@@ -3088,16 +3245,6 @@ impl Supervisor {
         let restart_policy = runtime.restart_policy;
         let effective_drain_timeout = Arc::clone(&runtime.effective_drain_timeout);
         let (tx, rx) = mpsc::channel(4);
-        let monitor = tokio::spawn(supervise_loop(
-            spec.clone(),
-            runtime,
-            Arc::clone(&self.registry),
-            Arc::clone(&self.process_liveness),
-            Arc::clone(&snapshot),
-            child,
-            rx,
-        ));
-
         let module_id = spec.module_id.clone();
         let module = SupervisedModule {
             inner: Arc::new(SupervisedModuleInner {
@@ -3108,19 +3255,42 @@ impl Supervisor {
                 stderr_ring,
                 terminal_ring,
                 commands: tx,
-                monitor: Mutex::new(Some(monitor)),
+                monitor: Mutex::new(None),
                 restart_policy,
                 effective_drain_timeout,
                 provenance_probe: self.provenance_probe.clone(),
             }),
         };
-        // The identity gates and the configured mark were set by
-        // `establish_identity` before any process was spawned; only the roster
-        // entry waits for the module handle, which needs the spawned child.
+        // Identity gates and the configured mark must precede the roster entry,
+        // so a client never sees a module without its admission policy.
         if let Some(supervisor_handle) = &self.supervisor_handle {
             supervisor_handle.insert(module.clone());
         }
-        module
+        (module, rx)
+    }
+
+    fn start_monitor(
+        &self,
+        spec: ModuleSpec,
+        runtime: SupervisorRuntimeConfig,
+        module: &SupervisedModule,
+        child: Option<SupervisedChild>,
+        commands: mpsc::Receiver<SupervisorCommand>,
+    ) {
+        let monitor = tokio::spawn(supervise_loop(
+            spec,
+            runtime,
+            Arc::clone(&self.registry),
+            Arc::clone(&self.process_liveness),
+            Arc::clone(&module.inner.snapshot),
+            child,
+            commands,
+        ));
+        *module
+            .inner
+            .monitor
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(monitor);
     }
 }
 
@@ -3183,6 +3353,22 @@ impl SupervisedModule {
 
     pub fn state(&self) -> Result<ModuleState, SuperviseError> {
         Ok(lock_snapshot(&self.inner.snapshot)?.state)
+    }
+
+    pub(crate) fn registration_end_reason(
+        &self,
+    ) -> Result<Option<RegistrationEndReason>, SuperviseError> {
+        let snapshot = lock_snapshot(&self.inner.snapshot)?;
+        Ok(match snapshot.state {
+            ModuleState::Draining if snapshot.draining_to_replace => {
+                Some(RegistrationEndReason::SupervisorRestart)
+            }
+            ModuleState::Draining => Some(RegistrationEndReason::SupervisorStop),
+            ModuleState::Restarting if snapshot.draining_to_replace => {
+                Some(RegistrationEndReason::SupervisorRestart)
+            }
+            _ => None,
+        })
     }
 
     /// The module's retained stderr, newest lines last.
@@ -3310,7 +3496,9 @@ impl SupervisedModule {
 
         Ok((
             ModuleStatus {
+                waiting_for_previous_pid: snapshot.waiting_for_previous_pid,
                 module_id: self.inner.module_id.clone(),
+                launch_nonce_source: observed_launch_nonce_source(&snapshot),
                 state: snapshot.state,
                 enabled: snapshot.enabled,
                 process_alive: snapshot.process_alive,
@@ -3332,7 +3520,7 @@ impl SupervisedModule {
                 last_exit: snapshot.last_exit,
                 health: snapshot.health,
             },
-            snapshot.spawned_file_identity,
+            snapshot.spawned_file_identity.clone(),
         ))
     }
 
@@ -3388,7 +3576,7 @@ impl SupervisedModule {
             .observe(
                 snapshot.reported_pid(),
                 snapshot.spawned_from.as_deref(),
-                snapshot.spawned_file_identity,
+                snapshot.spawned_file_identity.clone(),
                 snapshot.process_start_time,
             )
             .await
@@ -3397,15 +3585,37 @@ impl SupervisedModule {
     /// Memory and CPU time of the module's current process, read now. Only the
     /// process the supervisor spawned is read, not processes it has started.
     pub(crate) fn child_resource_usage(&self) -> subc_control::ChildResourceUsage {
-        let (pid, start_time) = match lock_snapshot(&self.inner.snapshot) {
-            Ok(snapshot) => (snapshot.reported_pid(), snapshot.process_start_time),
-            Err(_) => {
-                return subc_control::ChildResourceUsage::Unavailable {
-                    reason: subc_control::ChildResourceUnavailableReason::Unreadable,
+        #[cfg(windows)]
+        {
+            let image = lock_snapshot(&self.inner.snapshot)
+                .ok()
+                .and_then(|snapshot| {
+                    snapshot
+                        .spawned_file_identity
+                        .as_ref()
+                        .and_then(|identity| identity.windows_image.clone())
+                });
+            match image {
+                Some(image) => {
+                    crate::child_resources::read_windows_handle(image.process(), image.start_time())
                 }
+                None => subc_control::ChildResourceUsage::Unavailable {
+                    reason: subc_control::ChildResourceUnavailableReason::NotRunning,
+                },
             }
-        };
-        crate::child_resources::read(pid, start_time)
+        }
+        #[cfg(not(windows))]
+        {
+            let (pid, start_time) = match lock_snapshot(&self.inner.snapshot) {
+                Ok(snapshot) => (snapshot.reported_pid(), snapshot.process_start_time),
+                Err(_) => {
+                    return subc_control::ChildResourceUsage::Unavailable {
+                        reason: subc_control::ChildResourceUnavailableReason::Unreadable,
+                    }
+                }
+            };
+            crate::child_resources::read(pid, start_time)
+        }
     }
 
     pub(crate) fn will_recover_after_connection_loss(&self) -> Result<bool, SuperviseError> {
@@ -3413,6 +3623,7 @@ impl SupervisedModule {
         Ok(match snapshot.state {
             ModuleState::Restarting => true,
             ModuleState::Failed | ModuleState::Disabled => false,
+            _ if snapshot.enabled && snapshot.respawn_pending => true,
             _ => daemon_will_restart(&mut snapshot, &self.inner.restart_policy, Instant::now()),
         })
     }
@@ -3451,7 +3662,10 @@ impl SupervisedModule {
         self.stop().await
     }
 
-    pub(crate) async fn retire(&self) -> Result<(), SuperviseError> {
+    pub(crate) async fn retire_requested(
+        &self,
+        requester: Option<Principal>,
+    ) -> Result<(), SuperviseError> {
         match self.state()? {
             ModuleState::Stopped | ModuleState::Failed => return Ok(()),
             ModuleState::Starting
@@ -3465,7 +3679,10 @@ impl SupervisedModule {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .commands
-            .send(SupervisorCommand::Retire { reply: reply_tx })
+            .send(SupervisorCommand::Retire {
+                requester,
+                reply: reply_tx,
+            })
             .await
             .map_err(|_| SuperviseError::CommandClosed {
                 module_id: self.inner.module_id.clone(),
@@ -3476,6 +3693,13 @@ impl SupervisedModule {
     }
 
     pub async fn stop(&self) -> Result<(), SuperviseError> {
+        self.stop_requested(None).await
+    }
+
+    pub(crate) async fn stop_requested(
+        &self,
+        requester: Option<Principal>,
+    ) -> Result<(), SuperviseError> {
         match self.state()? {
             ModuleState::Stopped | ModuleState::Failed => return Ok(()),
             ModuleState::Starting
@@ -3489,7 +3713,10 @@ impl SupervisedModule {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .commands
-            .send(SupervisorCommand::Drain { reply: reply_tx })
+            .send(SupervisorCommand::Drain {
+                requester,
+                reply: reply_tx,
+            })
             .await
             .map_err(|_| SuperviseError::CommandClosed {
                 module_id: self.inner.module_id.clone(),
@@ -3500,11 +3727,20 @@ impl SupervisedModule {
     }
 
     pub async fn restart(&self, drain_timeout_ms: Option<u64>) -> Result<(), SuperviseError> {
+        self.restart_requested(drain_timeout_ms, None).await
+    }
+
+    pub(crate) async fn restart_requested(
+        &self,
+        drain_timeout_ms: Option<u64>,
+        requester: Option<Principal>,
+    ) -> Result<(), SuperviseError> {
         let received_at_generation = lock_snapshot(&self.inner.snapshot)?.spawn_generation;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .commands
             .send(SupervisorCommand::Restart {
+                requester,
                 drain_timeout_ms,
                 received_at_generation,
                 queued_at: Instant::now(),
@@ -3524,10 +3760,19 @@ impl SupervisedModule {
     /// process then drains in the background of the supervise loop) or has
     /// failed, leaving the old process serving.
     pub async fn swap(&self, ready_timeout: Option<Duration>) -> Result<(), SuperviseError> {
+        self.swap_requested(ready_timeout, None).await
+    }
+
+    pub(crate) async fn swap_requested(
+        &self,
+        ready_timeout: Option<Duration>,
+        requester: Option<Principal>,
+    ) -> Result<(), SuperviseError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .commands
             .send(SupervisorCommand::Swap {
+                requester,
                 ready_timeout,
                 reply: reply_tx,
             })
@@ -3541,10 +3786,20 @@ impl SupervisedModule {
     }
 
     pub async fn reload(&self) -> Result<(), SuperviseError> {
+        self.reload_requested(None).await
+    }
+
+    pub(crate) async fn reload_requested(
+        &self,
+        requester: Option<Principal>,
+    ) -> Result<(), SuperviseError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .commands
-            .send(SupervisorCommand::Reload { reply: reply_tx })
+            .send(SupervisorCommand::Reload {
+                requester,
+                reply: reply_tx,
+            })
             .await
             .map_err(|_| SuperviseError::CommandClosed {
                 module_id: self.inner.module_id.clone(),
@@ -3555,10 +3810,19 @@ impl SupervisedModule {
     }
 
     pub async fn set_enabled(&self, enabled: bool) -> Result<bool, SuperviseError> {
+        self.set_enabled_requested(enabled, None).await
+    }
+
+    pub(crate) async fn set_enabled_requested(
+        &self,
+        enabled: bool,
+        requester: Option<Principal>,
+    ) -> Result<bool, SuperviseError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.inner
             .commands
             .send(SupervisorCommand::SetEnabled {
+                requester,
                 enabled,
                 reply: reply_tx,
             })
@@ -3677,12 +3941,15 @@ impl Drop for SupervisedModuleInner {
 #[derive(Debug)]
 enum SupervisorCommand {
     Drain {
+        requester: Option<Principal>,
         reply: oneshot::Sender<Result<(), SuperviseError>>,
     },
     Retire {
+        requester: Option<Principal>,
         reply: oneshot::Sender<Result<(), SuperviseError>>,
     },
     Restart {
+        requester: Option<Principal>,
         /// Operator override for this one restart's drain budget, in ms. `None`
         /// uses the module's configured/default budget; `Some(0)` cuts
         /// immediately (wedge bounce: a stuck request never settles, so
@@ -3698,9 +3965,11 @@ enum SupervisorCommand {
         reply: oneshot::Sender<Result<(), SuperviseError>>,
     },
     Reload {
+        requester: Option<Principal>,
         reply: oneshot::Sender<Result<(), SuperviseError>>,
     },
     SetEnabled {
+        requester: Option<Principal>,
         enabled: bool,
         reply: oneshot::Sender<Result<bool, SuperviseError>>,
     },
@@ -3713,6 +3982,7 @@ enum SupervisorCommand {
         reply: oneshot::Sender<()>,
     },
     Swap {
+        requester: Option<Principal>,
         /// How long the candidate may take to register and declare itself
         /// ready. `None` uses [`DEFAULT_SWAP_READY_TIMEOUT`].
         ready_timeout: Option<Duration>,
@@ -4051,7 +4321,10 @@ impl HealthProbeRuntime {
             if !self.advertised {
                 self.next_probe_at = None;
                 let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                    state.health = ModuleHealthStatus::default();
+                    let unknown = ModuleHealthStatus::default();
+                    if state.health != unknown {
+                        state.health = unknown;
+                    }
                 });
             } else if self.next_probe_at.is_none() {
                 self.next_probe_at = Some(
@@ -4088,11 +4361,18 @@ impl HealthProbeRuntime {
             self.advertised = false;
             self.next_probe_at = None;
             let _ = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                state.health.status = SupervisorHealthStatus::Unknown;
-                state.health.consecutive_failures = 0;
-                state.health.last_probe_ms = None;
-                state.health.detail = None;
-                state.health.metrics = None;
+                if state.health.status != SupervisorHealthStatus::Unknown
+                    || state.health.consecutive_failures != 0
+                    || state.health.last_probe_ms.is_some()
+                    || state.health.detail.is_some()
+                    || state.health.metrics.is_some()
+                {
+                    state.health.status = SupervisorHealthStatus::Unknown;
+                    state.health.consecutive_failures = 0;
+                    state.health.last_probe_ms = None;
+                    state.health.detail = None;
+                    state.health.metrics = None;
+                }
             });
             return;
         }
@@ -4114,13 +4394,12 @@ impl HealthProbeRuntime {
         }
     }
 
-    fn wake_after(&self) -> Duration {
+    fn wake_after(&self) -> Option<Duration> {
         if !self.advertised {
-            return REGISTRY_RELEASE_POLL;
+            return None;
         }
         self.next_probe_at
             .map(|next| next.saturating_duration_since(Instant::now()))
-            .unwrap_or(REGISTRY_RELEASE_POLL)
     }
 
     fn due(&self) -> bool {
@@ -5138,21 +5417,21 @@ mod tests {
     }
 
     /// A supervised module's process can connect, register, sync its scopes
-    /// and describe them as soon as it is spawned, which is BEFORE the
-    /// supervisor puts the module on the roster. In that window the owner must
+    /// and describe them as soon as it is spawned. A plain `spawn` does not put
+    /// the module on the roster until afterward; configured supervision does
+    /// so before spawning. In both cases the owner must
     /// already read as configured, so a scoped `route.open` against it is
     /// refused as retryable `scope_not_synced` and not as terminal
     /// `scope_not_live` ("will never sync").
     ///
-    /// The hook runs in exactly that window on every path that takes on a new
-    /// module, so no race with a real child is needed: `on_roster: false`
-    /// proves each observation was taken before the roster insert.
+    /// The hook runs just after each initial spawn attempt, before returning to
+    /// the caller, so no race with a real child's registration is needed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_new_module_is_configured_before_its_first_process_can_register() {
         use crate::scopes::ScopeTable;
         use subc_protocol::{error_codes, scope::ScopeSelector, Principal};
 
-        let dir = subc_test_support::TestTempDir::new("configured-before-spawn");
+        let dir = cortexkit_test_support::ScratchDir::new("configured-before-spawn");
         let stub = |module_id: &str, program: PathBuf| ModuleSpec {
             module_id: module_id.to_string(),
             program,
@@ -5181,13 +5460,13 @@ mod tests {
             // Exactly what the control plane computes for a scoped route.open
             // naming this module as the owner of a scope it has not synced.
             let configured = hook_handle.is_configured(module_id);
-            let selector = ScopeSelector {
-                owner: Principal::Reserved {
+            let selector = ScopeSelector::new(
+                Principal::Reserved {
                     module_id: module_id.to_string(),
                 },
-                scope_ref: "s".to_string(),
-                scope_epoch: Some(1),
-            };
+                "s".to_string(),
+                Some(1),
+            );
             let carrier = Principal::Reserved {
                 module_id: "carrier".to_string(),
             };
@@ -5244,7 +5523,7 @@ mod tests {
         .map(|module_id| OwnerInSpawnWindow {
             module_id: module_id.to_string(),
             configured: true,
-            on_roster: false,
+            on_roster: !matches!(module_id, "plain" | "spawn-error"),
             admission_refusal: Some(error_codes::SCOPE_NOT_SYNCED),
         })
         .collect::<Vec<_>>();
@@ -5286,6 +5565,8 @@ mod tests {
             snapshot.spawned_file_identity = Some(SpawnedFileIdentity {
                 device: 43,
                 inode: 44,
+                #[cfg(windows)]
+                windows_image: None,
             });
         })
         .unwrap();
@@ -5465,7 +5746,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn rescan_preserves_running_protocol_until_respawn() {
-        let dir = subc_test_support::TestTempDir::new("rescan-protocol");
+        let dir = cortexkit_test_support::ScratchDir::new("rescan-protocol");
         let initial = ModuleSpec {
             module_id: "rescan-protocol".into(),
             program: PathBuf::from("/bin/sleep"),
@@ -5521,7 +5802,7 @@ mod tests {
     #[tokio::test]
     async fn orphan_identity_matches_path_names_and_shebang_interpreters() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = subc_test_support::TestTempDir::new("spawn-image-identity");
+        let dir = cortexkit_test_support::ScratchDir::new("spawn-image-identity");
         let script = dir.join("module.sh");
         std::fs::write(&script, "#!/bin/sh\nwhile :; do sleep 0.1; done\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -5624,7 +5905,7 @@ mod tests {
     #[tokio::test]
     async fn http_health_status_flips_ok_failing_ok() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let dir = subc_test_support::TestTempDir::new("http-status-flips");
+        let dir = cortexkit_test_support::ScratchDir::new("http-status-flips");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let status = Arc::new(std::sync::atomic::AtomicU16::new(200));
         let serving_status = status.clone();
@@ -5709,7 +5990,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn http_health_no_listener_restarts_after_consecutive_failures() {
-        let dir = subc_test_support::TestTempDir::new("http-refused");
+        let dir = cortexkit_test_support::ScratchDir::new("http-refused");
         let unused = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/healthz", unused.local_addr().unwrap());
         drop(unused);
@@ -5866,7 +6147,7 @@ mod tests {
             );
             return;
         }
-        let dir = subc_test_support::TestTempDir::new("nats-http-monitoring");
+        let dir = cortexkit_test_support::ScratchDir::new("nats-http-monitoring");
         let monitor = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = monitor.local_addr().unwrap().port();
         let client = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -5947,6 +6228,18 @@ async fn supervise_loop(
     mut commands: mpsc::Receiver<SupervisorCommand>,
 ) {
     let mut health_probe = HealthProbeRuntime::default();
+    // Registry writes (including embedded callers) notify this module only.
+    // Subscribe before the first refresh; watch retains changes that arrive
+    // while commands or probes are running. No polling fallback is needed.
+    let mut registration_changes = match registry.subscribe_module_changes(&spec.module_id) {
+        Ok(changes) => Some(changes),
+        Err(err) => {
+            // A poisoned registry cannot accept further writes, so it cannot
+            // recover via a timer. Keep exit and command handling alive.
+            warn!(module_id = %spec.module_id, error = %err, "health prober could not subscribe to registry");
+            None
+        }
+    };
     // All restart backoffs run here, including health and operator requests.
     // While one is pending the loop serves commands, so disable or drain can
     // cancel the replacement without spawning a process just to stop it.
@@ -5954,7 +6247,18 @@ async fn supervise_loop(
     // Commands a swap handed back to run next (see `swap::SwapEnd`). Served
     // before anything else so a stop that interrupted a swap runs at once.
     let mut requeued: VecDeque<SupervisorCommand> = VecDeque::new();
+    #[cfg(target_os = "linux")]
+    let mut previous_instance_recheck = tokio::time::interval_at(
+        Instant::now() + Duration::from_secs(5),
+        Duration::from_secs(5),
+    );
+    #[cfg(target_os = "linux")]
+    previous_instance_recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        #[cfg(test)]
+        {
+            lock_snapshot(&snapshot).unwrap().actor_select = None;
+        }
         #[cfg(target_os = "macos")]
         if let Some(active) = child.as_mut() {
             active.confirm_privacy_exec().await;
@@ -5975,7 +6279,10 @@ async fn supervise_loop(
                 "respawn cancelled by a supervisor command",
             );
         }
-        if child.is_none() && pending_respawn.is_none() {
+        if child.is_none()
+            && pending_respawn.is_none()
+            && lock_snapshot(&snapshot).is_ok_and(|state| state.waiting_for_previous_pid.is_none())
+        {
             cancel_deferred_reload(
                 &runtime,
                 &spec.module_id,
@@ -6023,12 +6330,44 @@ async fn supervise_loop(
             continue;
         }
         if child.is_some() {
+            #[cfg(test)]
+            {
+                lock_snapshot(&snapshot).unwrap().actor_turns += 1;
+            }
             health_probe.refresh_registration(&spec, &runtime, &registry, &snapshot);
-            let probe_sleep = sleep(health_probe.wake_after());
+            let wake_after = health_probe.wake_after();
+            let probe_sleep = async move {
+                match wake_after {
+                    Some(delay) => sleep(delay).await,
+                    None => std::future::pending().await,
+                }
+            };
             tokio::pin!(probe_sleep);
+            // A `protocol: "none"` child (a plain process that never registers
+            // over the subc wire, such as nats-server) with no HTTP health
+            // check has nothing to probe, so it waits only for its exit or a
+            // supervisor command. A rescan that adds an HTTP check is a command.
+            let wire_child = running_protocol(&spec, &snapshot) == ModuleProtocol::Subc;
+            #[cfg(test)]
+            {
+                let registration_pending = wire_child
+                    && registration_changes
+                        .as_ref()
+                        .is_some_and(|changes| changes.has_changed().unwrap());
+                let mut state = lock_snapshot(&snapshot).unwrap();
+                state.actor_select = (!registration_pending).then_some(ActorSelectCheckpoint {
+                    generation: state.spawn_generation,
+                    turn: state.actor_turns,
+                    registered_connection: health_probe.registered_connection,
+                    next_probe_at: health_probe.next_probe_at,
+                    wake_after,
+                });
+            }
             let active_child = child.as_mut().expect("child checked above");
             tokio::select! {
                 wait_result = active_child.wait() => {
+                    #[cfg(test)]
+                    { lock_snapshot(&snapshot).unwrap().actor_select = None; }
                     // Every arm below that gives up on the CHILD must keep the
                     // supervision task itself alive (child = None, loop
                     // continues into command-serving mode). Returning here
@@ -6041,16 +6380,12 @@ async fn supervise_loop(
                         Ok(status) => classify_reaped_child_exit(&snapshot, active_child, &status),
                         Err(err) => {
                             active_child.drain_stderr(&spec.module_id).await;
-                            fail_snapshot(&snapshot, Some(&spec.module_id), None);
-                            // Every other exit path (on_child_exit's Clean/Crash arms,
-                            // the reload-registration-failure path) records a terminal
-                            // before moving on. Without one here, a module whose wait()
-                            // itself errored (e.g. already reaped) leaves no terminal
-                            // record at all -- an empty ring reads as "nothing died".
-                            record_wait_error_terminal(
+                            fail_after_wait_error(
                                 &spec.module_id,
+                                &snapshot,
                                 &runtime.terminal_ring,
                                 &runtime.spawn_events,
+                                format!("failed to wait for supervised module: {err}"),
                             );
                             untrack_if_registration_released(
                                 &process_liveness,
@@ -6075,6 +6410,8 @@ async fn supervise_loop(
                         &runtime.child_roster,
                         exit_report,
                     ).await;
+                    runtime.start_requester = None;
+                    runtime.pending_activity_restart = false;
                     // The exit is recorded, so a daemon shutdown may stop
                     // waiting for this child (see `SupervisedChild::wait`).
                     active_child.release_roster();
@@ -6107,6 +6444,8 @@ async fn supervise_loop(
                     }
                 }
                 command = commands.recv() => {
+                    #[cfg(test)]
+                    { lock_snapshot(&snapshot).unwrap().actor_select = None; }
                     let Some(command) = command else {
                         return;
                     };
@@ -6124,7 +6463,18 @@ async fn supervise_loop(
                         return;
                     }
                 }
+                _ = async {
+                    match registration_changes.as_mut() {
+                        Some(changes) => { let _ = changes.changed().await; }
+                        None => std::future::pending().await,
+                    }
+                }, if wire_child => {
+                    #[cfg(test)]
+                    { lock_snapshot(&snapshot).unwrap().actor_select = None; }
+                }
                 _ = &mut probe_sleep => {
+                    #[cfg(test)]
+                    { lock_snapshot(&snapshot).unwrap().actor_select = None; }
                     if health_probe.due() {
                         run_health_probe_cycle(
                             &spec,
@@ -6134,6 +6484,10 @@ async fn supervise_loop(
                             &snapshot,
                             &mut child,
                         ).await;
+                        if child.is_none() {
+                            runtime.start_requester = None;
+                            runtime.pending_activity_restart = false;
+                        }
                         if child.is_some() {
                             health_probe.schedule_next(&spec, runtime.health.cadence);
                         }
@@ -6176,6 +6530,10 @@ async fn supervise_loop(
                     if matches!(pending.kind, RespawnKind::Reload) {
                         let reply = runtime.deferred_reload_reply.lock().unwrap_or_else(|p| p.into_inner()).take();
                         let result = finish_reload_child(&spec, &runtime, &registry, &process_liveness, &snapshot, &mut child).await;
+                        if result.is_ok() && runtime.pending_activity_restart {
+                            runtime.record_activity_transition("subc.module_restarted", &spec.module_id, runtime.start_requester.clone());
+                        }
+                        runtime.pending_activity_restart = false;
                         if let Some(reply) = reply { let _ = reply.send(result); }
                         continue;
                     }
@@ -6183,6 +6541,10 @@ async fn supervise_loop(
                     match spawn_and_mark_running(&spec, &runtime, &snapshot) {
                         Ok(next_child) => {
                             child = Some(next_child);
+                            if runtime.pending_activity_restart {
+                                runtime.record_activity_transition("subc.module_restarted", &spec.module_id, runtime.start_requester.clone());
+                                runtime.pending_activity_restart = false;
+                            }
                             debug!(module_id = %spec.module_id, "supervised module restarted after crash");
                         }
                         Err(err) => {
@@ -6220,7 +6582,39 @@ async fn supervise_loop(
                 }
             }
         } else {
-            let Some(command) = commands.recv().await else {
+            #[cfg(target_os = "linux")]
+            let command = if lock_snapshot(&snapshot)
+                .is_ok_and(|state| state.waiting_for_previous_pid.is_some())
+            {
+                tokio::select! {
+                    command = commands.recv() => command,
+                    _ = previous_instance_recheck.tick() => {
+                        if runtime.child_roster.previous_instance_pid(&spec.module_id).is_none() {
+                            let enabled = lock_snapshot(&snapshot).is_ok_and(|state| state.enabled);
+                            if enabled && !runtime.child_roster.is_closed() {
+                                process_liveness.track(spec.module_id.clone(), Arc::clone(&snapshot));
+                                match spawn_and_mark_running(&spec, &runtime, &snapshot) {
+                                    Ok(next_child) => child = Some(next_child),
+                                    Err(error) => {
+                                        fail_snapshot(&snapshot, Some(&spec.module_id), None);
+                                        error!(module_id = %spec.module_id, %error, "failed to start module after its previous instance exited");
+                                    }
+                                }
+                            } else {
+                                let _ = update_snapshot(&snapshot, Some(&spec.module_id), |state| {
+                                    state.waiting_for_previous_pid = None;
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                }
+            } else {
+                commands.recv().await
+            };
+            #[cfg(not(target_os = "linux"))]
+            let command = commands.recv().await;
+            let Some(command) = command else {
                 return;
             };
             if !handle_supervisor_command(
@@ -6284,8 +6678,30 @@ async fn handle_supervisor_command(
     commands: &mut mpsc::Receiver<SupervisorCommand>,
     requeued: &mut VecDeque<SupervisorCommand>,
 ) -> bool {
+    #[cfg(target_os = "linux")]
+    let command = if let Some(pid) = runtime.child_roster.previous_instance_pid(&spec.module_id) {
+        match command {
+            SupervisorCommand::Restart { reply, .. }
+            | SupervisorCommand::Reload { reply, .. }
+            | SupervisorCommand::Swap { reply, .. } => {
+                let _ = reply.send(Err(previous_instance_error(spec, pid)));
+                return true;
+            }
+            SupervisorCommand::SetEnabled {
+                enabled: true,
+                reply,
+                ..
+            } => {
+                let _ = reply.send(Err(previous_instance_error(spec, pid)));
+                return true;
+            }
+            other => other,
+        }
+    } else {
+        command
+    };
     match command {
-        SupervisorCommand::Drain { reply } => {
+        SupervisorCommand::Drain { requester, reply } => {
             // A plain stop runs no forwarding drain, so nothing reaches the
             // module over its connection before the wait: ask by signal.
             let result = drain_optional_child(
@@ -6304,13 +6720,20 @@ async fn handle_supervisor_command(
             )
             .await;
             let registration_released = result.is_ok();
+            if registration_released {
+                runtime.record_activity_transition(
+                    "subc.module_stopped",
+                    &spec.module_id,
+                    requester,
+                );
+            }
             let _ = reply.send(result);
             if registration_released {
                 process_liveness.untrack_if_current(&spec.module_id, snapshot);
             }
             false
         }
-        SupervisorCommand::Retire { reply } => {
+        SupervisorCommand::Retire { requester, reply } => {
             let result = async {
                 let stop_notice = begin_forwarding_drain_if_configured(
                     spec,
@@ -6339,6 +6762,13 @@ async fn handle_supervisor_command(
             }
             .await;
             let registration_released = result.is_ok();
+            if registration_released {
+                runtime.record_activity_transition(
+                    "subc.module_stopped",
+                    &spec.module_id,
+                    requester,
+                );
+            }
             let _ = reply.send(result);
             if registration_released {
                 process_liveness.untrack_if_current(&spec.module_id, snapshot);
@@ -6346,6 +6776,7 @@ async fn handle_supervisor_command(
             false
         }
         SupervisorCommand::Restart {
+            requester,
             drain_timeout_ms,
             received_at_generation,
             queued_at,
@@ -6441,13 +6872,20 @@ async fn handle_supervisor_command(
                         state.state = ModuleState::Failed;
                         clear_current_process_facts(state);
                     });
+                } else {
+                    runtime.start_requester = requester;
+                    runtime.pending_activity_restart = true;
                 }
             }
             true
         }
-        SupervisorCommand::Reload { reply } => {
+        SupervisorCommand::Reload { requester, reply } => {
             let result =
                 reload_child(spec, runtime, registry, process_liveness, snapshot, child).await;
+            if result.is_ok() {
+                runtime.start_requester = requester;
+                runtime.pending_activity_restart = true;
+            }
             if result.is_ok()
                 && runtime
                     .scheduled_respawn
@@ -6465,7 +6903,15 @@ async fn handle_supervisor_command(
             }
             true
         }
-        SupervisorCommand::SetEnabled { enabled, reply } => {
+        SupervisorCommand::SetEnabled {
+            enabled,
+            requester,
+            reply,
+        } => {
+            let previous_requester = runtime.start_requester.clone();
+            if enabled {
+                runtime.start_requester = requester.clone();
+            }
             let result = set_child_enabled(
                 spec,
                 runtime,
@@ -6476,6 +6922,21 @@ async fn handle_supervisor_command(
                 enabled,
             )
             .await;
+            if matches!(result, Ok(true)) {
+                runtime.pending_activity_restart = false;
+                if enabled {
+                    runtime.start_requester = requester;
+                } else {
+                    runtime.start_requester = None;
+                    runtime.record_activity_transition(
+                        "subc.module_disabled",
+                        &spec.module_id,
+                        requester,
+                    );
+                }
+            } else {
+                runtime.start_requester = previous_requester;
+            }
             let _ = reply.send(result);
             true
         }
@@ -6512,12 +6973,18 @@ async fn handle_supervisor_command(
             true
         }
         SupervisorCommand::Swap {
+            requester,
             ready_timeout,
             reply,
         } => {
+            let mut swap_runtime = runtime.clone();
+            swap_runtime.start_requester = requester;
+            let before = lock_snapshot(snapshot)
+                .ok()
+                .map(|state| state.spawn_generation);
             let end = swap::run_swap(
                 spec,
-                runtime,
+                &swap_runtime,
                 registry,
                 process_liveness,
                 snapshot,
@@ -6527,6 +6994,13 @@ async fn handle_supervisor_command(
                 reply,
             )
             .await;
+            if before
+                != lock_snapshot(snapshot)
+                    .ok()
+                    .map(|state| state.spawn_generation)
+            {
+                runtime.start_requester = swap_runtime.start_requester;
+            }
             requeued.extend(end.requeue);
             true
         }
@@ -6827,6 +7301,8 @@ async fn set_child_enabled(
                 state.spawned_file_identity = Some(SpawnedFileIdentity {
                     device: 43,
                     inode: 44,
+                    #[cfg(windows)]
+                    windows_image: None,
                 });
             })?;
         }
@@ -6936,20 +7412,27 @@ async fn on_child_exit(
                 exit_signal = ?exit_report.signal,
                 "supervised module exited cleanly"
             );
-            if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                state.state = ModuleState::Stopped;
-                clear_current_process_facts(state);
-                state.last_exit = Some(exit_report.clone());
-            }) {
-                error!(module_id = %spec.module_id, error = %err, "failed to record clean module exit");
-            }
-            record_terminal(
+            if let Err(err) = publish_after_terminal_record(
                 &spec.module_id,
-                terminal_ring,
-                spawn_events,
-                &exit_report,
-                TerminalDisposition::Stopped,
-            );
+                || {
+                    record_terminal(
+                        &spec.module_id,
+                        terminal_ring,
+                        spawn_events,
+                        &exit_report,
+                        TerminalDisposition::Stopped,
+                    )
+                },
+                || {
+                    update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                        state.state = ModuleState::Stopped;
+                        clear_current_process_facts(state);
+                        state.last_exit = Some(exit_report.clone());
+                    })
+                },
+            ) {
+                error!(module_id = %spec.module_id, error = %err, "failed to publish clean module exit");
+            }
             let registration_released = match wait_for_registration_release(
                 registry,
                 &spec.module_id,
@@ -6985,6 +7468,7 @@ async fn on_child_exit(
             }
             let mut restart_schedule = None;
             let mut disposition = TerminalDisposition::Disabled;
+            let mut final_state = ModuleState::Disabled;
             // Set only when the budget is what stopped the module, so the
             // terminal record says which limit was hit rather than leaving
             // `failed` to be read as "crashed once, badly".
@@ -6993,14 +7477,19 @@ async fn on_child_exit(
                 .and_then(|mut state| state.spawn_failure.take());
             let now = Instant::now();
             if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                clear_current_process_facts(state);
-                state.last_exit = Some(exit_report.clone());
                 if state.enabled {
                     if let Some(schedule) = state.next_crash_restart(&policy, now) {
-                        state.state = ModuleState::Restarting;
+                        // Reserving the last slot exhausts the budget for the
+                        // replacement, not for this exit. Publish its scheduled
+                        // recovery atomically with the reservation so connection
+                        // cleanup sees it while terminal recording still holds
+                        // the visible state at Running.
+                        state.respawn_pending = true;
+                        final_state = ModuleState::Restarting;
                         restart_schedule = Some(schedule);
                         disposition = TerminalDisposition::Restarting;
                     } else {
+                        final_state = ModuleState::Failed;
                         disposition = TerminalDisposition::Failed;
                         let budget = policy.budget_exhausted_detail();
                         disposition_detail =
@@ -7010,7 +7499,6 @@ async fn on_child_exit(
                             ));
                     }
                 } else {
-                    state.state = ModuleState::Disabled;
                     disposition = TerminalDisposition::Disabled;
                 }
             }) {
@@ -7032,40 +7520,27 @@ async fn on_child_exit(
                     policy.budget_exhausted_detail()
                 );
             }
-            let budget_exhausted = disposition == TerminalDisposition::Failed;
-            let record_exit = || {
-                record_terminal_with_detail(
-                    &spec.module_id,
-                    terminal_ring,
-                    spawn_events,
-                    &exit_report,
-                    disposition,
-                    disposition_detail,
-                );
-            };
-            if budget_exhausted {
-                // Publish Failed only after its terminal record is available.
-                // Recording takes the event-feed lock, then ring -> journal
-                // writer (with file I/O), all without the hot snapshot lock.
-                // No lock is held when the final snapshot update runs, nor
-                // across the registration-release await below. Commands and
-                // health actions run on this same supervisor task, so none can
-                // act on the old state during the write; process facts already
-                // say the child is dead to concurrent liveness readers.
-                // A journal error is retained in history, not returned. If
-                // recording panics, still publish Failed before resuming the
-                // original unwind rather than leaving a dead child Running.
-                let recorded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(record_exit));
-                if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                    state.state = ModuleState::Failed;
-                }) {
-                    error!(module_id = %spec.module_id, error = %err, "failed to publish exhausted restart budget");
-                }
-                if let Err(panic) = recorded {
-                    std::panic::resume_unwind(panic);
-                }
-            } else {
-                record_exit();
+            if let Err(err) = publish_after_terminal_record(
+                &spec.module_id,
+                || {
+                    record_terminal_with_detail(
+                        &spec.module_id,
+                        terminal_ring,
+                        spawn_events,
+                        &exit_report,
+                        disposition,
+                        disposition_detail,
+                    )
+                },
+                || {
+                    update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                        state.state = final_state;
+                        clear_current_process_facts(state);
+                        state.last_exit = Some(exit_report.clone());
+                    })
+                },
+            ) {
+                error!(module_id = %spec.module_id, error = %err, "failed to publish crashed module exit");
             }
 
             if let Some(schedule) = restart_schedule {
@@ -7098,32 +7573,45 @@ async fn on_child_exit(
                 exit_signal = ?exit_report.signal,
                 "supervised module exited after deliberate connection severance"
             );
-            let mut should_restart = false;
-            let mut disposition = TerminalDisposition::Disabled;
-            if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-                clear_current_process_facts(state);
-                state.last_exit = Some(exit_report.clone());
-                state.lifetime_restarts += 1;
-                if state.enabled {
-                    state.state = ModuleState::Restarting;
-                    should_restart = true;
-                    disposition = TerminalDisposition::Restarting;
-                } else {
-                    state.state = ModuleState::Disabled;
+            let should_restart = match lock_snapshot(snapshot) {
+                Ok(state) => state.enabled,
+                Err(err) => {
+                    error!(module_id = %spec.module_id, error = %err, "failed to read deliberately severed module state");
+                    return NextAction::Stop {
+                        registration_released: false,
+                    };
                 }
-            }) {
-                error!(module_id = %spec.module_id, error = %err, "failed to record deliberately severed module exit");
+            };
+            let final_state = if should_restart {
+                ModuleState::Restarting
+            } else {
+                ModuleState::Disabled
+            };
+            if let Err(err) = publish_after_terminal_record(
+                &spec.module_id,
+                || {
+                    record_terminal(
+                        &spec.module_id,
+                        terminal_ring,
+                        spawn_events,
+                        &exit_report,
+                        terminal_disposition(final_state),
+                    )
+                },
+                || {
+                    update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                        state.state = final_state;
+                        clear_current_process_facts(state);
+                        state.last_exit = Some(exit_report.clone());
+                        state.lifetime_restarts += 1;
+                    })
+                },
+            ) {
+                error!(module_id = %spec.module_id, error = %err, "failed to publish deliberately severed module exit");
                 return NextAction::Stop {
                     registration_released: false,
                 };
             }
-            record_terminal(
-                &spec.module_id,
-                terminal_ring,
-                spawn_events,
-                &exit_report,
-                disposition,
-            );
 
             if should_restart {
                 NextAction::Restart { schedule: None }
@@ -7164,20 +7652,27 @@ async fn on_child_exit_during_daemon_shutdown(
         exit_kind = ?exit_report.kind,
         "supervised module exited during daemon shutdown; not restarting it"
     );
-    if let Err(err) = update_snapshot(snapshot, Some(&spec.module_id), |state| {
-        state.state = ModuleState::Stopped;
-        clear_current_process_facts(state);
-        state.last_exit = Some(exit_report.clone());
-    }) {
-        error!(module_id = %spec.module_id, error = %err, "failed to record module exit during daemon shutdown");
-    }
-    record_terminal(
+    if let Err(err) = publish_after_terminal_record(
         &spec.module_id,
-        terminal_ring,
-        spawn_events,
-        &exit_report,
-        TerminalDisposition::DaemonShutdown,
-    );
+        || {
+            record_terminal(
+                &spec.module_id,
+                terminal_ring,
+                spawn_events,
+                &exit_report,
+                TerminalDisposition::DaemonShutdown,
+            )
+        },
+        || {
+            update_snapshot(snapshot, Some(&spec.module_id), |state| {
+                state.state = ModuleState::Stopped;
+                clear_current_process_facts(state);
+                state.last_exit = Some(exit_report.clone());
+            })
+        },
+    ) {
+        error!(module_id = %spec.module_id, error = %err, "failed to publish module exit during daemon shutdown");
+    }
     let registration_released =
         wait_for_registration_release(registry, &spec.module_id, REGISTRY_RELEASE_TIMEOUT)
             .await
@@ -7187,6 +7682,52 @@ async fn on_child_exit_during_daemon_shutdown(
     }
 }
 
+// Keep the status lock out of terminal I/O. Readers may observe the previous
+// state while recording is in progress, but never a completed exit without its
+// history. Journal errors are logged by the journal and retained in the ring;
+// a recording panic still publishes the final state before resuming the unwind.
+fn publish_after_terminal_record<T>(
+    module_id: &str,
+    record: impl FnOnce(),
+    publish: impl FnOnce() -> T,
+) -> T {
+    let recorded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(record));
+    let published = publish();
+    if let Err(panic) = recorded {
+        error!(
+            module_id,
+            "terminal recording panicked; published final state before resuming unwind"
+        );
+        std::panic::resume_unwind(panic);
+    }
+    published
+}
+
+fn fail_after_wait_error(
+    module_id: &str,
+    snapshot: &SharedSnapshot,
+    terminal_ring: &Arc<Mutex<TerminalRing>>,
+    spawn_events: &SpawnEventFeed,
+    detail: String,
+) {
+    let report = wait_error_exit_report();
+    publish_after_terminal_record(
+        module_id,
+        || {
+            record_terminal_with_detail(
+                module_id,
+                terminal_ring,
+                spawn_events,
+                &report,
+                TerminalDisposition::Failed,
+                Some(detail),
+            )
+        },
+        || fail_snapshot(snapshot, Some(module_id), Some(report.clone())),
+    );
+}
+
+#[cfg(test)]
 fn record_wait_error_terminal(
     module_id: &str,
     terminal_ring: &Arc<Mutex<TerminalRing>>,
@@ -7240,6 +7781,8 @@ fn record_terminal_with_detail(
     disposition: TerminalDisposition,
     disposition_detail: Option<String>,
 ) {
+    #[cfg(test)]
+    terminal_history_tests::before_terminal_record(spawn_events);
     spawn_events.emit_exited(module_id, exit_report.code, exit_report.signal);
     let record = TerminalRecord {
         exit_code: exit_report.code,
@@ -7301,14 +7844,18 @@ fn apply_wire_spawn_args(
 
 /// The read end of a spawn's launch-nonce pipe, prepared by
 /// [`apply_wire_spawn_args_for_role`] and installed as the child's descriptor 3
-/// by the last pre-exec step, just before `spawn()`. Windows has no descriptor
-/// handoff and keeps only the environment copy.
+/// by the last pre-exec step, just before `spawn()`. Windows prepares a named
+/// server before spawn and authenticates its client after the child exists.
 #[cfg(unix)]
 type NonceHandoff = subc_os::LaunchNonceHandoff;
-#[cfg(not(unix))]
+#[cfg(windows)]
+type NonceHandoff = subc_os::LaunchNoncePipeHandoff;
+#[cfg(not(any(unix, windows)))]
 type NonceHandoff = std::convert::Infallible;
 
-/// Prepare wire identity for a plain spawn or a swap candidate.
+/// Create the launch nonce that a new module process must present when it
+/// registers or opens a consumer connection, including a replacement process
+/// started alongside a still-serving module.
 ///
 /// A plain spawn replaces the module's recorded nonce. A swap candidate records
 /// a separate candidate token so the still-serving incumbent and its consumers
@@ -7321,9 +7868,11 @@ type NonceHandoff = std::convert::Infallible;
 /// process of the same user cannot read it with `ps eww`. That handoff is
 /// returned rather than installed here, because installing it replaces
 /// whatever the child has at descriptor 3 and so must be the last pre-exec
-/// step, after the Linux cgroup placement that the caller registers later.
-/// Windows retains the environment handoff until restricted handle inheritance
-/// can be implemented outside std's process primitives.
+/// step. Later in `spawn_child_in_slot`, `apply_cgroup_placement` first registers
+/// the Linux callback that writes the process into its cgroup. Only after that
+/// does `handoff.install_last` register the descriptor-3 replacement, so it
+/// cannot close a descriptor the cgroup callback still needs.
+/// Windows keeps SUBC_LAUNCH_NONCE as well until every module reads the named pipe.
 fn apply_wire_spawn_args_for_role(
     command: &mut Command,
     spec: &ModuleSpec,
@@ -7337,6 +7886,11 @@ fn apply_wire_spawn_args_for_role(
     // and passing it on would point the child at a descriptor it does not
     // have.
     command.env_remove(subc_os::LAUNCH_NONCE_FD_ENV);
+    #[cfg(windows)]
+    {
+        command.env_remove(subc_os::LAUNCH_NONCE_PIPE_ENV);
+        command.env_remove(subc_os::LAUNCH_NONCE_PIPE_FALLBACK_ENV);
+    }
     // Remove inherited or configured copies too: withholding must mean absent.
     command.env_remove(SUBC_LAUNCH_NONCE_ENV);
     if spec.protocol == ModuleProtocol::None {
@@ -7372,10 +7926,13 @@ fn apply_wire_spawn_args_for_role(
         command.env(subc_os::LAUNCH_NONCE_FD_ENV, handoff.fd_env_value());
         Some(handoff)
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let handoff = prepare_windows_nonce_pipe(command, spec, &nonce);
+    #[cfg(not(any(unix, windows)))]
     let handoff = None;
-    // Windows keeps the environment copy: std cannot restrict an inherited pipe
-    // handle to this child without leaking it to concurrently spawned processes.
+    // Older modules still read SUBC_LAUNCH_NONCE to register. Keep that copy
+    // until the daemon's per-spawn delivery records show that every running
+    // Windows module has read its secret from the named pipe.
     #[cfg(not(unix))]
     command.env(SUBC_LAUNCH_NONCE_ENV, nonce);
     Ok(handoff)
@@ -7405,6 +7962,67 @@ fn apply_child_env(command: &mut Command, spec: &ModuleSpec) {
     }
 }
 
+#[cfg(windows)]
+fn prepare_windows_nonce_pipe(
+    command: &mut Command,
+    spec: &ModuleSpec,
+    nonce: &str,
+) -> Option<NonceHandoff> {
+    match subc_os::LaunchNoncePipeHandoff::new(nonce) {
+        Ok(handoff) => {
+            command.env(subc_os::LAUNCH_NONCE_PIPE_ENV, handoff.name());
+            // Let a failed pipe read use SUBC_LAUNCH_NONCE so the process can
+            // still register until every module reads the pipe. A reader without
+            // this variable set to env returns the pipe error instead of using
+            // an inherited or configured environment copy.
+            command.env(subc_os::LAUNCH_NONCE_PIPE_FALLBACK_ENV, "env");
+            Some(handoff)
+        }
+        Err(error) => {
+            warn!(module_id = %spec.module_id, %error, "could not prepare launch nonce pipe; retaining the environment handoff");
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+fn start_windows_nonce_pipe(
+    handoff: Option<NonceHandoff>,
+    pid: u32,
+    spec: &ModuleSpec,
+) -> Option<subc_os::LaunchNoncePipeDelivery> {
+    // Close an unread pipe after REGISTRY_RELEASE_TIMEOUT (one second), the
+    // same maximum wait used for registration during a reload. Older modules
+    // may register using SUBC_LAUNCH_NONCE without ever connecting to the pipe.
+    handoff.and_then(|handoff| match handoff.serve(pid, REGISTRY_RELEASE_TIMEOUT) {
+        Ok(delivery) => Some(delivery),
+        Err(error) => {
+            warn!(module_id = %spec.module_id, %error, "could not serve launch nonce pipe; retaining the environment handoff");
+            None
+        }
+    })
+}
+
+fn observed_launch_nonce_source(snapshot: &SupervisorSnapshot) -> Option<String> {
+    #[cfg(windows)]
+    if snapshot.process_alive && snapshot.spawned_protocol == Some(ModuleProtocol::Subc) {
+        return Some(
+            if snapshot
+                .pipe_consumed
+                .as_ref()
+                .is_some_and(|consumed| consumed.get().is_some())
+            {
+                "pipe"
+            } else {
+                "env"
+            }
+            .to_owned(),
+        );
+    }
+    let _ = snapshot;
+    None
+}
+
 /// Which slot a spawn fills: the module's ordinary one, or the candidate slot
 /// of a blue/green swap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7418,6 +8036,17 @@ enum SpawnRole {
 fn apply_spawn_role(command: &mut Command, role: SpawnRole) {
     if role == SpawnRole::SwapCandidate {
         command.env(SUBC_SPAWN_ROLE_ENV, SPAWN_ROLE_SWAP_CANDIDATE);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn previous_instance_error(spec: &ModuleSpec, pid: u32) -> SuperviseError {
+    SuperviseError::Spawn {
+        program: spec.program.clone(),
+        source: io::Error::new(io::ErrorKind::WouldBlock, format!(
+            "waiting: previous instance (pid {pid}) is still running but hidden; it cannot be identified"
+        )),
+        cgroup_path: None,
     }
 }
 
@@ -7468,6 +8097,10 @@ fn spawn_child_in_slot(
     role: SpawnRole,
     alternate_slot: bool,
 ) -> Result<SupervisedChild, SuperviseError> {
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = roster.previous_instance_pid(&spec.module_id) {
+        return Err(previous_instance_error(spec, pid));
+    }
     if roster.is_closed() {
         return Err(SuperviseError::Spawn {
             program: spec.program.clone(),
@@ -7502,7 +8135,15 @@ fn spawn_child_in_slot(
     let _ = alternate_slot;
     #[cfg(target_os = "macos")]
     let (mut command, privacy_exec, exec_ack) = privacy_command(spec, roster)?;
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    let image_capture = windows_spawn_capture(spec).map_err(|source| SuperviseError::Spawn {
+        program: spec.program.clone(),
+        source,
+        cgroup_path: None,
+    })?;
+    #[cfg(windows)]
+    let mut command = Command::new(image_capture.path());
+    #[cfg(not(any(target_os = "macos", windows)))]
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
     // AMBIENT `CK_LOG` MUST NOT LEAK INTO AN OTHERWISE UNCONFIGURED MODULE — but
@@ -7606,7 +8247,7 @@ fn spawn_child_in_slot(
     if let Some(handoff) = nonce_handoff {
         handoff.install_last(command.as_std_mut());
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let _ = nonce_handoff;
 
     // Containment, step 1 of 3 (issue #109): create the child suspended so it
@@ -7636,18 +8277,48 @@ fn spawn_child_in_slot(
     #[cfg(target_os = "macos")]
     drop(exec_ack);
 
+    // Bind while the child is still suspended, before job assignment resumes it.
+    // Keeping the executable handle open across CreateProcessW denies rename
+    // and deletion, so the file cannot be exchanged during spawn. Bind that
+    // file ID to the process handle returned by spawn, never a reopened PID.
+    #[cfg(windows)]
+    let windows_image =
+        Arc::new(
+            image_capture
+                .bind_tokio(&child)
+                .map_err(|source| SuperviseError::Spawn {
+                    program: spec.program.clone(),
+                    source,
+                    cgroup_path: None,
+                })?,
+        );
     // Containment, steps 2 and 3: assign while suspended, then resume.
     #[cfg(windows)]
     let job = contain_spawned_child(&child, spec)?;
     let spawned_at_ms = unix_ms_now();
+    #[cfg(not(windows))]
     let spawned_from = spec.program.clone();
+    #[cfg(windows)]
+    let spawned_from = windows_image.path().to_path_buf();
+    #[cfg(not(windows))]
     let spawned_file_identity = spawned_file_identity(&spawned_from);
+    #[cfg(windows)]
+    let spawned_file_identity = Some(SpawnedFileIdentity {
+        device: 0,
+        inode: 0,
+        windows_image: Some(Arc::clone(&windows_image)),
+    });
     let pid = child.id().ok_or_else(|| SuperviseError::Spawn {
         program: spec.program.clone(),
         source: io::Error::other("spawned child exposed no live pid"),
         cgroup_path: cgroup_path.clone(),
     })?;
+    #[cfg(windows)]
+    let nonce_delivery = start_windows_nonce_pipe(nonce_handoff, pid, spec);
+    #[cfg(not(windows))]
     let process_start_time = crate::provenance::process_start_time(pid);
+    #[cfg(windows)]
+    let process_start_time = Some(windows_image.start_time());
     let process_identity = process_start_time.map(|start_time| ProcessIdentity { pid, start_time });
     #[cfg(all(test, target_os = "macos"))]
     privacy_exec_boundary_tests::before_image_sample(spec, pid);
@@ -7656,6 +8327,7 @@ fn spawn_child_in_slot(
     // lookup and shebang interpretation may select a different file from the
     // configured program. Keep the literal program's identity for provenance,
     // but never use it as proof that a recorded pid may be signalled.
+    #[cfg(not(windows))]
     let recorded_image = observe_spawned_image(pid);
     // spawn() confirms only the first exec, into the trampoline. Never persist
     // the trampoline image; the asynchronous acknowledgement publishes the
@@ -7676,10 +8348,18 @@ fn spawn_child_in_slot(
         spec.protocol,
         process_start_time,
         crate::child_roster::RecordedIdentity {
+            #[cfg(not(windows))]
             start_time: recorded_image.map(|image| image.start_time),
+            #[cfg(windows)]
+            start_time: process_start_time,
+            #[cfg(not(windows))]
             executable: recorded_image
                 .and_then(|image| image.executable)
                 .map(crate::live_children::ExecutableIdentity::from),
+            #[cfg(windows)]
+            executable: Some(crate::live_children::ExecutableIdentity::from(
+                windows_image.identity(),
+            )),
             cgroup_name: recorded_cgroup_name,
             #[cfg(target_os = "linux")]
             cgroup_placement: cgroup_placement.cloned(),
@@ -7776,6 +8456,8 @@ fn spawn_child_in_slot(
 
     Ok(SupervisedChild {
         child,
+        #[cfg(windows)]
+        nonce_delivery,
         protocol: spec.protocol,
         #[cfg(target_os = "linux")]
         module_id: cgroup_name,
@@ -8000,6 +8682,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// The kernel's image after an acknowledged exec, shared by ordinary launches
 /// and privacy trampolines. PATH and shebang interpretation are kernel facts,
 /// not identities inferred from a configured pathname.
+#[cfg(not(windows))]
 fn observe_spawned_image(pid: u32) -> Option<subc_os::Observation> {
     subc_os::Process::open(pid)
         .ok()
@@ -8007,11 +8690,68 @@ fn observe_spawned_image(pid: u32) -> Option<subc_os::Observation> {
         .and_then(|process| process.observe())
 }
 
+/// Resolve once and spawn that exact path, so PATH lookup cannot choose a
+/// different executable after the no-delete capture was taken.
+#[cfg(windows)]
+fn windows_spawn_capture(spec: &ModuleSpec) -> io::Result<subc_os::ExecutableCapture> {
+    let mut program = spec.program.clone();
+    if program.is_absolute() || program.components().count() > 1 {
+        // An explicit path can name a PE image with no extension. Try that
+        // exact file first, as Command does, before falling back to .exe.
+        match subc_os::ExecutableCapture::open(&program) {
+            Ok(capture) => return Ok(capture),
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && program.extension().is_none() => {}
+            Err(error) => return Err(error),
+        }
+        program.set_extension("exe");
+        return subc_os::ExecutableCapture::open(&program);
+    }
+    if program.extension().is_none() {
+        program.set_extension("exe");
+    }
+    let custom_path = spec
+        .env
+        .iter()
+        .rev()
+        .find(|(key, _)| key.eq_ignore_ascii_case("PATH"));
+    let mut directories = Vec::new();
+    // These are Windows' default executable search locations. A configured
+    // PATH still overrides the inherited PATH, not the system directories.
+    if let Some(parent) = std::env::current_exe()?.parent() {
+        directories.push(parent.to_path_buf());
+    }
+    directories.push(std::env::current_dir()?);
+    if let Some(windows) = std::env::var_os("SystemRoot") {
+        let windows = PathBuf::from(windows);
+        directories.push(windows.join("System32"));
+        directories.push(windows.clone());
+    }
+    let path = custom_path
+        .map(|(_, value)| std::ffi::OsString::from(value))
+        .or_else(|| std::env::var_os("PATH"));
+    if let Some(path) = path {
+        directories.extend(std::env::split_paths(&path));
+    }
+    for directory in directories {
+        match subc_os::ExecutableCapture::open(&directory.join(&program)) {
+            Ok(capture) => return Ok(capture),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "resolved executable not found",
+    ))
+}
+
 fn spawn_and_mark_running(
     spec: &ModuleSpec,
     runtime: &SupervisorRuntimeConfig,
     snapshot: &SharedSnapshot,
 ) -> Result<SupervisedChild, SuperviseError> {
+    let activity_spawn = runtime.begin_activity_spawn(&spec.module_id);
     let child = spawn_child(
         spec,
         runtime.connection_file_path.as_deref(),
@@ -8023,6 +8763,9 @@ fn spawn_and_mark_running(
         runtime.cgroup_placement.as_ref(),
     )?;
     set_running(snapshot, &child, &spec.module_id, &runtime.spawn_events)?;
+    if let Some(spawn) = activity_spawn {
+        spawn.complete(snapshot);
+    }
     Ok(child)
 }
 
@@ -8614,6 +9357,8 @@ async fn begin_forwarding_drain_with(
     };
     {
         send_module_draining(&spec.module_id, reason, deadline_ms, target);
+        #[cfg(feature = "test-support")]
+        forwarding.wait_before_route_closing_for_test().await;
         let routes = forwarding
             .endpoint_routes(target.endpoint)
             .map_err(SuperviseError::Forwarding)?;
@@ -9005,7 +9750,13 @@ async fn drain_child_to_state(
     let exit_report = match timeout(drain_timeout, child.wait()).await {
         Ok(Ok(status)) => classify_reaped_child_exit(snapshot, &child, &status),
         Ok(Err(source)) => {
-            fail_snapshot(snapshot, Some(module_id), None);
+            fail_after_wait_error(
+                module_id,
+                snapshot,
+                terminal_ring,
+                spawn_events,
+                format!("failed to wait during drain: {source}"),
+            );
             return Err(SuperviseError::Wait {
                 module_id: module_id.to_string(),
                 source,
@@ -9033,14 +9784,26 @@ async fn drain_child_to_state(
                 "drain budget expired before the module exited; killing it"
             );
             child.start_kill().map_err(|source| {
-                fail_snapshot(snapshot, Some(module_id), None);
+                fail_after_wait_error(
+                    module_id,
+                    snapshot,
+                    terminal_ring,
+                    spawn_events,
+                    format!("failed to kill during drain: {source}"),
+                );
                 SuperviseError::Kill {
                     module_id: module_id.to_string(),
                     source,
                 }
             })?;
             let status = child.wait().await.map_err(|source| {
-                fail_snapshot(snapshot, Some(module_id), None);
+                fail_after_wait_error(
+                    module_id,
+                    snapshot,
+                    terminal_ring,
+                    spawn_events,
+                    format!("failed to wait after drain kill: {source}"),
+                );
                 SuperviseError::Wait {
                     module_id: module_id.to_string(),
                     source,
@@ -9050,26 +9813,33 @@ async fn drain_child_to_state(
         }
     };
 
-    update_snapshot(snapshot, Some(module_id), |state| {
-        state.state = final_state;
-        if let Some(enabled) = enabled {
-            state.enabled = enabled;
-        }
-        clear_current_process_facts(state);
-        state.last_exit = Some(exit_report.clone());
-        if exit_report.kind == ExitKind::DeliberateSeverance {
-            state.lifetime_restarts += 1;
-        }
-    })?;
     let detail = lock_snapshot(snapshot)?.drain_disposition_detail.take();
-    record_terminal_with_detail(
+    publish_after_terminal_record(
         module_id,
-        terminal_ring,
-        spawn_events,
-        &exit_report,
-        terminal_disposition(final_state),
-        detail,
-    );
+        || {
+            record_terminal_with_detail(
+                module_id,
+                terminal_ring,
+                spawn_events,
+                &exit_report,
+                terminal_disposition(final_state),
+                detail,
+            )
+        },
+        || {
+            update_snapshot(snapshot, Some(module_id), |state| {
+                state.state = final_state;
+                if let Some(enabled) = enabled {
+                    state.enabled = enabled;
+                }
+                clear_current_process_facts(state);
+                state.last_exit = Some(exit_report.clone());
+                if exit_report.kind == ExitKind::DeliberateSeverance {
+                    state.lifetime_restarts += 1;
+                }
+            })
+        },
+    )?;
     child.drain_stderr(module_id).await;
 
     release_dead_registration(registry, forwarding, snapshot, module_id).await
@@ -9494,6 +10264,7 @@ fn set_running(
     }
     state.drain_disposition_detail = None;
     state.spawn_failure = None;
+    state.waiting_for_previous_pid = None;
     // Every caller of this is a plain spawn, which always uses the primary key;
     // a promoted swap candidate sets the flag itself after this returns.
     state.in_alternate_slot = false;
@@ -9503,21 +10274,33 @@ fn set_running(
     state.enabled = true;
     state.process_alive = true;
     state.pid = child.id();
+    #[cfg(windows)]
+    {
+        state.pipe_consumed = child
+            .nonce_delivery
+            .as_ref()
+            .map(|delivery| delivery.consumed());
+    }
     #[cfg(target_os = "macos")]
     {
         state.report_ready = Some(Arc::clone(&child.report_ready));
     }
     state.spawned_at_ms = Some(child.spawned_at_ms);
     state.spawned_from = Some(child.spawned_from.clone());
-    state.spawned_file_identity = child.spawned_file_identity;
+    state.spawned_file_identity = child.spawned_file_identity.clone();
     state.process_start_time = child.process_start_time;
     Ok(())
 }
 
 fn clear_current_process_facts(state: &mut SupervisorSnapshot) {
+    state.waiting_for_previous_pid = None;
     state.process_alive = false;
     state.spawned_protocol = None;
     state.pid = None;
+    #[cfg(windows)]
+    {
+        state.pipe_consumed = None;
+    }
     #[cfg(target_os = "macos")]
     {
         state.report_ready = None;
@@ -9630,7 +10413,7 @@ mod terminal_history_tests {
         time::{Duration, Instant},
     };
 
-    use tokio::time::sleep;
+    use tokio::{sync::mpsc, time::sleep};
 
     use super::{
         apply_deliberate_severance_marker, daemon_will_restart, drain_child_to_state,
@@ -9638,8 +10421,9 @@ mod terminal_history_tests {
         lock_snapshot, on_child_exit, record_deliberate_severance, record_wait_error_terminal,
         reset_restart_count, spawn_and_mark_running, update_snapshot, wait_error_exit_report,
         ExitKind, ExitReport, ModuleProtocol, ModuleSpec, ModuleState, NextAction, ProcessIdentity,
-        RestartPolicy, SpawnEventKind, StopNotice, SuperviseError, SupervisedModule, Supervisor,
-        SupervisorHandle, SupervisorHealthStatus, SupervisorSnapshot,
+        RestartPolicy, SpawnEventKind, StopNotice, SuperviseError, SupervisedConfiguration,
+        SupervisedModule, SupervisedModuleInner, Supervisor, SupervisorHandle,
+        SupervisorHealthStatus, SupervisorSnapshot,
     };
     // The supervisor's clock, distinct from the `std::time::Instant` these tests
     // use for their own wall-clock deadlines: crash-restart instants must be on
@@ -9882,29 +10666,40 @@ mod terminal_history_tests {
         let registry = Arc::new(Registry::default());
         let supervisor =
             Supervisor::new_for_test(Arc::clone(&registry), RestartPolicy::new(3, Duration::ZERO));
-        let module = supervisor
-            .spawn(ModuleSpec {
-                module_id: "recovery-snapshot".to_string(),
-                program: fake_aft_stub_path(),
-                args: Vec::new(),
-                env: Vec::new(),
-                reserved: false,
-                reserved_prefixes: Vec::new(),
-                protocol: ModuleProtocol::Subc,
-                overlap: Default::default(),
-            })
-            .unwrap();
-        update_snapshot(
-            &module.inner.snapshot,
-            Some("recovery-snapshot"),
-            |snapshot| {
-                snapshot.state = state;
-                snapshot.enabled = enabled;
-                seed_crash_restarts(snapshot, restart_count);
-            },
-        )
-        .unwrap();
-        module
+        let runtime = supervisor.runtime_config();
+        let spec = ModuleSpec {
+            module_id: "recovery-snapshot".to_string(),
+            program: fake_aft_stub_path(),
+            args: Vec::new(),
+            env: Vec::new(),
+            reserved: false,
+            reserved_prefixes: Vec::new(),
+            protocol: ModuleProtocol::Subc,
+            overlap: Default::default(),
+        };
+        let mut snapshot = SupervisorSnapshot::new(state, enabled);
+        seed_crash_restarts(&mut snapshot, restart_count);
+        // These tests read synthetic snapshots. A real child and monitor would
+        // race those reads by replacing the requested state during startup.
+        let (commands, _rx) = mpsc::channel(4);
+        SupervisedModule {
+            inner: Arc::new(SupervisedModuleInner {
+                module_id: spec.module_id.clone(),
+                registry,
+                snapshot: Arc::new(Mutex::new(snapshot)),
+                configuration: Arc::new(Mutex::new(SupervisedConfiguration {
+                    spec,
+                    health: runtime.health,
+                })),
+                stderr_ring: runtime.stderr_ring,
+                terminal_ring: runtime.terminal_ring,
+                commands,
+                monitor: Mutex::new(None),
+                restart_policy: runtime.restart_policy,
+                effective_drain_timeout: runtime.effective_drain_timeout,
+                provenance_probe: supervisor.provenance_probe.clone(),
+            }),
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -10146,7 +10941,7 @@ mod terminal_history_tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn protocol_none_unrequested_clean_exit_restarts_as_a_crash() {
-        let dir = subc_test_support::TestTempDir::new("none-unrequested-clean-exit");
+        let dir = cortexkit_test_support::ScratchDir::new("none-unrequested-clean-exit");
         let (spec, ready, marker) =
             protocol_none_sigterm_exits_clean_spec("none-unrequested-clean-exit", dir.path());
         let supervisor = Supervisor::new_for_test(
@@ -10155,11 +10950,23 @@ mod terminal_history_tests {
         );
         let module = supervisor.spawn(spec).unwrap();
         wait_for_file(&ready).await;
-        let first_pid = module
-            .status()
-            .unwrap()
-            .pid
-            .expect("a running module reports its pid");
+        // The ready file proves the child installed its SIGTERM handler, not
+        // that the supervisor has processed the privacy trampoline's exec
+        // acknowledgement. On macOS status withholds the pid until then.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let first_pid = loop {
+            let status = module.status().unwrap();
+            if status.state == ModuleState::Running {
+                if let Some(pid) = status.pid {
+                    break pid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a running module must report its pid after exec confirmation: {status:?}"
+            );
+            sleep(Duration::from_millis(10)).await;
+        };
 
         rustix::process::kill_process(
             rustix::process::Pid::from_raw(i32::try_from(first_pid).unwrap()).unwrap(),
@@ -10256,6 +11063,7 @@ mod terminal_history_tests {
 
     #[test]
     fn restart_budget_failure_is_published_after_its_terminal_record() {
+        use std::io::{Read, Write};
         let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
             RestartPolicy::new(0, Duration::ZERO),
@@ -10269,14 +11077,10 @@ mod terminal_history_tests {
             ModuleState::Running,
             true,
         )));
+        lock_snapshot(&snapshot).unwrap().process_alive = true;
         let reaped_snapshot = snapshot.clone();
-        let events = runtime.spawn_events.clone();
+        let mut barrier = terminal_record_barrier(&runtime.spawn_events);
         let history = runtime.terminal_ring.clone();
-
-        // Exit recording takes the event-feed lock before the history lock.
-        // Holding it pauses the writer after choosing a disposition but before
-        // recording history, without assuming anything about scheduler timing.
-        let before_record = events.0.lock().unwrap();
         let reap = std::thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -10298,19 +11102,15 @@ mod terminal_history_tests {
                     },
                 ))
         });
-        // The deadline bounds a hung writer only; last_exit is the handshake.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let before_state = loop {
+        let mut reached = [0];
+        barrier.read_exact(&mut reached).unwrap();
+        assert_eq!(&reached, b"R");
+        let (before_state, before_alive) = {
             let state = lock_snapshot(&snapshot).unwrap();
-            if state.last_exit.is_some() {
-                break state.state;
-            }
-            drop(state);
-            assert!(Instant::now() < deadline, "exit decision was not reached");
-            std::thread::yield_now();
+            (state.state, state.process_alive)
         };
         let before_history = history.lock().unwrap().snapshot();
-        drop(before_record);
+        barrier.write_all(b"X").unwrap();
         assert!(matches!(reap.join().unwrap(), NextAction::Stop { .. }));
         assert!(before_history.entries.is_empty());
         assert_ne!(
@@ -10318,6 +11118,7 @@ mod terminal_history_tests {
             ModuleState::Failed,
             "Failed was visible before its terminal record could be written"
         );
+        assert!(before_alive);
         assert_eq!(lock_snapshot(&snapshot).unwrap().state, ModuleState::Failed);
         let history = history.lock().unwrap().snapshot();
         assert_eq!(history.entries.len(), 1);
@@ -10325,9 +11126,379 @@ mod terminal_history_tests {
         assert_eq!(history.entries[0].disposition, TerminalDisposition::Failed);
     }
 
+    #[test]
+    fn crash_restart_at_budget_limit_remains_recoverable_while_recording() {
+        use std::io::{Read, Write};
+
+        let supervisor = Supervisor::new_for_test(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(3, Duration::ZERO),
+        );
+        let mut runtime = supervisor.runtime_config();
+        let module = module_with_recovery_snapshot(ModuleState::Running, true, 2);
+        let snapshot = module.inner.snapshot.clone();
+        lock_snapshot(&snapshot).unwrap().process_alive = true;
+        runtime.terminal_ring = module.inner.terminal_ring.clone();
+        let spec = windowed_crash_spec(module.module_id());
+        let mut barrier = terminal_record_barrier(&runtime.spawn_events);
+        let reaped_snapshot = snapshot.clone();
+        let reap = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(on_child_exit(
+                    &spec,
+                    runtime.restart_policy,
+                    &supervisor.registry,
+                    &reaped_snapshot,
+                    &runtime.terminal_ring,
+                    &runtime.spawn_events,
+                    &runtime.child_roster,
+                    ExitReport {
+                        kind: ExitKind::Crash,
+                        code: Some(2),
+                        signal: None,
+                        at_ms: 1,
+                    },
+                ))
+        });
+
+        // Hold the crash handler between its budget decision and publication.
+        // Connection cleanup must still see the recovery that this crash chose,
+        // even when that recovery consumes the last available restart slot.
+        let mut reached = [0];
+        barrier.read_exact(&mut reached).unwrap();
+        assert_eq!(&reached, b"R");
+        let before_status = module.status().unwrap();
+        let before_history = module.terminal_history();
+        let before_recovers = module.will_recover_after_connection_loss().unwrap();
+        barrier.write_all(b"X").unwrap();
+        assert!(matches!(reap.join().unwrap(), NextAction::Restart { .. }));
+
+        assert_eq!(before_status.state, ModuleState::Running);
+        assert!(before_status.process_alive);
+        assert_eq!(before_status.restart_count, 3);
+        assert!(before_history.entries.is_empty());
+        assert!(
+            before_recovers,
+            "connection cleanup would report a terminal close for a scheduled crash restart"
+        );
+        let restarting = module.status().unwrap();
+        assert_eq!(restarting.state, ModuleState::Restarting);
+        assert_eq!(restarting.restart_count, 3);
+        assert!(module.will_recover_after_connection_loss().unwrap());
+        let history = module.terminal_history();
+        assert_eq!(history.entries.len(), 1);
+        assert_eq!(
+            history.entries[0].disposition,
+            TerminalDisposition::Restarting
+        );
+
+        // Once the replacement is running, its next crash must be judged
+        // against the exhausted budget rather than the previous recovery.
+        update_snapshot(&snapshot, Some(module.module_id()), |state| {
+            state.state = ModuleState::Running;
+            state.respawn_pending = false;
+        })
+        .unwrap();
+        assert!(!module.will_recover_after_connection_loss().unwrap());
+        update_snapshot(&snapshot, Some(module.module_id()), |state| {
+            state.enabled = false;
+            state.respawn_pending = true;
+        })
+        .unwrap();
+        assert!(!module.will_recover_after_connection_loss().unwrap());
+    }
+
+    fn terminal_record_barrier(events: &super::SpawnEventFeed) -> std::net::TcpStream {
+        use std::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let writer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (barrier, _) = listener.accept().unwrap();
+        for stream in [&writer, &barrier] {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+        }
+        *events.1.lock().unwrap() = Some(writer);
+        barrier
+    }
+
+    pub(super) fn before_terminal_record(events: &super::SpawnEventFeed) {
+        use std::io::{Read, Write};
+        let barrier = events.1.lock().unwrap().take();
+        if let Some(mut barrier) = barrier {
+            barrier.write_all(b"R").unwrap();
+            let mut release = [0];
+            barrier.read_exact(&mut release).unwrap();
+            assert_eq!(&release, b"X");
+        }
+    }
+
+    #[test]
+    fn health_restart_budget_failure_is_published_after_its_terminal_record() {
+        use std::io::{Read, Write};
+
+        let supervisor = Supervisor::new_for_test(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(0, Duration::ZERO),
+        );
+        let mut runtime = supervisor.runtime_config();
+        let module = module_with_recovery_snapshot(ModuleState::Running, true, 0);
+        let snapshot = module.inner.snapshot.clone();
+        runtime.terminal_ring = module.inner.terminal_ring.clone();
+        let spec = ModuleSpec {
+            module_id: module.module_id().into(),
+            program: fake_aft_stub_path(),
+            protocol: ModuleProtocol::None,
+            env: vec![("FAKE_AFT_EXIT_CODE".into(), "17".into())],
+            ..windowed_crash_spec(module.module_id())
+        };
+        let mut barrier = terminal_record_barrier(&runtime.spawn_events);
+        let reap = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut child =
+                        Some(spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap());
+                    health_restart_child(
+                        &spec,
+                        &runtime,
+                        &supervisor.registry,
+                        &supervisor.process_liveness,
+                        &snapshot,
+                        &mut child,
+                        SupervisorHealthStatus::Failing,
+                        Some("health probe did not answer"),
+                        1,
+                    )
+                    .await
+                    .unwrap();
+                    assert!(child.is_none());
+                });
+        });
+        // The loopback barrier acknowledges entry into terminal recording by
+        // health_restart_child's drain, then waits for the test's release byte.
+        // Status and history are observed while that writer is held, not after
+        // an elapsed-time guess about when the health action has completed.
+        let mut reached = [0];
+        barrier.read_exact(&mut reached).unwrap();
+        assert_eq!(&reached, b"R");
+        let before_status = module.status().unwrap();
+        let before_history = module.terminal_history();
+        barrier.write_all(b"X").unwrap();
+        reap.join().unwrap();
+        assert!(before_history.entries.is_empty());
+        assert_ne!(
+            before_status.state,
+            ModuleState::Failed,
+            "Failed was visible before its terminal record could be written"
+        );
+        assert!(
+            before_status.process_alive,
+            "process death was visible before its terminal record could be written"
+        );
+        let failed = module.status().unwrap();
+        assert_eq!(failed.state, ModuleState::Failed);
+        assert!(!failed.process_alive);
+        let history = module.terminal_history();
+        assert_eq!(history.entries.len(), 1);
+        assert_eq!(history.entries[0].disposition, TerminalDisposition::Failed);
+        assert_eq!(
+            history.entries[0].disposition_detail.as_deref(),
+            Some("crash budget exhausted: max_restarts=0 within window_secs=600")
+        );
+    }
+
+    #[test]
+    fn observed_exits_publish_process_death_after_terminal_history() {
+        use std::io::{Read, Write};
+        for (kind, enabled, shutdown, wait_error, expected_state) in [
+            (ExitKind::Clean, true, false, false, ModuleState::Stopped),
+            (ExitKind::Crash, true, false, false, ModuleState::Restarting),
+            (ExitKind::Crash, false, false, false, ModuleState::Disabled),
+            (
+                ExitKind::DeliberateSeverance,
+                true,
+                false,
+                false,
+                ModuleState::Restarting,
+            ),
+            #[cfg(unix)]
+            (ExitKind::Crash, true, true, false, ModuleState::Stopped),
+            (ExitKind::Crash, true, false, true, ModuleState::Failed),
+        ] {
+            let supervisor = Supervisor::new_for_test(
+                Arc::new(Registry::default()),
+                RestartPolicy::new(1, Duration::ZERO),
+            );
+            let runtime = supervisor.runtime_config();
+            #[cfg(unix)]
+            if shutdown {
+                runtime.child_roster.close();
+            }
+            #[cfg(not(unix))]
+            let _ = shutdown;
+            let spec = windowed_crash_spec("exit-publication-order");
+            let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::new(
+                ModuleState::Running,
+                enabled,
+            )));
+            lock_snapshot(&snapshot).unwrap().process_alive = true;
+            let reaped_snapshot = snapshot.clone();
+            let history = runtime.terminal_ring.clone();
+            let mut barrier = terminal_record_barrier(&runtime.spawn_events);
+            let reap = std::thread::spawn(move || {
+                if wait_error {
+                    super::fail_after_wait_error(
+                        &spec.module_id,
+                        &reaped_snapshot,
+                        &runtime.terminal_ring,
+                        &runtime.spawn_events,
+                        "wait failed".into(),
+                    );
+                } else {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(on_child_exit(
+                            &spec,
+                            runtime.restart_policy,
+                            &supervisor.registry,
+                            &reaped_snapshot,
+                            &runtime.terminal_ring,
+                            &runtime.spawn_events,
+                            &runtime.child_roster,
+                            ExitReport {
+                                kind,
+                                code: Some(0),
+                                signal: None,
+                                at_ms: 1,
+                            },
+                        ));
+                }
+            });
+            let mut reached = [0];
+            barrier.read_exact(&mut reached).unwrap();
+            assert_eq!(&reached, b"R");
+            let before_alive = lock_snapshot(&snapshot).unwrap().process_alive;
+            let before_history = history.lock().unwrap().snapshot();
+            barrier.write_all(b"X").unwrap();
+            reap.join().unwrap();
+            assert!(
+                before_alive,
+                "{kind:?}: death was published before recording"
+            );
+            assert!(before_history.entries.is_empty());
+            assert_eq!(lock_snapshot(&snapshot).unwrap().state, expected_state);
+            assert!(!lock_snapshot(&snapshot).unwrap().process_alive);
+            assert_eq!(history.lock().unwrap().snapshot().entries.len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn health_restart_budget_failure_remains_failed_when_journal_append_fails() {
+        let dir = cortexkit_test_support::ScratchDir::new("health-budget-journal-failure");
+        let path = dir.join("terminals.jsonl");
+        std::fs::create_dir(&path).unwrap();
+        let supervisor = Supervisor::new_for_test(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(0, Duration::ZERO),
+        )
+        .with_terminal_journal(path, "health-budget-journal-failure".into());
+        let runtime = supervisor.runtime_config();
+        let spec = ModuleSpec {
+            program: fake_aft_stub_path(),
+            protocol: ModuleProtocol::None,
+            env: vec![("FAKE_AFT_EXIT_CODE".into(), "17".into())],
+            ..windowed_crash_spec("health-budget-journal-failure")
+        };
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let mut child = Some(spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap());
+        health_restart_child(
+            &spec,
+            &runtime,
+            &supervisor.registry,
+            &supervisor.process_liveness,
+            &snapshot,
+            &mut child,
+            SupervisorHealthStatus::Failing,
+            None,
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(lock_snapshot(&snapshot).unwrap().state, ModuleState::Failed);
+        assert!(!lock_snapshot(&snapshot).unwrap().process_alive);
+        let history = runtime
+            .terminal_ring
+            .lock()
+            .unwrap()
+            .durable_history(&spec.module_id);
+        assert!(history.journal_write_failures > 0);
+        assert_eq!(history.entries.len(), 1);
+        assert_eq!(history.entries[0].disposition, TerminalDisposition::Failed);
+    }
+
+    #[test]
+    fn health_restart_budget_failure_remains_failed_when_exit_recording_panics() {
+        let supervisor = Supervisor::new_for_test(
+            Arc::new(Registry::default()),
+            RestartPolicy::new(0, Duration::ZERO),
+        );
+        let runtime = supervisor.runtime_config();
+        let spec = ModuleSpec {
+            program: fake_aft_stub_path(),
+            protocol: ModuleProtocol::None,
+            env: vec![("FAKE_AFT_EXIT_CODE".into(), "17".into())],
+            ..windowed_crash_spec("health-budget-recording-panic")
+        };
+        let snapshot = Arc::new(Mutex::new(SupervisorSnapshot::starting()));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut child =
+                        Some(spawn_and_mark_running(&spec, &runtime, &snapshot).unwrap());
+                    runtime.spawn_events.0.lock().unwrap().seq = u64::MAX;
+                    health_restart_child(
+                        &spec,
+                        &runtime,
+                        &supervisor.registry,
+                        &supervisor.process_liveness,
+                        &snapshot,
+                        &mut child,
+                        SupervisorHealthStatus::Failing,
+                        None,
+                        1,
+                    )
+                    .await
+                    .unwrap();
+                });
+        }));
+        let panic = result.expect_err("recording must still unwind");
+        assert_eq!(
+            panic.downcast_ref::<String>().map(String::as_str),
+            Some("spawn event sequence exhausted")
+        );
+        let state = lock_snapshot(&snapshot).unwrap();
+        assert_eq!(state.state, ModuleState::Failed);
+        assert!(!state.process_alive);
+        assert!(state.last_exit.is_some());
+    }
+
     #[tokio::test]
     async fn restart_budget_failure_remains_failed_when_journal_append_fails() {
-        let dir = subc_test_support::TestTempDir::new("budget-journal-failure");
+        let dir = cortexkit_test_support::ScratchDir::new("budget-journal-failure");
         let path = dir.join("terminals.jsonl");
         std::fs::create_dir(&path).unwrap();
         let supervisor = Supervisor::new_for_test(
@@ -10411,7 +11582,7 @@ mod terminal_history_tests {
             } else {
                 "none-requested-stop"
             };
-            let dir = subc_test_support::TestTempDir::new(label);
+            let dir = cortexkit_test_support::ScratchDir::new(label);
             let (spec, ready, marker) = protocol_none_sigterm_exits_clean_spec(label, dir.path());
             let supervisor = Supervisor::new_for_test(
                 Arc::new(Registry::default()),
@@ -10495,7 +11666,7 @@ mod terminal_history_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn reload_exit_keeps_roster_until_terminal_is_recorded_during_shutdown() {
-        let dir = subc_test_support::TestTempDir::new("reload-roster-terminal-order");
+        let dir = cortexkit_test_support::ScratchDir::new("reload-roster-terminal-order");
         let record = dir.join("live-children.json");
         let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
@@ -11221,6 +12392,467 @@ mod terminal_history_tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod health_event_tests {
+    use super::*;
+    use cortexkit_test_support::ScratchDir;
+    use subc_protocol::{manifest::Concurrency, session::ModuleControlResponse};
+
+    struct Actor {
+        module: SupervisedModule,
+        registry: Arc<Registry>,
+        forwarding: Arc<ForwardingTable>,
+        spec: ModuleSpec,
+        health: HealthConfig,
+        rx: mpsc::Receiver<crate::router::OutboundFrame>,
+        _home: ScratchDir,
+    }
+
+    async fn wait_for<T>(reason: &str, mut observe: impl FnMut() -> Option<T>) -> T {
+        // OS exec and socket readiness are real I/O. Stay runnable while waiting
+        // for an observed condition, rather than letting paused time auto-advance
+        // deadlines or assuming a fixed number of yields finishes the work.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let tick = Instant::now();
+        loop {
+            if let Some(value) = observe() {
+                assert_eq!(Instant::now(), tick, "{reason} must not wait for a timer");
+                return value;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {reason}"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    impl Actor {
+        async fn start(protocol: ModuleProtocol, cadence: Duration) -> Self {
+            let home = ScratchDir::new("health-events");
+            let registry = Arc::new(Registry::default());
+            let forwarding = Arc::new(ForwardingTable::default());
+            let health = HealthConfig {
+                cadence,
+                deadline: Duration::from_secs(3600),
+                ..HealthConfig::default()
+            };
+            let supervisor =
+                Supervisor::new_for_test(registry.clone(), RestartPolicy::new(3, Duration::ZERO))
+                    .with_forwarding(forwarding.clone())
+                    .with_health_config(health.clone());
+            let spec = ModuleSpec {
+                module_id: "event-health-child".into(),
+                program: PathBuf::from("/bin/sh"),
+                // The process stays alive but has no real bus peer. Registrations
+                // below exercise the same registry writes as accepted HELLOs.
+                args: vec!["-c".into(), "exec sleep 600".into()],
+                env: ["XDG_DATA_HOME", "XDG_RUNTIME_DIR", "XDG_CONFIG_HOME"]
+                    .into_iter()
+                    .map(|key| (key.into(), home.path().display().to_string()))
+                    .collect(),
+                reserved: false,
+                reserved_prefixes: vec![],
+                protocol,
+                overlap: Default::default(),
+            };
+            let module = supervisor.spawn(spec.clone()).unwrap();
+            let (_, rx) = mpsc::channel(8);
+            let actor = Self {
+                module,
+                registry,
+                forwarding,
+                spec,
+                health,
+                rx,
+                _home: home,
+            };
+            actor
+                .wait_for_select(|checkpoint| checkpoint.generation > 0)
+                .await;
+            actor
+        }
+
+        fn turns(&self) -> u64 {
+            lock_snapshot(&self.module.inner.snapshot)
+                .unwrap()
+                .actor_turns
+        }
+
+        async fn wait_for_select(
+            &self,
+            expected: impl Fn(&ActorSelectCheckpoint) -> bool,
+        ) -> ActorSelectCheckpoint {
+            wait_for("actor select checkpoint", || {
+                let state = lock_snapshot(&self.module.inner.snapshot).unwrap();
+                state.actor_select.filter(|checkpoint| {
+                    checkpoint.generation == state.spawn_generation
+                        && state.state == ModuleState::Running
+                        && state.process_alive
+                        && state.reported_pid().is_some()
+                        && expected(checkpoint)
+                })
+            })
+            .await
+        }
+
+        fn hello(&mut self, connection: u64, health: bool) {
+            let manifest =
+                subc_protocol::manifest::ModuleManifest::builder(&self.spec.module_id, "1.0.0")
+                    .protocol_ver(subc_protocol::PROTOCOL_VERSION)
+                    .build();
+            let connection = ConnectionId::new(connection);
+            let (tx, rx) = mpsc::channel(8);
+            self.rx = rx;
+            self.forwarding
+                .register_module_connection(
+                    connection,
+                    self.spec.module_id.clone(),
+                    subc_protocol::PROTOCOL_VERSION,
+                    Concurrency::ModuleManaged,
+                    FrameSink::new(tx),
+                )
+                .unwrap();
+            self.registry
+                .register_with_control_ops(
+                    manifest,
+                    subc_protocol::PROTOCOL_VERSION,
+                    connection,
+                    if health {
+                        vec![MODULE_CONTROL_OP_HEALTH_CHECK.into()]
+                    } else {
+                        vec![]
+                    },
+                )
+                .unwrap();
+        }
+
+        async fn probe(&mut self) -> crate::router::OutboundFrame {
+            let frame = wait_for("outbound health probe", || match self.rx.try_recv() {
+                Ok(frame) => Some(frame),
+                Err(mpsc::error::TryRecvError::Empty) => None,
+                Err(mpsc::error::TryRecvError::Disconnected) => panic!("health peer disconnected"),
+            })
+            .await;
+            let body: Value = serde_json::from_slice(&frame.body).unwrap();
+            assert_eq!(body["op"], MODULE_CONTROL_OP_HEALTH_CHECK);
+            frame
+        }
+
+        fn no_probe(&mut self) {
+            assert!(matches!(
+                self.rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+
+        fn answer(&self, connection: u64, frame: crate::router::OutboundFrame) {
+            self.forwarding
+                .complete_module_control_rpc(
+                    ConnectionId::new(connection),
+                    frame.header.corr,
+                    Some(MODULE_CONTROL_OP_HEALTH_CHECK),
+                    ModuleControlRpcOutcome::Response(ModuleControlResponse::HealthCheck {
+                        status: HealthStatus::Ok,
+                        detail: None,
+                        metrics: None,
+                    }),
+                )
+                .unwrap();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_health_children_park_for_sixty_seconds() {
+        let none = Actor::start(ModuleProtocol::None, Duration::from_secs(30)).await;
+        let unregistered = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
+        let mut unadvertised = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
+        unadvertised.hello(1, false);
+        // Include any one-off registration wake in the budget; receiving a
+        // no-health HELLO must not turn a parked child into a polling child.
+        // Advance in 10 ms steps so the old poll really executes ~6,000 turns;
+        // a single 60 s jump would only observe one expired timer.
+        for _ in 0..6000 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+        }
+        for actor in [&none, &unregistered, &unadvertised] {
+            assert!(
+                actor.turns() <= 5,
+                "no-health actor woke {} times",
+                actor.turns()
+            );
+            assert_eq!(actor.module.state().unwrap(), ModuleState::Running);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_hello_starts_a_due_probe_in_the_notification_tick() {
+        // With a zero cadence the first probe is due at once, so this measures
+        // only how fast the registration notification starts health probing,
+        // not the normal 30-33 s wait before a first probe (checked below).
+        let mut actor = Actor::start(ModuleProtocol::Subc, Duration::ZERO).await;
+        let tick = Instant::now();
+        actor.hello(1, true);
+        actor.probe().await;
+        assert_eq!(Instant::now(), tick, "HELLO must not wait for a poll");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hello_keeps_the_jittered_cadence_and_catalog_updates_do_not_reset_it() {
+        let mut actor = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
+        let hello_tick = Instant::now();
+        actor.hello(1, true);
+        let armed = actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.registered_connection == Some(ConnectionId::new(1))
+                    && checkpoint.next_probe_at.is_some()
+            })
+            .await;
+        let delay = jittered_health_delay(&actor.spec.module_id, 0, actor.health.cadence);
+        assert!((Duration::from_secs(30)..Duration::from_secs(33)).contains(&delay));
+        let first_deadline = hello_tick + delay;
+        assert_eq!(armed.next_probe_at, Some(first_deadline));
+        tokio::time::advance(Duration::from_secs(29)).await;
+        let turns = actor.turns();
+        actor
+            .registry
+            .replace_catalog_for_connection(ConnectionId::new(1), vec![], None, Some(true))
+            .unwrap();
+        let updated = actor
+            .wait_for_select(|checkpoint| checkpoint.turn > turns)
+            .await;
+        assert_eq!(
+            updated.next_probe_at,
+            Some(first_deadline),
+            "catalog update must not reset cadence"
+        );
+        actor.no_probe();
+        tokio::time::advance(first_deadline - Instant::now()).await;
+        let frame = actor.probe().await;
+        actor.answer(1, frame);
+        let next = jittered_health_delay(&actor.spec.module_id, 1, actor.health.cadence);
+        let next_deadline = Instant::now() + next;
+        let rearmed = actor
+            .wait_for_select(|checkpoint| {
+                checkpoint
+                    .next_probe_at
+                    .is_some_and(|deadline| deadline > first_deadline)
+            })
+            .await;
+        assert_eq!(rearmed.next_probe_at, Some(next_deadline));
+        tokio::time::advance(next - Duration::from_nanos(1)).await;
+        actor.no_probe();
+        tokio::time::advance(Duration::from_nanos(1)).await;
+        actor.probe().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_disarms_and_reconnect_rearms_health() {
+        let mut actor = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
+        actor.hello(1, true);
+        actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.registered_connection == Some(ConnectionId::new(1))
+                    && checkpoint.next_probe_at.is_some()
+            })
+            .await;
+        let turns = actor.turns();
+        let tick = Instant::now();
+        actor
+            .registry
+            .deregister_connection(ConnectionId::new(1))
+            .unwrap();
+        let disarmed = actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.turn > turns && checkpoint.registered_connection.is_none()
+            })
+            .await;
+        assert_eq!(disarmed.next_probe_at, None);
+        assert_eq!(disarmed.wake_after, None);
+        assert_eq!(
+            Instant::now(),
+            tick,
+            "disconnect must disarm in the notification tick"
+        );
+        tokio::time::advance(Duration::from_secs(60)).await;
+        actor.no_probe();
+        let reconnect_tick = Instant::now();
+        actor.hello(2, true);
+        let rearmed = actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.registered_connection == Some(ConnectionId::new(2))
+                    && checkpoint.next_probe_at.is_some()
+            })
+            .await;
+        let delay = jittered_health_delay(&actor.spec.module_id, 0, actor.health.cadence);
+        assert_eq!(rearmed.next_probe_at, Some(reconnect_tick + delay));
+        tokio::time::advance(delay).await;
+        actor.probe().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reregistration_without_health_disarms_the_old_schedule() {
+        let mut actor = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
+        actor.hello(1, true);
+        actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.registered_connection == Some(ConnectionId::new(1))
+                    && checkpoint.next_probe_at.is_some()
+            })
+            .await;
+        actor
+            .registry
+            .deregister_connection(ConnectionId::new(1))
+            .unwrap();
+        actor.hello(2, false);
+        let disarmed = actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.registered_connection == Some(ConnectionId::new(2))
+            })
+            .await;
+        assert_eq!(disarmed.next_probe_at, None);
+        assert_eq!(disarmed.wake_after, None);
+        tokio::time::advance(Duration::from_secs(60)).await;
+        actor.no_probe();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn restart_waits_for_its_own_hello_before_rearming_health() {
+        let mut actor = Actor::start(ModuleProtocol::Subc, Duration::from_secs(30)).await;
+        actor.hello(1, true);
+        let armed = actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.registered_connection == Some(ConnectionId::new(1))
+                    && checkpoint.next_probe_at.is_some()
+            })
+            .await;
+        // Simulate the old process's connection closing before the restart
+        // tears the process down. The replacement process has started but has
+        // not sent its HELLO, so it is not registered.
+        actor
+            .registry
+            .deregister_connection(ConnectionId::new(1))
+            .unwrap();
+        actor.module.restart(Some(0)).await.unwrap();
+        let parked = actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.generation > armed.generation
+                    && checkpoint.registered_connection.is_none()
+                    && checkpoint.next_probe_at.is_none()
+            })
+            .await;
+        assert_eq!(parked.wake_after, None);
+        actor.rx.close();
+        // Drain the stop notice the restart queued for the old process's connection,
+        // so it isn't mistaken for traffic to the replacement.
+        while actor.rx.try_recv().is_ok() {}
+        let turns = actor.turns();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let after = actor.turns();
+        eprintln!(
+            "restart park turns: before={turns} after={after} delta={}",
+            after - turns
+        );
+        assert_eq!(after, turns, "replacement must park before HELLO");
+        let hello_tick = Instant::now();
+        actor.hello(2, true);
+        let rearmed = actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.registered_connection == Some(ConnectionId::new(2))
+                    && checkpoint.next_probe_at.is_some()
+            })
+            .await;
+        let delay = jittered_health_delay(&actor.spec.module_id, 0, actor.health.cadence);
+        assert_eq!(rearmed.next_probe_at, Some(hello_tick + delay));
+        tokio::time::advance(delay).await;
+        actor.probe().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rescan_adds_and_removes_http_health_without_polling() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+        let mut actor = Actor::start(ModuleProtocol::None, Duration::from_secs(30)).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        actor.health.http = Some(format!("http://{}/health", listener.local_addr().unwrap()));
+        // One millisecond separates successive probes without a polling delay.
+        actor.health.cadence = Duration::from_millis(1);
+        let (started_tx, mut started_rx) = mpsc::channel(8);
+        let peer = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                started_tx.send(()).await.unwrap();
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        let tick = Instant::now();
+        let turns = actor.turns();
+        actor
+            .module
+            .update_configuration(actor.spec.clone(), actor.health.clone(), None)
+            .await
+            .unwrap();
+        let armed = actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.turn > turns && checkpoint.next_probe_at.is_some()
+            })
+            .await;
+        assert_eq!(armed.next_probe_at, Some(tick + Duration::from_millis(1)));
+        assert_eq!(Instant::now(), tick);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let mut started = false;
+        wait_for("successful HTTP probe", || {
+            started |= started_rx.try_recv().is_ok();
+            (started && actor.module.status().unwrap().health.status == SupervisorHealthStatus::Ok)
+                .then_some(())
+        })
+        .await;
+        assert!(started, "added HTTP check must start at its first deadline");
+        assert_eq!(
+            actor.module.status().unwrap().health.status,
+            SupervisorHealthStatus::Ok
+        );
+        assert_eq!(Instant::now(), tick + Duration::from_millis(1));
+        actor.health.http = None;
+        let turns = actor.turns();
+        actor
+            .module
+            .update_configuration(actor.spec.clone(), actor.health.clone(), None)
+            .await
+            .unwrap();
+        let parked = actor
+            .wait_for_select(|checkpoint| {
+                checkpoint.turn > turns && checkpoint.next_probe_at.is_none()
+            })
+            .await;
+        assert_eq!(parked.wake_after, None);
+        let turns = actor.turns();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(
+            actor.turns(),
+            turns,
+            "removed HTTP check must park the actor"
+        );
+        assert!(
+            started_rx.try_recv().is_err(),
+            "removed HTTP check must stay disarmed"
+        );
+        assert_eq!(
+            actor.module.status().unwrap().health,
+            ModuleHealthStatus::default()
+        );
+        peer.abort();
+    }
+}
+
 #[cfg(test)]
 mod health_evidence_tests {
     use super::{HealthProbeError, HealthProbeEvidence};
@@ -11599,6 +13231,66 @@ mod health_tombstone_tests {
 
 #[cfg(test)]
 mod child_env_tests {
+    #[cfg(windows)]
+    use super::{
+        clear_current_process_facts, observed_launch_nonce_source, ModuleState, SupervisorSnapshot,
+    };
+    #[cfg(windows)]
+    use std::sync::{Arc, OnceLock};
+    #[cfg(windows)]
+    #[test]
+    fn windows_wire_spawn_prepares_pipe_and_keeps_phase_one_env() {
+        let spec = spec(Vec::new());
+        let mut command = Command::new("unused");
+        let handoff = apply_wire_spawn_args(&mut command, &spec, None, None)
+            .unwrap()
+            .unwrap();
+        let name = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new(subc_os::launch_nonce::LAUNCH_NONCE_PIPE_ENV))
+            .and_then(|(_, value)| value)
+            .unwrap();
+        assert_eq!(name, OsStr::new(handoff.name()));
+        assert!(handoff.name().starts_with(r"\\.\pipe\subc-launch-"));
+        assert!(command.as_std().get_envs().any(|(key, value)| key
+            == OsStr::new(subc_os::LAUNCH_NONCE_PIPE_FALLBACK_ENV)
+            && value == Some(OsStr::new("env"))));
+        assert!(command
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == OsStr::new(SUBC_LAUNCH_NONCE_ENV) && value.is_some()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_source_reporting_tracks_consumption_and_resets_per_spawn() {
+        let mut snapshot = SupervisorSnapshot::new(ModuleState::Running, true);
+        snapshot.process_alive = true;
+        snapshot.spawned_protocol = Some(ModuleProtocol::Subc);
+        assert_eq!(
+            observed_launch_nonce_source(&snapshot).as_deref(),
+            Some("env")
+        );
+        let consumed = Arc::new(OnceLock::new());
+        snapshot.pipe_consumed = Some(consumed.clone());
+        assert_eq!(
+            observed_launch_nonce_source(&snapshot).as_deref(),
+            Some("env")
+        );
+        consumed.set(()).unwrap();
+        assert_eq!(
+            observed_launch_nonce_source(&snapshot).as_deref(),
+            Some("pipe")
+        );
+        snapshot.pipe_consumed = Some(Arc::new(OnceLock::new()));
+        assert_eq!(
+            observed_launch_nonce_source(&snapshot).as_deref(),
+            Some("env")
+        );
+        clear_current_process_facts(&mut snapshot);
+        assert_eq!(observed_launch_nonce_source(&snapshot), None);
+    }
     use super::{
         apply_child_env, apply_spawn_role, apply_wire_spawn_args, ModuleProtocol, ModuleSpec,
         SpawnRole, SupervisorHandle, SPAWN_ROLE_SWAP_CANDIDATE, SUBC_ARG, SUBC_LAUNCH_NONCE_ENV,
@@ -11687,6 +13379,10 @@ mod child_env_tests {
             none_handoff.is_none(),
             "protocol:none spawn must not receive a nonce descriptor"
         );
+        #[cfg(windows)]
+        assert!(!none.as_std().get_envs().any(|(key, value)| key
+            == OsStr::new(subc_os::LAUNCH_NONCE_PIPE_FALLBACK_ENV)
+            && value.is_some()));
         assert!(
             !none.as_std().get_envs().any(|(key, value)| key
                 == OsStr::new(subc_os::LAUNCH_NONCE_FD_ENV)
@@ -11740,7 +13436,9 @@ mod child_env_tests {
             Some(wire_handoff.expect("a descriptor handoff").fd_env_value()),
             "a subc-wire spawn names the pipe it will receive at descriptor 3"
         );
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        assert!(wire_handoff.is_some() && wire_fd_env.is_none());
+        #[cfg(not(any(unix, windows)))]
         assert!(wire_handoff.is_none() && wire_fd_env.is_none());
         let wire_args: Vec<String> = wire
             .as_std()
@@ -11945,18 +13643,18 @@ mod cgroup_placement_tests {
         SupervisedChild,
     };
     use crate::stderr_tail::{StderrRing, StderrTailConfig};
+    use cortexkit_test_support::ScratchDir;
     use std::{
         fs, io,
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
     };
-    use subc_test_support::TestTempDir;
     use tokio::process::Command;
 
     #[tokio::test]
     async fn unique_spawn_cgroups_clean_up_across_restarts_and_shutdown() {
         use super::*;
-        let dir = TestTempDir::new("unique-spawn-cgroups");
+        let dir = ScratchDir::new("unique-spawn-cgroups");
         let root = PathBuf::from(format!(
             "/sys/fs/cgroup/subc-unique-test-{}-{}",
             std::process::id(),
@@ -12105,7 +13803,7 @@ mod cgroup_placement_tests {
 
     #[tokio::test]
     async fn reaping_a_child_removes_its_empty_module_cgroup() {
-        let root = TestTempDir::new("supervisor-reap-cgroup");
+        let root = ScratchDir::new("supervisor-reap-cgroup");
         fs::write(root.join("cgroup.procs"), b"").expect("write scratch cgroup marker");
         let placement = subc_cgroup::prepare_at(&root)
             .expect("prepare scratch cgroup root")
@@ -12151,7 +13849,7 @@ mod cgroup_placement_tests {
 
     #[test]
     fn non_empty_cgroup_removal_is_reported_without_blocking_teardown() {
-        let root = TestTempDir::new("supervisor-non-empty-cgroup");
+        let root = ScratchDir::new("supervisor-non-empty-cgroup");
         fs::write(root.join("cgroup.procs"), b"").expect("write scratch cgroup marker");
         let placement = subc_cgroup::prepare_at(&root)
             .expect("prepare scratch cgroup root")
@@ -12271,8 +13969,8 @@ mod spawn_subscriber_lag_tests {
 mod terminal_history_read_concurrency_tests {
     use super::*;
     use crate::terminal_journal::read_pause;
+    use cortexkit_test_support::ScratchDir;
     use std::sync::mpsc as std_mpsc;
-    use subc_test_support::TestTempDir;
 
     fn journaled_ring(
         journal: &Arc<crate::terminal_journal::TerminalJournal>,
@@ -12321,7 +14019,7 @@ mod terminal_history_read_concurrency_tests {
     /// the moment it started, and the next read has each exit exactly once.
     #[test]
     fn exits_recorded_during_a_paused_history_read_are_not_blocked_or_half_merged() {
-        let dir = TestTempDir::new("terminal-history-concurrent-read");
+        let dir = ScratchDir::new("terminal-history-concurrent-read");
         let path = dir.join("terminals.jsonl");
         let journal = Arc::new(crate::terminal_journal::TerminalJournal::open(
             path.clone(),
@@ -12375,8 +14073,8 @@ mod terminal_history_read_concurrency_tests {
     }
 }
 
-/// What a restart does with the exited process's stderr reader. These drive
-/// the same `settle_stderr_pump` the supervisor calls, with a reader the test
+/// What a restart does with the exited process's output readers. These drive
+/// the same settle functions the supervisor calls, with a reader the test
 /// holds, so a reader that has not been scheduled by the bound is a controlled
 /// input rather than something only a loaded machine produces.
 #[cfg(test)]
@@ -12396,9 +14094,10 @@ mod stderr_settle_tests {
         time::Instant,
     };
 
-    use super::{settle_stderr_pump, StderrPump};
+    use super::{settle_stderr_pump, settle_stdout_pump, StderrPump};
     use crate::stderr_tail::{
-        pump_stderr_to, untimed, CaptureState, OutputSink, StderrRing, StderrTailConfig, TailEntry,
+        pump_stderr_to, pump_stdout_to, split_capture_stamp, untimed, CaptureState,
+        ChildOutputSink, OutputSink, StderrRing, StderrTailConfig, TailEntry,
     };
 
     const BOUND: Duration = Duration::from_millis(250);
@@ -12571,6 +14270,79 @@ mod stderr_settle_tests {
         assert_eq!(snapshot.capture, CaptureState::Captured);
         assert_eq!(untimed(snapshot.entries), vec![line("one"), line("two")]);
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn stdout_buffered_past_the_exit_drain_bound_reaches_the_capture_file() {
+        const BURST: usize = 150;
+        let capture = cortexkit_test_support::ScratchDir::new("stdout-exit-drain");
+        let path = capture.join("two-pipe.stderr.log");
+        let sink = ChildOutputSink::open(&path, cortexkit_log::Retention::default()).unwrap();
+        let ring = Arc::new(Mutex::new(StderrRing::new(StderrTailConfig::default())));
+        let generation = lock(&ring).begin_process();
+        let stdout = (0..BURST)
+            .map(|i| format!("out-{i:04}-{}\n", "o".repeat(64)))
+            .collect::<String>();
+        let stderr = (0..BURST)
+            .map(|i| format!("err-{i:04}-{}\n", "e".repeat(64)))
+            .collect::<String>();
+        // Model a child that has written both bursts and exited. Hold the stdout
+        // reader after one line and a partial prefix, as if pipe readiness or
+        // capture-file writes had delayed it. The final line also needs EOF to
+        // flush: neither complete nor partial buffered output may be discarded.
+        let first_chunk = stdout.find('\n').unwrap() + 1 + "out-0001-".len();
+        let (release, gate) = oneshot::channel();
+        let reader = HeldReader {
+            before: Some(stdout.as_bytes()[..first_chunk].to_vec()),
+            gate: Some(gate),
+            after: io::Cursor::new(stdout.as_bytes()[first_chunk..stdout.len() - 1].to_vec()),
+        };
+        let (finished, completion) = oneshot::channel();
+        let stdout_sink = sink.clone();
+        let pump = tokio::spawn(async move {
+            pump_stdout_to(reader, stdout_sink).await;
+            finished.send(()).unwrap();
+        });
+        pump_stderr_to(io::Cursor::new(stderr.into_bytes()), ring, generation, sink).await;
+
+        let started = Instant::now();
+        settle_stdout_pump("two-pipe", pump, BOUND).await;
+        assert_eq!(
+            started.elapsed(),
+            BOUND,
+            "a late reader must not hold up restart"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().lines().count(),
+            BURST + 1
+        );
+
+        release
+            .send(())
+            .expect("stdout reader must survive the exit drain bound");
+        tokio::time::timeout(Duration::from_secs(1), completion)
+            .await
+            .expect("released stdout reader must reach EOF")
+            .expect("stdout capture must finish at EOF, not be cancelled");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let mut lines = contents
+            .lines()
+            .map(|line| split_capture_stamp(line).expect("capture stamp").1)
+            .collect::<Vec<_>>();
+        let mut expected = (0..BURST)
+            .flat_map(|i| {
+                [
+                    format!("out-{i:04}-{}", "o".repeat(64)),
+                    format!("err-{i:04}-{}", "e".repeat(64)),
+                ]
+            })
+            .collect::<Vec<_>>();
+        lines.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            lines, expected,
+            "both pipes must retain every complete line exactly once"
+        );
+    }
 }
 
 /// Containment of a module's process tree (issue #109).
@@ -12589,12 +14361,12 @@ mod stderr_settle_tests {
 #[cfg(all(test, windows))]
 mod job_containment_tests {
     use super::*;
+    use cortexkit_test_support::ScratchDir;
     use std::{
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
-    use subc_test_support::TestTempDir;
 
     /// The stub, expected beside this test executable.
     ///
@@ -12636,7 +14408,7 @@ mod job_containment_tests {
     /// Everything one fixture run needs, so the two tests below differ in exactly
     /// one place: whether the child is contained.
     struct Fixture {
-        _dir: TestTempDir,
+        _dir: ScratchDir,
         module_id: String,
         grandchild: u32,
         child: Option<SupervisedChild>,
@@ -12647,7 +14419,7 @@ mod job_containment_tests {
     }
 
     fn fixture(label: &str, module_id: &str) -> Fixture {
-        let dir = TestTempDir::new(label);
+        let dir = ScratchDir::new(label);
         let pid_file = dir.join("grandchild.pid");
         let supervisor = Supervisor::new_for_test(
             Arc::new(Registry::default()),
@@ -12754,7 +14526,7 @@ mod job_containment_tests {
     /// the job object and the containment claim is unproven.
     #[test]
     fn an_uncontained_grandchild_survives_a_direct_child_kill() {
-        let dir = TestTempDir::new("teardown-uncontained");
+        let dir = ScratchDir::new("teardown-uncontained");
         let pid_file = dir.join("grandchild.pid");
         let mut child = std::process::Command::new(stub_path())
             .env("FAKE_AFT_NEVER_CONNECT", "1")
@@ -12950,7 +14722,7 @@ mod privacy_exec_boundary_tests {
     async fn macos_roster_withholds_a_nonnull_trampoline_image_until_exec_confirmation() {
         #[cfg(target_os = "macos")]
         {
-            let root = subc_test_support::TestTempDir::new("privacy-roster-barrier");
+            let root = cortexkit_test_support::ScratchDir::new("privacy-roster-barrier");
             // Loopback sockets also work when the replay adapter's TMPDIR is
             // longer than Darwin's Unix-domain socket path limit.
             let exec_listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -13090,15 +14862,15 @@ mod privacy_exec_boundary_tests {
 mod launch_nonce_descriptor_tests {
     use super::{ChildRoster, ModuleProtocol, ModuleSpec, SupervisorHandle};
     use crate::stderr_tail::{StderrRing, StderrTailConfig};
+    use cortexkit_test_support::ScratchDir;
     use std::{
         path::PathBuf,
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
-    use subc_test_support::TestTempDir;
 
     async fn probe(role: super::SpawnRole) {
-        let scratch = TestTempDir::new("launch-nonce-descriptor");
+        let scratch = ScratchDir::new("launch-nonce-descriptor");
         let fd_copy = scratch.join("from-descriptor");
         let env_copy = scratch.join("environment");
         let script = format!(
@@ -13183,7 +14955,7 @@ mod launch_nonce_descriptor_tests {
 #[cfg(all(test, target_os = "linux"))]
 mod cgroup_containment_tests {
     use super::*;
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
 
     fn running(pid: u32) -> bool {
         // An orphan can remain a zombie until the container init reaps it.
@@ -13207,7 +14979,7 @@ mod cgroup_containment_tests {
     }
 
     async fn teardown_tree(test_name: &str, shutdown: bool) {
-        let dir = TestTempDir::new(test_name);
+        let dir = ScratchDir::new(test_name);
         let root = PathBuf::from(format!(
             "/sys/fs/cgroup/subc-tree-test-{test_name}-{}-{}",
             std::process::id(),

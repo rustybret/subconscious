@@ -42,6 +42,11 @@ use tokio::{
 
 const FAKE_AFT_MODULE_ID_ENV: &str = "FAKE_AFT_MODULE_ID";
 const FAKE_AFT_CRASH_AFTER_MS_ENV: &str = "FAKE_AFT_CRASH_AFTER_MS";
+/// After registration, spawn a descendant that ignores daemon EOF and retains
+/// the module's stderr writer, so only process-tree containment can reap it.
+const FAKE_AFT_CONTAINMENT_WITNESS_ENV: &str = "FAKE_AFT_CONTAINMENT_WITNESS";
+/// Exit 2 on a bound-route request so tests can finish attaching before a crash.
+const FAKE_AFT_CRASH_ON_REQUEST_ENV: &str = "FAKE_AFT_CRASH_ON_REQUEST";
 /// Exit 0 after the delay: exercises the supervisor's clean-exit arm, which
 /// must keep the supervision command channel alive for later operator restarts.
 const FAKE_AFT_CLEAN_EXIT_AFTER_MS_ENV: &str = "FAKE_AFT_CLEAN_EXIT_AFTER_MS";
@@ -274,6 +279,11 @@ type InFlightRegistry = Arc<Mutex<HashMap<InFlightKey, oneshot::Sender<()>>>>;
 
 #[tokio::main]
 async fn main() -> Result<(), StubError> {
+    #[cfg(windows)]
+    if env_flag("FAKE_AFT_RESTRICT_PROCESS") {
+        subc_os::windows_acl::restrict_current_process()
+            .expect("FAKE_AFT_RESTRICT_PROCESS: restrict_current_process failed");
+    }
     // Before every branch, so the witness is available on the normal supervised
     // path and not only to the exit-only shapes.
     echo_requested_env();
@@ -425,6 +435,44 @@ fn spawn_grandchild_if_requested() -> Result<(), StubError> {
         .map_err(StubError::Io)?;
     fs::write(&pid_file, grandchild.id().to_string()).map_err(StubError::Io)?;
     drop(grandchild);
+    Ok(())
+}
+
+fn spawn_containment_witness_if_requested(config: &StubConfig) -> Result<(), StubError> {
+    if !env_flag(FAKE_AFT_CONTAINMENT_WITNESS_ENV) {
+        return Ok(());
+    }
+    let child = Command::new(env::current_exe().map_err(StubError::Io)?)
+        .env(FAKE_AFT_GRANDCHILD_MODE_ENV, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(StubError::Io)?;
+    let pid = child.id();
+    let creation = subc_os::start_time(pid).ok_or_else(|| {
+        StubError::Io(io::Error::other(
+            "containment witness creation time unavailable",
+        ))
+    })?;
+    let parent_creation = subc_os::start_time(std::process::id()).ok_or_else(|| {
+        StubError::Io(io::Error::other(
+            "containment witness parent creation time unavailable",
+        ))
+    })?;
+    record_event(
+        config,
+        json!({
+            "kind": "containment_witness_spawned",
+            "parent_pid": std::process::id(),
+            "parent_creation": parent_creation,
+            "pid": pid,
+            "creation": creation,
+        }),
+    )?;
+    // Dropping Child does not terminate the parked descendant. Its process and
+    // stderr writer must be reclaimed by the supervising process group or job.
+    drop(child);
     Ok(())
 }
 
@@ -699,6 +747,7 @@ where
 
     send_hello(&writer, &config).await?;
     expect_hello_ack(read_half).await?;
+    spawn_containment_witness_if_requested(&config)?;
 
     if let Some(path) = config.launch_nonce_path.clone() {
         write_launch_nonce(&path, config.launch_nonce.as_deref())?;
@@ -993,20 +1042,25 @@ async fn handle_frame(
                 ModuleControlCommand::Draining {
                     reason,
                     deadline_ms,
-                } => record_event(
-                    config,
-                    json!({
-                        "kind": "draining",
-                        "reason": reason,
-                        "deadline_ms": deadline_ms,
-                        "shutdown_marker_seen": env::var_os("FAKE_AFT_SHUTDOWN_JOURNAL")
-                            .and_then(|path| fs::read_to_string(path).ok())
-                            .is_some_and(|journal| journal.lines().any(|line| {
-                                serde_json::from_str::<Value>(line).is_ok_and(|entry|
-                                    entry["event"] == "daemon_shutdown")
-                            })),
-                    }),
-                )?,
+                } => {
+                    record_event(
+                        config,
+                        json!({
+                            "kind": "draining",
+                            "reason": reason,
+                            "deadline_ms": deadline_ms,
+                            "shutdown_marker_seen": env::var_os("FAKE_AFT_SHUTDOWN_JOURNAL")
+                                .and_then(|path| fs::read_to_string(path).ok())
+                                .is_some_and(|journal| journal.lines().any(|line| {
+                                    serde_json::from_str::<Value>(line).is_ok_and(|entry|
+                                        entry["event"] == "daemon_shutdown")
+                                })),
+                        }),
+                    )?;
+                    for request in std::mem::take(&mut state.respond_on_draining) {
+                        emit_response(writer, config, request).await?;
+                    }
+                }
             }
             Ok(true)
         }
@@ -1057,6 +1111,9 @@ async fn handle_frame(
                     "body_json": serde_json::from_slice::<Value>(&frame.body).ok(),
                 }),
             )?;
+            if env_flag(FAKE_AFT_CRASH_ON_REQUEST_ENV) {
+                std::process::exit(2);
+            }
             let behavior = request_behavior(config, &frame.body);
             let fanout_channels = state
                 .bound_channels
@@ -1066,7 +1123,20 @@ async fn handle_frame(
             let request_writer = writer.clone();
             let request_config = config.clone();
 
-            if behavior.delay.is_zero() {
+            if behavior.respond_on_draining {
+                // A held request can settle only after the drain command arrives;
+                // unlike a timed delay, this proves notice-before-quiescence.
+                send_requested_pushes(
+                    writer,
+                    config,
+                    frame.header.ver,
+                    frame.header.channel,
+                    frame.header.epoch,
+                    &fanout_channels,
+                )
+                .await?;
+                state.respond_on_draining.push(frame);
+            } else if behavior.delay.is_zero() {
                 handle_data_request(
                     request_writer,
                     frame,
@@ -1405,6 +1475,7 @@ async fn handle_control_request(
             role_versions,
             admission_facts,
             scope,
+            call_mode: _,
         } => {
             state.tentative_channels.insert(route_channel, epoch);
             record_event(
@@ -1747,6 +1818,7 @@ async fn send_outbound(writer: &mpsc::Sender<Frame>, frame: Frame) -> Result<(),
 struct RequestBehavior {
     delay: Duration,
     cancellable: bool,
+    respond_on_draining: bool,
 }
 
 /// A route request is a tool call when it decodes as the shared tool-call
@@ -1770,6 +1842,7 @@ fn request_behavior(config: &StubConfig, body: &[u8]) -> RequestBehavior {
         return RequestBehavior {
             delay,
             cancellable: true,
+            respond_on_draining: false,
         };
     }
 
@@ -1777,6 +1850,7 @@ fn request_behavior(config: &StubConfig, body: &[u8]) -> RequestBehavior {
         return RequestBehavior {
             delay: Duration::ZERO,
             cancellable: true,
+            respond_on_draining: false,
         };
     }
 
@@ -1795,6 +1869,10 @@ fn request_behavior(config: &StubConfig, body: &[u8]) -> RequestBehavior {
     RequestBehavior {
         delay: Duration::from_millis(delay_ms),
         cancellable: !uncancellable,
+        respond_on_draining: parsed
+            .as_ref()
+            .and_then(|value| value.get("respond_on_draining").and_then(Value::as_bool))
+            .unwrap_or(false),
     }
 }
 
@@ -2095,6 +2173,7 @@ struct StubState {
     tentative_channels: BTreeMap<u16, u32>,
     route_bind_count: usize,
     in_flight: InFlightRegistry,
+    respond_on_draining: Vec<Frame>,
 }
 
 impl Default for StubState {
@@ -2104,6 +2183,7 @@ impl Default for StubState {
             tentative_channels: BTreeMap::new(),
             route_bind_count: 0,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
+            respond_on_draining: Vec::new(),
         }
     }
 }

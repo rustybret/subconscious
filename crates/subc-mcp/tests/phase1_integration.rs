@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+use cortexkit_test_support::ScratchDir;
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
 use std::{
     collections::BTreeMap,
     env, fs,
@@ -14,7 +17,6 @@ use std::{
     },
     time::Duration,
 };
-use subc_test_support::TestTempDir;
 
 use rmcp::{
     model::{
@@ -100,7 +102,7 @@ struct TestDaemon {
     registry: Arc<Registry>,
     forwarding: Arc<ForwardingTable>,
     connection_file_path: PathBuf,
-    temp_dir: TestTempDir,
+    temp_dir: ScratchDir,
     task: JoinHandle<Result<(), subc_daemon::ServerError>>,
 }
 
@@ -138,7 +140,7 @@ impl TestServer {
 }
 
 struct TestProject {
-    path: TestTempDir,
+    path: ScratchDir,
 }
 
 impl TestProject {
@@ -504,6 +506,22 @@ impl ScriptedProvider {
         {
             ScriptedProviderEvent::ReverseResponse { body, .. } => body,
             other => panic!("expected reverse response event, got {other:?}"),
+        }
+    }
+
+    async fn wait_reverse_outcome(&mut self, corr: u64) -> Result<Value, Value> {
+        match self
+            .wait_for_event("reverse outcome", |event| {
+                matches!(event,
+                ScriptedProviderEvent::ReverseResponse { corr: event_corr, .. }
+                | ScriptedProviderEvent::ReverseError { corr: event_corr, .. }
+                if *event_corr == corr)
+            })
+            .await
+        {
+            ScriptedProviderEvent::ReverseResponse { body, .. } => Ok(body),
+            ScriptedProviderEvent::ReverseError { body, .. } => Err(body),
+            other => panic!("expected reverse outcome event, got {other:?}"),
         }
     }
 
@@ -1073,17 +1091,15 @@ async fn mcp_initialize_publishes_reverse_peer_before_initialized_notification()
         .provider
         .send_reverse_request(route, 907, elicitation_body("initialize-boundary"))
         .await;
-    let (raw_stdin, raw_stdout) = tokio::select! {
-        result = raw_client => result.expect("raw MCP client should handle elicitation"),
-        error = harness.provider.wait_reverse_error(907) => {
-            panic!("reverse request was rejected after initialize instead of reaching the host: {error}")
-        }
-    };
+    let (raw_client_result, provider_response) =
+        wait_reverse_outcome_and_client(raw_client, harness.provider.wait_reverse_outcome(907))
+            .await;
+    let (raw_stdin, raw_stdout) =
+        raw_client_result.expect("raw MCP client should handle elicitation");
     wait_for_atomic_at_least(&prompt_count, 1, "pre-initialized elicitation prompts").await;
     harness.shim.stdin = Some(raw_stdin);
     harness.shim.stdout = Some(raw_stdout);
 
-    let provider_response = harness.provider.wait_reverse_response(907).await;
     assert_eq!(
         provider_response.pointer("/content/initializeBoundary"),
         Some(&Value::Bool(true))
@@ -1100,6 +1116,64 @@ async fn mcp_initialize_publishes_reverse_peer_before_initialized_notification()
     .await;
     drop(harness.shim.stdin.take());
     harness.shutdown().await;
+}
+
+async fn wait_reverse_outcome_and_client<T>(
+    client: impl std::future::Future<Output = T>,
+    outcome: impl std::future::Future<Output = Result<Value, Value>>,
+) -> (T, Value) {
+    tokio::pin!(client, outcome);
+    // A response can reach the provider before the client's stdio flush future
+    // resumes. Consume response and error through one waiter, and retain a
+    // response-first result rather than discarding it while waiting for errors.
+    let require_response = |result: Result<Value, Value>| {
+        result.unwrap_or_else(|error| {
+        panic!("reverse request was rejected after initialize instead of reaching the host: {error}")
+    })
+    };
+    tokio::select! {
+        result = &mut client => (result, require_response(outcome.await)),
+        reply = &mut outcome => {
+            let response = require_response(reply);
+            (client.await, response)
+        }
+    }
+}
+
+#[tokio::test]
+async fn reverse_initialize_retains_a_response_before_client_completion() {
+    let (command_tx, _command_rx) = mpsc::channel(1);
+    let (events_tx, events_rx) = mpsc::channel(1);
+    let mut provider = ScriptedProvider {
+        module_id: "response-first".into(),
+        tool_name: "probe".into(),
+        command_tx,
+        events_rx,
+        task: tokio::spawn(async {}),
+    };
+    let expected = json!({"content": {"initializeBoundary": true}});
+    events_tx
+        .send(ScriptedProviderEvent::ReverseResponse {
+            corr: 907,
+            body: expected.clone(),
+        })
+        .await
+        .unwrap();
+    let (release_client, client_released) = tokio::sync::oneshot::channel();
+    let outcome = async {
+        let reply = provider.wait_reverse_outcome(907).await;
+        release_client.send(()).unwrap();
+        reply
+    };
+    let client = async {
+        client_released.await.unwrap();
+        "client completed"
+    };
+    let (client_result, response) = wait_reverse_outcome_and_client(client, outcome).await;
+    assert_eq!(client_result, "client completed");
+    assert_eq!(response, expected);
+    assert!(provider.events_rx.try_recv().is_err());
+    provider.task.await.unwrap();
 }
 
 #[tokio::test]
@@ -4027,7 +4101,7 @@ async fn mcp_module_without_spawn_attestation_exits_loud_before_serving() {
     let xdg_config_home = server.daemon.temp_dir.join("mcp-unattested-xdg-config");
     fs::create_dir_all(&xdg_config_home).unwrap();
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ck-subc-mcp"));
+    let mut command = Command::from(cortexkit_test_support::dev_command(ckdev_subc_mcp()));
     command
         .arg("module")
         .arg("--subc")
@@ -4284,16 +4358,70 @@ async fn start_test_daemon_with_process_liveness_and_supervisor(
     }
 }
 
+#[cfg(target_os = "macos")]
+fn privacy_trampoline() -> PathBuf {
+    static TRAMPOLINE: OnceLock<PathBuf> = OnceLock::new();
+    TRAMPOLINE
+        .get_or_init(|| {
+            let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let output = process::Command::new("cargo")
+                .args([
+                    "build",
+                    "--locked",
+                    "-p",
+                    "subc-core",
+                    "--bin",
+                    "ck-subc",
+                    "--message-format=json-render-diagnostics",
+                ])
+                .current_dir(workspace)
+                .output()
+                .expect("build the ck-subc privacy trampoline");
+            assert!(
+                output.status.success(),
+                "building ck-subc privacy trampoline failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let built_binary = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find_map(|message| {
+                    (message["reason"] == "compiler-artifact"
+                        && message["target"]["name"] == "ck-subc")
+                        .then(|| message["executable"].as_str().map(PathBuf::from))
+                        .flatten()
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Cargo did not report the ck-subc executable\nstdout:\n{}\nstderr:\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    )
+                });
+            assert!(
+                built_binary.exists(),
+                "ck-subc privacy trampoline was not built at {}",
+                built_binary.display()
+            );
+            cortexkit_test_support::ckdev_binary(built_binary)
+        })
+        .clone()
+}
+
 fn supervisor(server: &TestServer) -> Supervisor {
-    Supervisor::new(
+    let supervisor = Supervisor::new(
         Arc::clone(&server.daemon.registry),
         RestartPolicy::new(0, Duration::ZERO),
-    )
-    .with_process_liveness(Arc::clone(&server.process_liveness))
-    .with_forwarding(Arc::clone(&server.daemon.forwarding))
-    .with_handle(server.supervisor_handle.clone())
-    .with_drain_timeout(Duration::from_millis(25))
-    .with_connection_file_path(server.daemon.connection_file_path.clone())
+    );
+    #[cfg(target_os = "macos")]
+    let supervisor = supervisor.with_privacy_trampoline(privacy_trampoline());
+    supervisor
+        .with_process_liveness(Arc::clone(&server.process_liveness))
+        .with_forwarding(Arc::clone(&server.daemon.forwarding))
+        .with_handle(server.supervisor_handle.clone())
+        .with_drain_timeout(Duration::from_millis(25))
+        .with_connection_file_path(server.daemon.connection_file_path.clone())
 }
 
 fn stub_spec(module_id: &str, events_path: &Path, extra_env: &[(&str, &str)]) -> ModuleSpec {
@@ -4330,6 +4458,12 @@ fn stub_spec(module_id: &str, events_path: &Path, extra_env: &[(&str, &str)]) ->
     }
 }
 
+/// `ck-subc-mcp` published as `ckdev-subc-mcp`, so the module and
+/// shim processes these tests start are never listed under the production name.
+fn ckdev_subc_mcp() -> PathBuf {
+    cortexkit_test_support::ckdev_binary(env!("CARGO_BIN_EXE_ck-subc-mcp"))
+}
+
 fn mcp_module_spec(
     module_id: &str,
     module_connection_file: &Path,
@@ -4337,7 +4471,7 @@ fn mcp_module_spec(
 ) -> ModuleSpec {
     ModuleSpec {
         module_id: module_id.to_owned(),
-        program: PathBuf::from(env!("CARGO_BIN_EXE_ck-subc-mcp")),
+        program: ckdev_subc_mcp(),
         args: vec![
             "module".to_string(),
             "--connection-file".to_string(),
@@ -4438,7 +4572,7 @@ fn module_command(
     module_connection_file: &Path,
     xdg_config_home: &Path,
 ) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ck-subc-mcp"));
+    let mut command = Command::from(cortexkit_test_support::dev_command(ckdev_subc_mcp()));
     command
         .arg("module")
         .arg("--subc")
@@ -4480,7 +4614,7 @@ fn spawn_shim(
     project_root: &Path,
     xdg_config_home: &Path,
 ) -> ShimProcess {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ck-subc-mcp"));
+    let mut command = Command::from(cortexkit_test_support::dev_command(ckdev_subc_mcp()));
     command
         .arg("shim")
         .arg("--module-connection-file")
@@ -5132,8 +5266,8 @@ fn assert_unknown_tool_error(error: ServiceError, name: &str) {
     }
 }
 
-fn unique_temp_dir(label: &str) -> TestTempDir {
-    TestTempDir::new(label)
+fn unique_temp_dir(label: &str) -> ScratchDir {
+    ScratchDir::new(label)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5189,11 +5323,10 @@ async fn real_mcp_hello_declares_build_provenance() {
 }
 
 /// Where a supervised module gets its launch nonce on this platform: the daemon
-/// hands it over on a pipe on Unix, and only in the environment on Windows,
-/// which has no pipe handover yet.
+/// hands it over on an inherited Unix pipe or a PID-authenticated Windows pipe.
 fn expected_launch_nonce_source() -> subc_protocol::manifest::LaunchNonceSource {
     if cfg!(windows) {
-        subc_protocol::manifest::LaunchNonceSource::Env
+        subc_protocol::manifest::LaunchNonceSource::Pipe
     } else {
         subc_protocol::manifest::LaunchNonceSource::Fd
     }

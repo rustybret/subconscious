@@ -100,7 +100,7 @@ set -euo pipefail
 
 STAGING="${CK_STAGING:-$HOME/.local/share/cortexkit/staging}"
 BIN_DIR="${CK_BIN_DIR:-$HOME/.local/share/cortexkit/bin}"
-MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0; ALLOW_UNSTRIPPED=0; INSTALL=0
+MODULE=""; STAGED=""; DEST=""; PATH_FACE=""; MARKER=""; CONTROL=""; OLD_CONTROL=""; GONE=""; RESTART=1; PLACE=0; OLDER=0; MIGRATES=""; NEW_REQUIREMENT=""; ALLOW_UNHARDENED=0; ALLOW_UNSTRIPPED=0; ALLOW_UNSTAMPED=0; INSTALL=0
 
 while (($# > 0)); do
   case "$1" in
@@ -125,6 +125,10 @@ while (($# > 0)); do
     # are built stripped; this lets an incident placement of an unstripped build
     # through on purpose.
     --allow-unstripped) ALLOW_UNSTRIPPED=1; shift ;;
+    # A build that stamps no commit (it was built from a dirty tree, or outside
+    # git) cannot prove which source it came from. This lets one through on
+    # purpose, for an incident; the output says it was unstamped.
+    --allow-unstamped) ALLOW_UNSTAMPED=1; shift ;;
     --before) BEFORE_CMD="$2"; shift 2 ;;
     # A card that MIGRATES THE STORE cannot be rolled back by binary alone: the
     # old binary meets a newer schema and refuses on store_ahead, which is the
@@ -361,6 +365,48 @@ for cand in "$(dirname "$staged_dir")/$CUR.current" \
     exit 2
   fi
 done
+# A currency declaration is the module owner's statement of which staged build
+# is live. It comes in two shapes: key=value ("stage=<path>", checked above)
+# and the older positional "<sha256>  <file>  <stamp>". The check above reads
+# only the key=value shape, so a leftover positional file naming an older
+# build could sit beside a correct key=value one and never be read. Here every
+# declaration, in either shape, either names the artifact being placed or
+# names something else. If some do and some don't, the owner's statement is
+# ambiguous, and the gate refuses even with --older, since --older means
+# "place an older build on purpose", not "ignore a contradiction".
+have_sha_all=$(shasum -a256 "$STAGED" | awk '{print $1}')
+yes_decls=""; no_decls=""
+for cand in "$(dirname "$staged_dir")/$CUR.current" \
+            "$staged_dir/$CUR.current" \
+            "$(dirname "$staged_dir")/ck-$CUR.current" \
+            "$staged_dir/ck-$CUR.current"; do
+  [ -f "$cand" ] || continue
+  if grep -q '^stage=' "$cand" 2>/dev/null; then
+    decl_stage=$(awk -F= '$1=="stage"{print $2}' "$cand")
+    case "$decl_stage" in
+      /*) ;;
+      *) decl_stage="$(cd "$(dirname "$cand")" && pwd)/$decl_stage" ;;
+    esac
+    if [ "$staged_dir" = "$decl_stage" ] || [ "$STAGED" = "$decl_stage" ]; then
+      yes_decls="$yes_decls $cand"
+    else
+      no_decls="$no_decls $cand"
+    fi
+  else
+    if [ "$(awk 'NR==1{print $1}' "$cand")" = "$have_sha_all" ]; then
+      yes_decls="$yes_decls $cand"
+    else
+      no_decls="$no_decls $cand"
+    fi
+  fi
+done
+if [ -n "$yes_decls" ] && [ -n "$no_decls" ]; then
+  echo "REFUSED: currency declarations for $CUR disagree about which artifact is live" >&2
+  echo "         name $(basename "$STAGED"):$yes_decls" >&2
+  echo "         name something else:$no_decls" >&2
+  echo "         Remove the stale one (record its content first), then retry." >&2
+  exit 2
+fi
 manifest="$staged_dir/ck-$CUR.current"
 staged_base=$(basename "$STAGED")
 if [ -n "$root_manifest" ]; then
@@ -445,6 +491,59 @@ else
   fi
 fi
 
+# The sidecar and the currency declaration prove the bytes are the staged file
+# the owner named; they do not prove those bytes were built from the commit the
+# owner named. A module's `--manifest` reports its build provenance: the commit
+# it was built from, or why it stamped none (a dirty tree declines to stamp).
+# Entorhinal 0.1.22 and 0.1.23 were both placed from dirty trees, attesting no
+# commit, and nothing here noticed. So: refuse an unstamped build, and refuse a
+# stamped commit that disagrees with the declared revision, unless
+# --allow-unstamped is given on purpose.
+#
+# The probe runs the staged binary with only `--manifest`, under a throwaway
+# XDG home and a 5 s alarm, so a binary that does not know the flag cannot touch
+# real stores or hang the gate. A binary that does not answer is reported as
+# unchecked rather than refused: not every module serves `--manifest` yet.
+prov_home=$(mktemp -d)
+prov_json=$(XDG_DATA_HOME="$prov_home/data" XDG_RUNTIME_DIR="$prov_home/run" XDG_CONFIG_HOME="$prov_home/config" \
+  perl -e 'alarm 5; exec @ARGV' "$STAGED" --manifest 2>/dev/null </dev/null) || prov_json=""
+rm -rf "$prov_home"
+prov_line=$(printf '%s' "$prov_json" | python3 -c '
+import json, sys
+try:
+    p = json.load(sys.stdin).get("provenance") or {}
+except Exception:
+    print("unreported"); sys.exit(0)
+sha = p.get("build_git_sha") or ""
+why = p.get("build_git_sha_absence_reason") or ""
+print("stamped " + sha if sha else ("unstamped " + why if why else "unreported"))
+' 2>/dev/null || echo unreported)
+case "$prov_line" in
+  "stamped "*)
+    stamped=${prov_line#stamped }
+    if [ -n "${want_rev:-}" ]; then
+      n=${#stamped}; [ ${#want_rev} -lt "$n" ] && n=${#want_rev}
+      if [ "${stamped:0:$n}" = "${want_rev:0:$n}" ]; then
+        say "provenance: built from ${stamped:0:12}, matching the declared revision"
+      elif [ "$ALLOW_UNSTAMPED" -eq 1 ]; then
+        say "provenance: built from ${stamped:0:12}, NOT the declared ${want_rev:0:12} (--allow-unstamped given)"
+      else
+        refuse "staged binary was built from ${stamped:0:12}, but the currency declaration names revision ${want_rev:0:12}. Rebuild from the declared commit, fix the declaration, or pass --allow-unstamped on purpose"
+      fi
+    else
+      say "provenance: built from ${stamped:0:12}; no declared revision to compare (the declaration has no revision=)"
+    fi ;;
+  "unstamped "*)
+    why=${prov_line#unstamped }
+    if [ "$ALLOW_UNSTAMPED" -eq 1 ]; then
+      say "provenance: build stamps no commit ($why); placed unstamped by request (--allow-unstamped)"
+    else
+      refuse "staged binary stamps no commit ($why), so it cannot prove which source it was built from. Rebuild from a clean tree, or pass --allow-unstamped on purpose"
+    fi ;;
+  *)
+    say "provenance: not checked (the binary did not answer --manifest)" ;;
+esac
+
 # Signing posture must match the running image: an ad-hoc re-sign of a Developer ID
 # binary silently revokes its macOS TCC grants, and the reverse is a surprise too.
 # The posture is every field a grant or the loader keys on, not just the signer:
@@ -464,7 +563,7 @@ signing_posture() {
 # change a placement may make, and only from off to on. Each module holds a launch
 # nonce that admits any connection presenting it as that module; hardened runtime
 # is what stops another process of the same user attaching a debugger and reading
-# it (docs/designs/launch-nonce-descriptor.md). Modules gain the flag one placement
+# it (docs/launch-nonce.md). Modules gain the flag one placement
 # at a time, so an exact match on it would refuse every module's first hardened
 # build. Removing it is refused, because that lets same-user processes attach again.
 cd_flags() {

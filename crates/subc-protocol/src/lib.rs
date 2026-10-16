@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 
 pub use machine_id::{MachineId, MachineIdError};
 
+pub mod call_mode;
 pub mod frame;
 pub mod machine_id;
 pub mod manifest;
@@ -43,7 +44,7 @@ pub mod scope;
 pub mod session;
 pub mod tool_call;
 
-/// Canonical error codes emitted while opening a client route.
+/// Canonical error codes emitted by subc.
 ///
 /// Error frames remain extensible strings, but these daemon-owned route-open
 /// outcomes need identical spelling across the daemon and SDK retry policies.
@@ -52,6 +53,10 @@ pub mod error_codes {
 
     pub const UNKNOWN_CHANNEL: &str = "unknown_channel";
     pub const STALE_ROUTE_EPOCH: &str = "stale_route_epoch";
+    /// A module reply exceeds the client connection's whole egress byte budget.
+    /// TERMINAL for this request: the module already received it, and retrying
+    /// unchanged would produce the same oversized reply. The route stays open.
+    pub const FRAME_TOO_LARGE: &str = "frame_too_large";
     pub const UNKNOWN_MODULE: &str = "unknown_module";
     pub const MODULE_REMOVED: &str = "module_removed";
     /// The target module's endpoint is draining for a reload, restart or disable.
@@ -71,9 +76,15 @@ pub mod error_codes {
     pub const MODULE_WARMING: &str = "module_warming";
     pub const TARGET_UNAVAILABLE: &str = "target_unavailable";
     /// A flow-scoped route targets a module that does not provide
-    /// `flow-scopes/v1`. TERMINAL: decoding `flow_id` alone does not promise
-    /// flow behaviour, and removing it would silently change the identity.
+    /// either `flow-scopes/v1` or `call-modes/v1`. TERMINAL: decoding `flow_id`
+    /// alone does not promise flow behaviour, and removing it would silently
+    /// change the identity.
     pub const TARGET_FLOW_UNSUPPORTED: &str = "target_flow_unsupported";
+    /// An agent-run-scoped route targets a module providing neither
+    /// `agent-run-scopes/v1` nor `call-modes/v1`, or a delegating run targets a
+    /// module without `call-modes/v1`. TERMINAL: removing `run_id` or delegation
+    /// would silently change the identity or authority under which the route acts.
+    pub const TARGET_AGENT_RUN_UNSUPPORTED: &str = "target_agent_run_unsupported";
     pub const MODULE_TIMEOUT: &str = "module_timeout";
     /// The target module is declared as speaking no subc wire protocol
     /// (`protocol: "none"` in daemon config), so it has no control lane and can
@@ -115,39 +126,60 @@ pub mod error_codes {
     /// listed carrier, or it is a targeted carrier and the target module is not
     /// in its list. TERMINAL.
     pub const SCOPE_NOT_CARRIER: &str = "scope_not_carrier";
+    /// A scope with a bind-proof hash requires every opener, including its
+    /// owner, to present the proof. TERMINAL.
+    pub const SCOPE_BIND_PROOF_REQUIRED: &str = "scope_bind_proof_required";
+    /// The proof is malformed or does not match the scope's hash. TERMINAL.
+    pub const SCOPE_BIND_PROOF_MISMATCH: &str = "scope_bind_proof_mismatch";
+    /// An idle-only epoch/proof replacement found routes, admitted binds or
+    /// connected presence under the live epoch. Per-record refusal. TERMINAL.
+    pub const SCOPE_EPOCH_IN_USE: &str = "scope_epoch_in_use";
     /// Raised by a carrier, never by the daemon: the daemon does not advertise
     /// `scopes/v1`, so the carrier fails the call instead of opening an
     /// unscoped route.
     pub const SCOPE_UNSUPPORTED: &str = "scope_unsupported";
 
-    /// `scope.sync` came from a connection that is not the owner's sync
-    /// authority: another connection of the same launch holds it, or this
-    /// connection's launch is no longer the owner's current one (a blue/green
-    /// swap candidate before cutover, or an incumbent after it).
+    /// `scope.sync` or `scope.apply` came from a connection that is not the
+    /// owner's sync authority: another connection of the same launch holds it,
+    /// or this connection's launch is no longer the owner's current one (a
+    /// blue/green swap candidate before cutover, or an incumbent after it).
     pub const SCOPE_SYNC_NOT_AUTHORITY: &str = "scope_sync_not_authority";
-    /// `scope.sync` carried a generation no larger than the last one the
-    /// authority had accepted. The whole sync is refused and nothing changes.
+    /// `scope.apply` came from a connection that has not taken sync authority
+    /// through an accepted full `scope.sync`. The whole call changes nothing.
+    pub const SCOPE_SYNC_REQUIRED: &str = "scope_sync_required";
+    /// `scope.sync` or `scope.apply` carried a generation no larger than the last
+    /// one the authority accepted. The whole call is refused and nothing changes.
     pub const SCOPE_SYNC_STALE: &str = "scope_sync_stale";
-    /// `scope.sync` named more live scopes than one owner may hold. The whole
-    /// sync is refused and nothing changes.
+    /// `scope.sync` or `scope.apply` exceeds the owner's live-scope limit.
+    /// The whole call is refused and nothing changes.
     pub const SCOPE_LIVE_LIMIT_EXCEEDED: &str = "scope_live_limit_exceeded";
-    /// One record in a `scope.sync` carried more attribute bytes than a scope may
-    /// hold. The whole sync is refused and nothing changes.
+    /// One record in a `scope.sync` or `scope.apply` carried more attribute bytes
+    /// than a scope may hold. The whole call is refused and nothing changes.
     pub const SCOPE_ATTRIBUTES_TOO_LARGE: &str = "scope_attributes_too_large";
 
     // Per-record refusals: each is reported against one record in the
-    // `scope.sync` reply, that record keeps its previous state, and the rest
-    // of the sync applies.
+    // `scope.sync` or `scope.apply` reply. A refusal itself does not change the
+    // ref or undo expiry processing; other records in the call still apply.
 
     /// The record lowers the `scope_epoch` the daemon holds for its ref.
     pub const SCOPE_EPOCH_REGRESSED: &str = "scope_epoch_regressed";
     /// The record names an `(owner, ref, scope_epoch)` that already ended in
     /// this daemon incarnation; an ended session cannot come back.
     pub const SCOPE_EPOCH_ENDED: &str = "scope_epoch_ended";
+    /// The record's deadline has passed, or this ref at this epoch was ended by
+    /// expiry and its tombstone is still held. The same session epoch cannot
+    /// return.
+    pub const SCOPE_EXPIRED: &str = "scope_expired";
+    /// The record adds, removes or changes the deadline of a live scope at the
+    /// same epoch. A different deadline requires a new session epoch.
+    pub const SCOPE_EXPIRY_IMMUTABLE: &str = "scope_expiry_immutable";
+    /// The record's deadline is more than `scope::MAX_SCOPE_EXPIRY_AHEAD_MS`
+    /// ahead of the daemon's current Unix wall clock.
+    pub const SCOPE_EXPIRY_TOO_FAR: &str = "scope_expiry_too_far";
     /// The record changes `kind` at the same `scope_epoch`.
     pub const SCOPE_KIND_CHANGED: &str = "scope_kind_changed";
-    /// The record sets `agent_id` or `delegates` and its owner is not listed in
-    /// the daemon's `scope_authority_owners`.
+    /// The record sets `agent_id`, `delegates`, `flow_id` or `run_id` and its
+    /// owner is not listed in the daemon's `scope_authority_owners`.
     pub const SCOPE_ATTRIBUTE_NOT_PERMITTED: &str = "scope_attribute_not_permitted";
     /// The record's parent link is not permitted: the parent's owner has synced
     /// and the parent is not live at the named epoch, the syncing owner is
@@ -159,6 +191,28 @@ pub mod error_codes {
     pub const SCOPE_CARRIER_TARGETS_INVALID: &str = "scope_carrier_targets_invalid";
     /// The record sets `delegates` without an `agent_id` to delegate.
     pub const SCOPE_DELEGATES_WITHOUT_AGENT: &str = "scope_delegates_without_agent";
+    /// The record sets `run_id` without `agent_id`, the agent this run is on
+    /// behalf of.
+    pub const SCOPE_RUN_ID_WITHOUT_AGENT: &str = "scope_run_id_without_agent";
+    /// The record sets both `run_id` and `flow_id`; a run scope is not a flow scope.
+    pub const SCOPE_RUN_ID_WITH_FLOW_ID: &str = "scope_run_id_with_flow_id";
+    /// Legacy refusal for a record setting `run_id` with `delegates`.
+    /// No longer emitted by validation: run records may delegate, and route
+    /// admission instead requires a target providing `call-modes/v1`.
+    pub const SCOPE_RUN_ID_DELEGATES: &str = "scope_run_id_delegates";
+
+    /// An `operator.confirm` was declined or withdrawn. `detail.reason` is
+    /// `person`, `backoff`, `route_closed`, `module_closed` or `caller_cancelled`.
+    pub const OPERATOR_DECLINED: &str = "operator_declined";
+    /// An `operator.confirm` could not prompt or complete. `detail.reason` is
+    /// `no_presence`, `timeout`, `module_limit`, `queue_full`, `queue_wait`,
+    /// `provider_stuck`, `unsupported_platform` or `provider_error`.
+    pub const OPERATOR_PRESENCE_UNAVAILABLE: &str = "operator_presence_unavailable";
+    /// The summary of an `operator.confirm` breaks the daemon's summary rules.
+    pub const OPERATOR_SUMMARY_INVALID: &str = "operator_summary_invalid";
+    /// An `operator.confirm` is not from a nonce-proven module connection for
+    /// an open route with a verified opener on that connection.
+    pub const OPERATOR_REQUEST_NOT_PERMITTED: &str = "operator_request_not_permitted";
 
     /// Whether a `route.open` refusal carrying `code` may be retried in place
     /// within the caller's deadline, or is terminal for the target as named.
@@ -180,7 +234,14 @@ pub mod error_codes {
     /// that races an unsupervised module's HELLO owns its own retry; retrying
     /// in place only papers over that race for one narrow window.
     pub fn is_retryable_route_open(code: &str) -> bool {
-        if code == TARGET_FLOW_UNSUPPORTED {
+        if matches!(
+            code,
+            TARGET_FLOW_UNSUPPORTED
+                | TARGET_AGENT_RUN_UNSUPPORTED
+                | SCOPE_BIND_PROOF_REQUIRED
+                | SCOPE_BIND_PROOF_MISMATCH
+                | SCOPE_EPOCH_IN_USE
+        ) {
             return false;
         }
         matches!(
@@ -227,14 +288,14 @@ pub enum RouteCloseReason {
     /// A live route became forbidden because newly attested capability metadata
     /// matched its supervised opening module's deny edge.
     CapabilityDenied,
-    /// The route's scope ended: its owner removed it, or replaced it with a
-    /// higher `scope_epoch` (a new session under the same ref).
+    /// The route's scope ended: it expired, its owner ended it, or replaced it
+    /// with a higher `scope_epoch` (a new session under the same ref).
     ScopeEnded,
     /// The route's opener is no longer a listed carrier of its scope, or the
     /// route's target was removed from that carrier's target list.
     ScopeCarrierRemoved,
-    /// The scope's `delegates` went from true to false, or its `agent_id`
-    /// changed.
+    /// The scope's `delegates` went from true to false, or its `agent_id`,
+    /// `flow_id` or `run_id` changed.
     ScopeDelegationChanged,
     /// The scope's parent ended, so its stamp no longer names a live parent.
     ScopeParentEnded,

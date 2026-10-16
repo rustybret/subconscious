@@ -80,6 +80,65 @@ pub trait CommandRunner {
     fn run(&mut self, program: &str, args: &[String]) -> Result<CommandResult, String>;
 }
 
+impl<R: CommandRunner + ?Sized> CommandRunner for Box<R> {
+    fn run(&mut self, program: &str, args: &[String]) -> Result<CommandResult, String> {
+        (**self).run(program, args)
+    }
+}
+
+const USER_MANAGER_HINT: &str = "refusal: systemd-user-manager-unavailable: systemd is available, but no user session bus is reachable. Log in normally, or run `loginctl enable-linger $USER` then start a new login session; if it exists, export `XDG_RUNTIME_DIR=/run/user/$(id -u)`.";
+const SYSTEMD_UNAVAILABLE: &str = "refusal: systemd-unavailable: Linux setup is unsupported because systemd is not available on this host.";
+
+/// Check before setup reads release metadata or changes any files.
+pub fn preflight<R: CommandRunner>(
+    platform: RuntimePlatform,
+    runner: &mut R,
+) -> Result<(), String> {
+    if platform != RuntimePlatform::Linux {
+        return Ok(());
+    }
+
+    let args = vec!["--user".to_string(), "show-environment".to_string()];
+    let result = runner
+        .run("systemctl", &args)
+        .map_err(|_| SYSTEMD_UNAVAILABLE.to_string())?;
+    if result.success {
+        return Ok(());
+    }
+
+    // A running system manager distinguishes a missing user session from a
+    // host that cannot run systemd at all.
+    let system_result = runner
+        .run("systemctl", &["show-environment".to_string()])
+        .map_err(|_| SYSTEMD_UNAVAILABLE.to_string())?;
+    if !system_result.success {
+        return Err(SYSTEMD_UNAVAILABLE.to_string());
+    }
+
+    Err(USER_MANAGER_HINT.to_string())
+}
+
+/// Return the operator hint only when loginctl confirms linger is disabled.
+pub fn linger_hint<R: CommandRunner>(
+    platform: RuntimePlatform,
+    runner: &mut R,
+) -> Option<&'static str> {
+    if platform != RuntimePlatform::Linux {
+        return None;
+    }
+
+    let args = vec![
+        "show-user".to_string(),
+        current_uid().to_string(),
+        "-p".to_string(),
+        "Linger".to_string(),
+    ];
+    let result = runner.run("loginctl", &args).ok()?;
+    (result.success && result.stdout.lines().any(|line| line.trim() == "Linger=no")).then_some(
+        "The daemon stops at logout; run `loginctl enable-linger $USER` to keep it running.",
+    )
+}
+
 pub struct SystemCommandRunner;
 
 impl CommandRunner for SystemCommandRunner {
@@ -127,12 +186,42 @@ pub fn runtime_paths(platform: RuntimePlatform, home: &Path, data_home: &Path) -
 /// leaves a margin of several seconds.
 pub const DAEMON_STOP_TIMEOUT_SECS: u64 = 35;
 
-pub fn desired_definition(platform: RuntimePlatform, paths: &RuntimePaths) -> String {
+// Tests render definitions without going through setup's error path.
+#[cfg(test)]
+fn desired_definition(platform: RuntimePlatform, paths: &RuntimePaths) -> String {
+    let windows_user = if platform == RuntimePlatform::Windows {
+        current_windows_user().unwrap_or_else(|error| panic!("{error}"))
+    } else {
+        String::new()
+    };
+    desired_definition_for_user(platform, paths, &windows_user)
+}
+
+// Setup resolves the Windows account first so a missing account is a setup
+// error with a message rather than a panic.
+fn desired_definition_checked(
+    platform: RuntimePlatform,
+    paths: &RuntimePaths,
+) -> Result<String, String> {
+    let windows_user = if platform == RuntimePlatform::Windows {
+        current_windows_user()?
+    } else {
+        String::new()
+    };
+    Ok(desired_definition_for_user(platform, paths, &windows_user))
+}
+
+fn desired_definition_for_user(
+    platform: RuntimePlatform,
+    paths: &RuntimePaths,
+    windows_user: &str,
+) -> String {
     let raw_daemon = paths.daemon.to_string_lossy();
     let daemon = match platform {
         RuntimePlatform::Linux => systemd_argument(&raw_daemon),
         RuntimePlatform::Macos | RuntimePlatform::Windows => xml_text(&raw_daemon),
     };
+    let windows_user = xml_text(windows_user);
     match platform {
         // NO AbandonProcessGroup, deliberately. launchd's default kills what is
         // left in the job's process group when the daemon exits. Supervised
@@ -166,9 +255,31 @@ pub fn desired_definition(platform: RuntimePlatform, paths: &RuntimePaths) -> St
         // any bytes, which is how this shipped without it; the test on this
         // template pins the namespace for that reason.
         RuntimePlatform::Windows => format!(
-            "<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo><URI>\\CortexKit\\subc-daemon</URI></RegistrationInfo><Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers><Principals><Principal id=\"Author\"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Actions Context=\"Author\"><Exec><Command>{daemon}</Command></Exec></Actions></Task>\n"
+            "<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo><URI>\\CortexKit\\subc-daemon</URI></RegistrationInfo><Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{windows_user}</UserId></LogonTrigger></Triggers><Principals><Principal id=\"Author\"><UserId>{windows_user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Actions Context=\"Author\"><Exec><Command>{daemon}</Command></Exec></Actions></Task>\n"
         ),
     }
+}
+
+// Windows exposes the current logon account as USERDOMAIN and USERNAME. Using
+// both scopes the task to this account instead of requiring permission to
+// register a task for every user.
+#[cfg(windows)]
+fn current_windows_user() -> Result<String, String> {
+    let read = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                format!("cannot register the logon task: {name} is not set, so the current Windows account is unknown")
+            })
+    };
+    Ok(format!("{}\\{}", read("USERDOMAIN")?, read("USERNAME")?))
+}
+
+// Only tests render Windows task definitions on other hosts; they get a stable account.
+#[cfg(not(windows))]
+fn current_windows_user() -> Result<String, String> {
+    Ok("TESTDOMAIN\\testuser".to_string())
 }
 
 fn xml_text(value: &str) -> String {
@@ -288,7 +399,7 @@ pub fn ensure<R: CommandRunner>(
     runner: &mut R,
     inventory: &mut Inventory,
 ) -> Result<(), String> {
-    let desired = desired_definition(platform, paths);
+    let desired = desired_definition_checked(platform, paths)?;
     let current = fs::read_to_string(&paths.definition).ok();
     let needs_definition = current.as_deref() != Some(desired.as_str());
     if needs_definition && platform == RuntimePlatform::Macos && status.registered && status.live {
@@ -471,6 +582,13 @@ pub fn deregister<R: CommandRunner>(
     ))
 }
 
+fn is_access_denied(explanation: &str) -> bool {
+    let explanation = explanation.to_ascii_lowercase();
+    explanation.contains("access is denied")
+        || explanation.contains("access denied")
+        || explanation.contains("0x80070005")
+}
+
 fn register<R: CommandRunner>(
     platform: RuntimePlatform,
     paths: &RuntimePaths,
@@ -503,11 +621,23 @@ fn register<R: CommandRunner>(
     };
     let result = runner.run(program, &args)?;
     if !result.success {
+        let explanation = result.explanation();
+        if platform == RuntimePlatform::Windows && is_access_denied(&explanation) {
+            // Setup registers the task for the current account only, which
+            // Windows allows without administrator rights. A denial here
+            // usually means a policy forbids scheduled tasks. Elevating with a
+            // different administrator account would register the daemon for
+            // that account, so it is not suggested.
+            return Err(format!(
+                "could not register {}: Task Scheduler refused to add a logon task for your account. ck setup needs no administrator rights for this, so a system policy may be blocking scheduled tasks. Task Scheduler said: {explanation}",
+                platform.identifier()
+            ));
+        }
         return Err(format!(
             "could not register {}: `{program} {}` said: {}",
             platform.identifier(),
             args.join(" "),
-            result.explanation()
+            explanation
         ));
     }
     if platform == RuntimePlatform::Linux {
@@ -710,7 +840,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
 
     #[derive(Default)]
     struct RecordingRunner {
@@ -729,8 +859,93 @@ mod tests {
         }
     }
 
-    fn fixture_dir(name: &str) -> TestTempDir {
-        TestTempDir::new(name)
+    fn fixture_dir(name: &str) -> ScratchDir {
+        ScratchDir::new(name)
+    }
+
+    struct LingerRunner {
+        output: String,
+        calls: usize,
+    }
+
+    impl CommandRunner for LingerRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<CommandResult, String> {
+            self.calls += 1;
+            assert_eq!(program, "loginctl");
+            assert_eq!(args.first().map(String::as_str), Some("show-user"));
+            assert_eq!(args.get(2).map(String::as_str), Some("-p"));
+            assert_eq!(args.get(3).map(String::as_str), Some("Linger"));
+            Ok(CommandResult {
+                success: true,
+                stdout: self.output.clone(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn linger_hint_is_shown_only_when_loginctl_reports_linger_off() {
+        let mut disabled = LingerRunner {
+            output: "Linger=no\n".to_string(),
+            calls: 0,
+        };
+        assert_eq!(
+            linger_hint(RuntimePlatform::Linux, &mut disabled),
+            Some("The daemon stops at logout; run `loginctl enable-linger $USER` to keep it running.")
+        );
+        assert_eq!(disabled.calls, 1);
+
+        let mut enabled = LingerRunner {
+            output: "Linger=yes\n".to_string(),
+            calls: 0,
+        };
+        assert_eq!(linger_hint(RuntimePlatform::Linux, &mut enabled), None);
+        assert_eq!(enabled.calls, 1);
+
+        let mut not_linux = LingerRunner {
+            output: "Linger=no\n".to_string(),
+            calls: 0,
+        };
+        assert_eq!(linger_hint(RuntimePlatform::Macos, &mut not_linux), None);
+        assert_eq!(not_linux.calls, 0);
+    }
+
+    #[test]
+    fn setup_refuses_when_the_system_service_manager_is_unavailable() {
+        let mut runner = RecordingRunner {
+            results: VecDeque::from([false, false]),
+            ..RecordingRunner::default()
+        };
+
+        let error = preflight(RuntimePlatform::Linux, &mut runner).unwrap_err();
+
+        assert!(error.contains("systemd-unavailable"), "{error}");
+        assert!(error.contains("unsupported"), "{error}");
+        assert_eq!(
+            runner.calls,
+            vec![
+                (
+                    "systemctl".to_string(),
+                    vec!["--user".to_string(), "show-environment".to_string()]
+                ),
+                (
+                    "systemctl".to_string(),
+                    vec!["show-environment".to_string()]
+                ),
+            ]
+        );
+    }
+
+    struct AccessDeniedRunner;
+
+    impl CommandRunner for AccessDeniedRunner {
+        fn run(&mut self, _program: &str, _args: &[String]) -> Result<CommandResult, String> {
+            Ok(CommandResult {
+                success: false,
+                stdout: String::new(),
+                stderr: "ERROR: Access is denied. (0x80070005)".to_string(),
+            })
+        }
     }
 
     /// Refuses every command with a reason on stderr, the way launchctl and
@@ -766,6 +981,18 @@ mod tests {
         let error = start(RuntimePlatform::Macos, &paths, &mut RefusingRunner).unwrap_err();
         assert!(error.contains("Bootstrap failed"), "{error}");
         assert!(error.contains("launchctl kickstart"), "{error}");
+    }
+
+    #[test]
+    fn windows_access_denied_says_no_elevation_is_needed() {
+        let root = fixture_dir("windows-access-denied");
+        let paths = runtime_paths(RuntimePlatform::Windows, root.path(), root.path());
+        let error =
+            register(RuntimePlatform::Windows, &paths, &mut AccessDeniedRunner).unwrap_err();
+
+        assert!(error.contains("needs no administrator rights"), "{error}");
+        assert!(!error.contains("Run as administrator"), "{error}");
+        assert!(error.contains("Access is denied"), "{error}");
     }
 
     /// Eighth finding of the macOS operator drive: the agent was bootstrapped
@@ -1009,7 +1236,7 @@ mod tests {
             RuntimePlatform::Linux,
             RuntimePlatform::Windows,
         ] {
-            let root = fixture_dir(platform.identifier());
+            let root = fixture_dir(&platform.identifier().replace(['/', '\\'], "-"));
             let paths = runtime_paths(platform, &root.join("bin"), &root);
             let manifest = root.join("installer-manifest.json");
             let mut inventory = Inventory::load(&manifest, "test").expect("inventory");
@@ -1301,20 +1528,43 @@ mod tests {
     }
 
     #[test]
+    fn windows_logon_trigger_is_scoped_to_the_current_user() {
+        let paths = runtime_paths(
+            RuntimePlatform::Windows,
+            Path::new("C:\\Users\\u\\AppData\\Local\\cortexkit\\bin"),
+            Path::new("C:\\Users\\u"),
+        );
+        let xml =
+            desired_definition_for_user(RuntimePlatform::Windows, &paths, "DOMAIN\\alice&operator");
+
+        assert!(
+            xml.contains("<LogonTrigger><Enabled>true</Enabled><UserId>DOMAIN\\alice&amp;operator</UserId></LogonTrigger>"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains("<Principal id=\"Author\"><UserId>DOMAIN\\alice&amp;operator</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal>"),
+            "{xml}"
+        );
+    }
+
+    #[test]
     fn windows_task_definition_carries_the_scheduler_namespace() {
         let paths = runtime_paths(
             RuntimePlatform::Windows,
             Path::new("C:\\Users\\u\\AppData\\Local\\cortexkit\\bin"),
             Path::new("C:\\Users\\u"),
         );
-        let xml = desired_definition(RuntimePlatform::Windows, &paths);
+        let xml =
+            desired_definition_for_user(RuntimePlatform::Windows, &paths, "TESTDOMAIN\\testuser");
         assert!(
             xml.starts_with(
                 "<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"
             ),
             "{xml}"
         );
-        assert!(xml.contains("<LogonTrigger><Enabled>true</Enabled></LogonTrigger>"));
+        assert!(xml.contains(
+            "<LogonTrigger><Enabled>true</Enabled><UserId>TESTDOMAIN\\testuser</UserId></LogonTrigger>"
+        ));
         // The path is rendered by the host's path joiner, so it is compared
         // to what runtime_paths produced rather than to a literal.
         let command = format!("<Command>{}</Command>", paths.daemon.to_string_lossy());

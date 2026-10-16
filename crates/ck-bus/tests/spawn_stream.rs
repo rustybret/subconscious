@@ -1,4 +1,4 @@
-//! Ladder row "Spawn-stream consumer" (slice 7 of `docs/specs/ck-bus-module.md`).
+//! Ladder row "Spawn-stream consumer" (slice 7 of `docs/ck-bus.md`).
 //!
 //! Serving side: none. No arm opens a Claustrum or Callosum route. The daemon arms run
 //! the acceptance daemon (the shape stubs registered, never reached) and drive ck-bus's
@@ -63,13 +63,13 @@ mod spawn_consumer;
 #[path = "support/mod.rs"]
 mod support;
 
+use cortexkit_test_support::ScratchDir;
 use std::{
     collections::{BTreeSet, VecDeque},
     path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use subc_test_support::TestTempDir;
 
 use async_trait::async_trait;
 use harness::{
@@ -103,8 +103,8 @@ fn cursor(incarnation: &str, seq: u64) -> SpawnCursor {
     }
 }
 
-fn store_dir(name: &str) -> TestTempDir {
-    TestTempDir::new(&format!("ckbus-spawn-stream-{name}"))
+fn store_dir(name: &str) -> ScratchDir {
+    ScratchDir::new(&format!("ckbus-spawn-stream-{name}"))
 }
 
 async fn until<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {

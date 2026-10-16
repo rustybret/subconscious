@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+pub use crate::activity::ActivityConfig;
 use cortexkit_log::Retention;
 use serde::Deserialize;
 use subc_control::ModuleProtocol;
@@ -51,15 +52,17 @@ pub enum RestartRequiredSection {
     AdmissionFactsCarrierModuleId,
     AdmissionFactsTargets,
     ScopeAuthorityOwners,
+    PrivilegedOperatorPrompt,
 }
 
 impl RestartRequiredSection {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Port,
         Self::Storage,
         Self::AdmissionFactsCarrierModuleId,
         Self::AdmissionFactsTargets,
         Self::ScopeAuthorityOwners,
+        Self::PrivilegedOperatorPrompt,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -69,8 +72,18 @@ impl RestartRequiredSection {
             Self::AdmissionFactsCarrierModuleId => "admission_facts_carrier_module_id",
             Self::AdmissionFactsTargets => "admission_facts_targets",
             Self::ScopeAuthorityOwners => "scope_authority_owners",
+            Self::PrivilegedOperatorPrompt => "privileged_operator_prompt",
         }
     }
+}
+
+/// Whether privileged client operations are only logged or require operator approval.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum PrivilegedOperatorPrompt {
+    #[default]
+    Log,
+    Enforce,
 }
 
 /// `scope_authority_owners` when the config does not set it: the session
@@ -151,6 +164,8 @@ impl LoggingConfig {
 pub struct DaemonConfig {
     pub path: PathBuf,
     pub port: Option<u16>,
+    /// Restart-required: rescan must not change the policy that guards rescan itself.
+    pub privileged_operator_prompt: PrivilegedOperatorPrompt,
     /// Daemon-wide default drain budget (ms) for module teardown: how long a
     /// drain waits for already-dispatched requests to finalize. `None` uses
     /// the built-in default (30s). Per-module `drain_timeout_ms` overrides.
@@ -371,7 +386,11 @@ pub enum DaemonConfigError {
 struct RawDaemonConfig {
     version: u32,
     #[serde(default)]
+    activity: ActivityConfig,
+    #[serde(default)]
     port: Option<u16>,
+    #[serde(default)]
+    privileged_operator_prompt: PrivilegedOperatorPrompt,
     #[serde(default)]
     drain_timeout_ms: Option<u64>,
     #[serde(default)]
@@ -549,6 +568,19 @@ pub fn load(path: impl AsRef<Path>) -> Result<Option<DaemonConfig>, DaemonConfig
     parse_doc(&doc, path).map(Some)
 }
 
+/// Load module configuration and activity retention from the same document.
+/// Reading once prevents an edit between reads from mixing two configurations
+/// during rescan, without adding fields to the public `DaemonConfig` struct.
+pub fn load_with_activity(
+    path: impl AsRef<Path>,
+) -> Result<Option<(DaemonConfig, ActivityConfig)>, DaemonConfigError> {
+    let path = path.as_ref();
+    let Some(doc) = read_config_doc(path)? else {
+        return Ok(None);
+    };
+    parse_doc_with_activity(&doc, path).map(Some)
+}
+
 /// Loads only the daemon-wide logging block for tracing initialization.
 ///
 /// The daemon installs its global subscriber before bootstrap parses the full
@@ -633,8 +665,14 @@ fn ensure_directory_private(path: &Path) -> Result<(), io::Error> {
     Ok(())
 }
 
-/// Windows has no mode bits to tighten; the directory is created on first use.
-#[cfg(not(unix))]
+/// A redirected run directory must not inherit access for other users. Windows
+/// receives a protected DACL at creation and narrows existing inherited grants.
+#[cfg(windows)]
+fn ensure_directory_private(path: &Path) -> Result<(), io::Error> {
+    subc_os::windows_acl::create_private_dir(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn ensure_directory_private(path: &Path) -> Result<(), io::Error> {
     if !path.exists() {
         fs::create_dir_all(path)?;
@@ -707,6 +745,13 @@ fn read_config_doc(path: &Path) -> Result<Option<String>, DaemonConfigError> {
 }
 
 fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> {
+    parse_doc_with_activity(doc, path).map(|(config, _)| config)
+}
+
+fn parse_doc_with_activity(
+    doc: &str,
+    path: &Path,
+) -> Result<(DaemonConfig, ActivityConfig), DaemonConfigError> {
     let json = jsonc_to_json(doc).map_err(|message| DaemonConfigError::InvalidJsonc {
         path: path.to_path_buf(),
         message,
@@ -902,18 +947,28 @@ fn parse_doc(doc: &str, path: &Path) -> Result<DaemonConfig, DaemonConfigError> 
         })
         .transpose()?;
 
-    Ok(DaemonConfig {
-        path: path.to_path_buf(),
-        port: raw.port,
-        drain_timeout_ms: default_drain_timeout_ms,
-        route_bind_relay_timeout_ms: default_route_bind_relay_timeout_ms,
-        modules,
-        storage,
-        admission_facts_carrier_module_id: raw.admission_facts_carrier_module_id,
-        admission_facts_targets: raw.admission_facts_targets,
-        scope_authority_owners,
-        reserved_capabilities: raw.reserved_capabilities,
-    })
+    if raw.activity.max_age_days == 0 || raw.activity.max_total_mb == 0 {
+        return Err(DaemonConfigError::InvalidValue {
+            path: path.to_path_buf(),
+            message: "activity.max_age_days and activity.max_total_mb must be positive".into(),
+        });
+    }
+    Ok((
+        DaemonConfig {
+            path: path.to_path_buf(),
+            port: raw.port,
+            privileged_operator_prompt: raw.privileged_operator_prompt,
+            drain_timeout_ms: default_drain_timeout_ms,
+            route_bind_relay_timeout_ms: default_route_bind_relay_timeout_ms,
+            modules,
+            storage,
+            admission_facts_carrier_module_id: raw.admission_facts_carrier_module_id,
+            admission_facts_targets: raw.admission_facts_targets,
+            scope_authority_owners,
+            reserved_capabilities: raw.reserved_capabilities,
+        },
+        raw.activity,
+    ))
 }
 
 fn parse_logging_config(
@@ -1428,11 +1483,44 @@ impl Error for DaemonConfigError {
     }
 }
 
+#[cfg(all(test, windows))]
+mod windows_run_dir_privacy_tests {
+    use super::ensure_directory_private;
+    use cortexkit_test_support::ScratchDir;
+    use subc_os::windows_acl::test_support::{
+        assert_dacl_owner_only, assert_owner_only, grant_everyone,
+    };
+
+    #[test]
+    fn windows_run_dir_has_exact_protected_dacl_at_creation() {
+        let root = ScratchDir::new("windows-run-dir-create");
+        grant_everyone(root.path());
+        let path = root.join("run");
+        ensure_directory_private(&path).unwrap();
+        assert_owner_only(&path, true, true);
+    }
+
+    #[test]
+    fn windows_run_dir_narrows_existing_inherited_descendants() {
+        let root = ScratchDir::new("windows-run-dir-existing");
+        grant_everyone(root.path());
+        let path = root.join("run");
+        std::fs::create_dir(&path).unwrap();
+        let child = path.join("old.log");
+        std::fs::write(&child, b"old log").unwrap();
+        ensure_directory_private(&path).unwrap();
+        // The folder and the file both existed before narrowing, so only their
+        // access lists change; an elevated test runner owns them as Administrators.
+        assert_dacl_owner_only(&path, true, true);
+        assert_dacl_owner_only(&child, false, false);
+    }
+}
+
 #[cfg(all(test, unix))]
 mod run_dir_privacy_tests {
+    use cortexkit_test_support::ScratchDir;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use subc_test_support::TestTempDir;
 
     /// Both arms of the thing that actually bit: a directory this code CREATES,
     /// and one it INHERITS from another creator. The second is the real case --
@@ -1441,7 +1529,7 @@ mod run_dir_privacy_tests {
     /// nothing anywhere it mattered.
     #[test]
     fn run_dir_is_created_private_and_an_inherited_wide_one_is_tightened() {
-        let temp = TestTempDir::new("subc-run-dir-privacy");
+        let temp = ScratchDir::new("subc-run-dir-privacy");
         let created = temp.path().join("cortexkit").join("run");
         super::ensure_directory_private(&created).expect("create run dir");
         let mode = fs::metadata(&created)
@@ -1702,8 +1790,43 @@ mod tests {
                 "admission_facts_carrier_module_id",
                 "admission_facts_targets",
                 "scope_authority_owners",
+                "privileged_operator_prompt",
             ]
         );
+    }
+
+    #[test]
+    fn privileged_operator_prompt_defaults_to_log_and_accepts_both_modes() {
+        let path = Path::new("/tmp/subc.jsonc");
+        let config = parse_doc(r#"{"version":1}"#, path).unwrap();
+        assert_eq!(
+            config.privileged_operator_prompt,
+            PrivilegedOperatorPrompt::Log
+        );
+        for (value, expected) in [
+            ("log", PrivilegedOperatorPrompt::Log),
+            ("enforce", PrivilegedOperatorPrompt::Enforce),
+        ] {
+            let config = parse_doc(
+                &format!(r#"{{"version":1,"privileged_operator_prompt":"{value}"}}"#),
+                path,
+            )
+            .unwrap();
+            assert_eq!(config.privileged_operator_prompt, expected);
+        }
+    }
+
+    #[test]
+    fn privileged_operator_prompt_refuses_unknown_values_and_wrong_types() {
+        let path = Path::new("/tmp/subc.jsonc");
+        for value in [r#""unknown""#, r#""Enforce""#, "null", "true", "1", "{}"] {
+            let error = parse_doc(
+                &format!(r#"{{"version":1,"privileged_operator_prompt":{value}}}"#),
+                path,
+            )
+            .unwrap_err();
+            assert!(matches!(error, DaemonConfigError::InvalidJson { .. }));
+        }
     }
 
     #[test]
@@ -2734,5 +2857,54 @@ mod tests {
     fn reject_unterminated_block_comment() {
         let err = parse_doc(r#"{ "version": 1, /*"#, Path::new("subc.jsonc")).unwrap_err();
         assert!(matches!(err, DaemonConfigError::InvalidJsonc { .. }));
+    }
+}
+
+#[cfg(test)]
+mod activity_config_tests {
+    use super::*;
+
+    #[test]
+    fn activity_config_defaults_partial_overrides_and_positive_bounds() {
+        let path = Path::new("subc.jsonc");
+        let default = parse_doc_with_activity(r#"{"version":1,"modules":{}}"#, path).unwrap();
+        assert_eq!(
+            default.1,
+            ActivityConfig {
+                max_age_days: 30,
+                max_total_mb: 64
+            }
+        );
+        let changed = parse_doc_with_activity(
+            r#"{"version":1,"activity":{"max_age_days":7,"max_total_mb":8}}"#,
+            path,
+        )
+        .unwrap();
+        assert_eq!(
+            changed.1,
+            ActivityConfig {
+                max_age_days: 7,
+                max_total_mb: 8
+            }
+        );
+        let partial =
+            parse_doc_with_activity(r#"{"version":1,"activity":{"max_age_days":7}}"#, path)
+                .unwrap();
+        assert_eq!(
+            partial.1,
+            ActivityConfig {
+                max_age_days: 7,
+                max_total_mb: 64
+            }
+        );
+        for doc in [
+            r#"{"version":1,"activity":{"max_age_days":0}}"#,
+            r#"{"version":1,"activity":{"max_total_mb":0}}"#,
+        ] {
+            assert!(parse_doc(doc, path).is_err());
+        }
+        assert!(!RestartRequiredSection::ALL
+            .iter()
+            .any(|section| section.label() == "activity"));
     }
 }

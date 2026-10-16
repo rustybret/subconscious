@@ -3,6 +3,7 @@ use std::{fmt::Debug, fs, path::PathBuf};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
 use subc_protocol::{
+    call_mode::CallMode,
     error_codes,
     manifest::{
         Bindings, CapabilityDeclarations, Concurrency, ExecutionMode, IdentityBinding,
@@ -11,8 +12,9 @@ use subc_protocol::{
         SelfSignalKind, SignalAnchor, StorageBinding, StorageKind, StorageScope, Tool, TrustTier,
     },
     scope::{
-        ParentState, ScopeAttributes, ScopeCarrier, ScopeEnded, ScopeKind, ScopeParent,
-        ScopeRecord, ScopeRecordOutcome, ScopeRecordResult, ScopeStamp, ScopeStatus,
+        ParentState, ScopeAttributes, ScopeCarrier, ScopeEnd, ScopeEndOutcome, ScopeEndResult,
+        ScopeEnded, ScopeKind, ScopeParent, ScopeRecord, ScopeRecordOutcome, ScopeRecordResult,
+        ScopeStamp, ScopeStatus,
     },
     session::{
         HealthStatus, ModuleControlCommand, ModuleControlPush, ModuleControlRequest,
@@ -26,6 +28,23 @@ use subc_protocol::{
 // when a wire-shape change is intentional and the TS mirror is updated too.
 #[test]
 fn protocol_wire_shapes_match_golden_json_and_round_trip() {
+    assert_golden(
+        "scope_selector_with_bind_proof",
+        &subc_protocol::scope::ScopeSelector::new(
+            Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            },
+            "head-1",
+            Some(3),
+        )
+        .with_bind_proof(Some("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc".into())),
+    );
+    assert_golden(
+        "scope_record_with_bind_proof_sha256",
+        &scope_head_record().with_bind_proof_sha256(Some(
+            "4bb06f8e4e3a7715d201d573d0aa423762e55dabd61a2c02278fa56cc6d294e0".into(),
+        )),
+    );
     assert_golden("bind_identity", &bind_identity());
     assert_golden(
         "route_target_tool_provider",
@@ -106,10 +125,8 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
     }
     assert_golden("module_control_request_route_bind_with_flow_id", &flow_bind);
     let mut flow_record = scope_head_record();
-    flow_record.attributes = ScopeAttributes {
-        flow_id: Some("flow:run-7/step-2".to_string()),
-        ..ScopeAttributes::default()
-    };
+    flow_record.attributes =
+        ScopeAttributes::new().with_flow_id(Some("flow:run-7/step-2".to_string()));
     assert_golden("scope_record_with_flow_id_without_agent", &flow_record);
     // The same call with no origin: the member must be absent, not null.
     assert_golden(
@@ -288,20 +305,15 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
             daemon_incarnation: "0123456789abcdef0123456789abcdef".to_string(),
             owner_synced: true,
             owner_configured: true,
-            scope: Some(ScopeStamp {
-                owner: principal_reserved(),
-                scope_ref: "head-1".to_string(),
-                scope_epoch: 3,
-                kind: ScopeKind::Head,
-                parent: None,
-                parent_state: None,
-                attributes: ScopeAttributes {
-                    agent_id: Some("agent-7".to_string()),
-                    delegates: true,
-                    flow_id: None,
-                },
-                owner_authorized: true,
-            }),
+            scope: Some(
+                ScopeStamp::new(principal_reserved(), "head-1", 3, ScopeKind::Head)
+                    .with_attributes(
+                        ScopeAttributes::new()
+                            .with_agent_id(Some("agent-7".to_string()))
+                            .with_delegates(true),
+                    )
+                    .with_owner_authorized(true),
+            ),
         },
     );
     assert_golden(
@@ -348,50 +360,175 @@ fn protocol_wire_shapes_match_golden_json_and_round_trip() {
     );
 }
 
-fn scope_head_record() -> ScopeRecord {
-    ScopeRecord {
-        scope_ref: "head-1".to_string(),
-        scope_epoch: 3,
-        kind: ScopeKind::Head,
-        parent: None,
-        child_owners: vec![Principal::Reserved {
-            module_id: "magic-context".to_string(),
-        }],
-        carriers: vec![
-            ScopeCarrier {
-                principal: Principal::Reserved {
-                    module_id: "broca".to_string(),
-                },
-                targets: None,
-            },
-            ScopeCarrier {
-                principal: Principal::Reserved {
-                    module_id: "aft".to_string(),
-                },
-                targets: Some(vec!["plexus".to_string(), "prefrontal-core".to_string()]),
-            },
-        ],
-        attributes: ScopeAttributes {
-            agent_id: Some("agent-7".to_string()),
-            delegates: true,
-            flow_id: None,
-        },
+#[test]
+fn call_mode_route_binds_match_golden_json_and_round_trip() {
+    let unscoped = module_control_request(None, None);
+    let mut run = module_control_request_with_scope();
+    let mut flow = module_control_request_with_scope();
+    for (bind, attributes) in [
+        (
+            &mut run,
+            ScopeAttributes::new()
+                .with_agent_id(Some("agent-7".to_string()))
+                .with_run_id(Some("run:7".to_string())),
+        ),
+        (
+            &mut flow,
+            ScopeAttributes::new()
+                .with_agent_id(Some("agent-7".to_string()))
+                .with_delegates(true)
+                .with_flow_id(Some("flow:run-7/step-2".to_string())),
+        ),
+    ] {
+        let ModuleControlRequest::RouteBind {
+            scope: Some(stamp), ..
+        } = bind
+        else {
+            panic!("expected a scoped bind");
+        };
+        stamp.attributes = attributes;
+    }
+
+    for (name, bind) in [
+        (
+            "module_control_request_route_bind_without_consumer_capabilities",
+            &unscoped,
+        ),
+        ("module_control_request_route_bind_with_run_id", &run),
+        ("module_control_request_route_bind_with_flow_id", &flow),
+    ] {
+        // Older providers must see neither new field, even on scoped routes.
+        let wire = serde_json::to_value(bind).unwrap();
+        assert!(wire.get("call_mode").is_none());
+        assert!(wire["scope"].get("expires_at_ms").is_none());
+        assert_golden(name, bind);
+    }
+
+    for (name, mut bind, mode) in [
+        (
+            "module_control_request_route_bind_with_call_mode_classic",
+            unscoped,
+            CallMode::Classic,
+        ),
+        (
+            "module_control_request_route_bind_with_call_mode_codemode",
+            run,
+            CallMode::Codemode,
+        ),
+        (
+            "module_control_request_route_bind_with_call_mode_flow",
+            flow,
+            CallMode::Flow,
+        ),
+    ] {
+        let ModuleControlRequest::RouteBind {
+            scope, call_mode, ..
+        } = &mut bind
+        else {
+            panic!("expected a route.bind");
+        };
+        *call_mode = Some(mode);
+        if let Some(stamp) = scope {
+            stamp.expires_at_ms = Some(1_725_000_030_000);
+        }
+        assert_golden(name, &bind);
     }
 }
 
+fn scope_head_record() -> ScopeRecord {
+    ScopeRecord::new("head-1", 3, ScopeKind::Head)
+        .with_child_owners(vec![Principal::Reserved {
+            module_id: "magic-context".to_string(),
+        }])
+        .with_carriers(vec![
+            ScopeCarrier::new(Principal::Reserved {
+                module_id: "broca".to_string(),
+            }),
+            ScopeCarrier::new(Principal::Reserved {
+                module_id: "aft".to_string(),
+            })
+            .with_targets(Some(vec![
+                "plexus".to_string(),
+                "prefrontal-core".to_string(),
+            ])),
+        ])
+        .with_attributes(
+            ScopeAttributes::new()
+                .with_agent_id(Some("agent-7".to_string()))
+                .with_delegates(true),
+        )
+}
+
 fn scope_worker_record() -> ScopeRecord {
-    ScopeRecord {
-        scope_ref: "worker-1".to_string(),
-        scope_epoch: 1,
-        kind: ScopeKind::Worker,
-        parent: Some(ScopeParent {
-            owner: principal_reserved(),
-            scope_ref: "head-1".to_string(),
-            scope_epoch: 3,
-        }),
-        child_owners: Vec::new(),
-        carriers: Vec::new(),
-        attributes: ScopeAttributes::default(),
+    ScopeRecord::new("worker-1", 1, ScopeKind::Worker).with_parent(Some(ScopeParent::new(
+        principal_reserved(),
+        "head-1",
+        3,
+    )))
+}
+
+#[test]
+fn scope_apply_request_and_response_match_golden_json_and_round_trip() {
+    assert_golden(
+        "module_control_request_from_module_scope_apply",
+        &ModuleControlRequestFromModule::ScopeApply {
+            generation: 8,
+            upsert: vec![ScopeRecord::new("run-1", 1, ScopeKind::Ephemeral)
+                .with_expires_at_ms(Some(1_725_000_030_000))
+                .with_carriers(vec![ScopeCarrier::new(Principal::Direct)])
+                .with_attributes(
+                    ScopeAttributes::new()
+                        .with_agent_id(Some("agent-7".to_string()))
+                        .with_run_id(Some("run:7/step-2".to_string())),
+                )],
+            end: vec![ScopeEnd::new("worker-1", 1), ScopeEnd::new("worker-0", 9)],
+        },
+    );
+    assert_golden(
+        "module_control_response_to_module_scope_apply",
+        &ModuleControlResponseToModule::ScopeApply {
+            generation: 8,
+            results: vec![ScopeRecordResult {
+                scope_ref: "run-1".to_string(),
+                scope_epoch: 1,
+                outcome: ScopeRecordOutcome::Created,
+                code: None,
+                message: None,
+                version: Some(1),
+                parent_state: None,
+            }],
+            end_results: vec![
+                ScopeEndResult::new("worker-1", 1, ScopeEndOutcome::Ended),
+                ScopeEndResult::new("worker-0", 9, ScopeEndOutcome::NotLive),
+            ],
+            ended: vec![ScopeEnded {
+                scope_ref: "worker-1".to_string(),
+                scope_epoch: 1,
+            }],
+        },
+    );
+}
+
+#[test]
+fn legacy_scope_sync_golden_decodes_without_expiry_or_run_id() {
+    let body =
+        fs::read_to_string(golden_path("module_control_request_from_module_scope_sync")).unwrap();
+    assert!(!body.contains("expires_at_ms"));
+    assert!(!body.contains("run_id"));
+    let decoded: ModuleControlRequestFromModule = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        decoded,
+        ModuleControlRequestFromModule::ScopeSync {
+            generation: 7,
+            scopes: vec![scope_head_record(), scope_worker_record()],
+        }
+    );
+    let ModuleControlRequestFromModule::ScopeSync { scopes, .. } = decoded else {
+        panic!("expected scope.sync");
+    };
+    for record in scopes {
+        assert_eq!(record.expires_at_ms, None);
+        assert_eq!(record.attributes.run_id, None);
     }
 }
 
@@ -848,6 +985,17 @@ fn target_flow_unsupported_is_terminal_in_the_shared_retry_predicate() {
 }
 
 #[test]
+fn target_agent_run_unsupported_is_terminal_in_the_shared_retry_predicate() {
+    assert_eq!(
+        error_codes::TARGET_AGENT_RUN_UNSUPPORTED,
+        "target_agent_run_unsupported"
+    );
+    assert!(!error_codes::is_retryable_route_open(
+        "target_agent_run_unsupported"
+    ));
+}
+
+#[test]
 fn established_route_dead_predicate_matches_the_decision_table() {
     let table: Value =
         serde_json::from_str(&fs::read_to_string(golden_path("decision_tables")).unwrap()).unwrap();
@@ -1064,6 +1212,7 @@ fn module_control_request(
         role_versions: None,
         admission_facts,
         scope: None,
+        call_mode: None,
     }
 }
 
@@ -1096,6 +1245,7 @@ fn module_control_request_role_versions(with_role_versions: bool) -> ModuleContr
         }),
         admission_facts: None,
         scope: None,
+        call_mode: None,
     }
 }
 
@@ -1126,28 +1276,31 @@ fn module_control_request_with_scope() -> ModuleControlRequest {
         consumer_capabilities,
         role_versions: None,
         admission_facts,
-        scope: Some(ScopeStamp {
-            owner: Principal::Reserved {
-                module_id: "prefrontal-core".to_string(),
-            },
-            scope_ref: "head-1".to_string(),
-            scope_epoch: 3,
-            kind: ScopeKind::Worker,
-            parent: Some(ScopeParent {
-                owner: Principal::Reserved {
+        scope: Some(
+            ScopeStamp::new(
+                Principal::Reserved {
                     module_id: "prefrontal-core".to_string(),
                 },
-                scope_ref: "head-0".to_string(),
-                scope_epoch: 2,
-            }),
-            parent_state: Some(ParentState::Linked),
-            attributes: ScopeAttributes {
-                agent_id: Some("agent-7".to_string()),
-                delegates: true,
-                flow_id: None,
-            },
-            owner_authorized: true,
-        }),
+                "head-1",
+                3,
+                ScopeKind::Worker,
+            )
+            .with_parent(Some(ScopeParent::new(
+                Principal::Reserved {
+                    module_id: "prefrontal-core".to_string(),
+                },
+                "head-0",
+                2,
+            )))
+            .with_parent_state(Some(ParentState::Linked))
+            .with_attributes(
+                ScopeAttributes::new()
+                    .with_agent_id(Some("agent-7".to_string()))
+                    .with_delegates(true),
+            )
+            .with_owner_authorized(true),
+        ),
+        call_mode: None,
     }
 }
 

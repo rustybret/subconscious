@@ -15,13 +15,19 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 use subc_protocol::{
-    manifest::{CapabilityDeclarations, ManifestProvenance, ProviderRole, SelfSignalDeclaration},
+    manifest::{
+        CapabilityDeclarations, EventDeclaration, ManifestProvenance, ProviderRole,
+        SelfSignalDeclaration,
+    },
     scope::ScopeSelector,
     session::HealthStatus,
     BindIdentity, RouteTarget,
 };
 
 pub use subc_protocol::RouteCloseReason;
+
+mod activity;
+pub use activity::*;
 
 macro_rules! open_string_enum {
     (
@@ -131,6 +137,9 @@ pub mod ops {
     pub const SUPERVISOR_PROVENANCE: &str = "supervisor.provenance";
     pub const SUPERVISOR_SPAWN_SNAPSHOT: &str = "supervisor.spawn_snapshot";
     pub const SUPERVISOR_SPAWN_SUBSCRIBE: &str = "supervisor.spawn_subscribe";
+    pub const ACTIVITY_RECORD: &str = "activity.record";
+    pub const ACTIVITY_QUERY: &str = "activity.query";
+    pub const ACTIVITY_SUBSCRIBE: &str = "activity.subscribe";
 }
 
 /// Client-originated channel-0 control RPC body.
@@ -631,6 +640,13 @@ pub enum ModuleDeclaredProvenance {
 /// daemon independently observed module-provided metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SupervisorObservedProcess {
+    /// The daemon's Windows delivery record for this process: `pipe` after the
+    /// process whose PID was returned by spawn has read all nonce bytes; `env`
+    /// when that delivery was not completed and SUBC_LAUNCH_NONCE was offered.
+    /// This is returned under `daemon_observed.launch_nonce_source` by
+    /// `supervisor.provenance`, and is absent when the daemon cannot report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_nonce_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -734,6 +750,11 @@ pub enum RunningImageEvidence {
         device: u64,
         inode: u64,
     },
+    /// The spawn-time Windows file object, not verified executable content.
+    WindowsSpawnFileId {
+        volume_serial_number: u64,
+        file_id: [u8; 16],
+    },
     /// Future discriminator. `body` retains the complete ordered object; `tag`
     /// is its decoded discriminator projection.
     Unknown {
@@ -748,6 +769,8 @@ open_string_enum! {
         NotRunning => "not_running",
         UnsupportedPlatform => "unsupported_platform",
         RunningExecutableUnreadable => "running_executable_unreadable",
+        RunningExecutablePermissionDenied => "running_executable_permission_denied",
+        ProcessHidden => "process_hidden",
         SpawnedPathUnreadable => "spawned_path_unreadable",
         HashFailed => "hash_failed",
         ProcessIdentityUnconfirmed => "process_identity_unconfirmed",
@@ -863,8 +886,17 @@ enum ReloadPathAgreementWire {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 enum RunningImageEvidenceWire {
-    LinuxProcSha256 { digest: String },
-    MacosSpawnInode { device: u64, inode: u64 },
+    LinuxProcSha256 {
+        digest: String,
+    },
+    MacosSpawnInode {
+        device: u64,
+        inode: u64,
+    },
+    WindowsSpawnFileId {
+        volume_serial_number: u64,
+        file_id: [u8; 16],
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1211,6 +1243,22 @@ fn decode_running_image_evidence(value: OrderedJsonValue) -> Result<RunningImage
                 .ok_or_else(|| "tagged object has no unsigned `inode` field".to_string())?;
             Ok(RunningImageEvidence::MacosSpawnInode { device, inode })
         }
+        "windows_spawn_file_id" => {
+            let wire: RunningImageEvidenceWire = serde_json::from_value(
+                serde_json::to_value(&body).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            match wire {
+                RunningImageEvidenceWire::WindowsSpawnFileId {
+                    volume_serial_number,
+                    file_id,
+                } => Ok(RunningImageEvidence::WindowsSpawnFileId {
+                    volume_serial_number,
+                    file_id,
+                }),
+                _ => unreachable!(),
+            }
+        }
         _ => Ok(RunningImageEvidence::Unknown { tag, body }),
     }
 }
@@ -1430,6 +1478,14 @@ impl Serialize for RunningImageEvidence {
                 inode: *inode,
             }
             .serialize(serializer),
+            Self::WindowsSpawnFileId {
+                volume_serial_number,
+                file_id,
+            } => RunningImageEvidenceWire::WindowsSpawnFileId {
+                volume_serial_number: *volume_serial_number,
+                file_id: *file_id,
+            }
+            .serialize(serializer),
             Self::Unknown { body, .. } => body.serialize(serializer),
         }
     }
@@ -1455,6 +1511,18 @@ impl<'de> Deserialize<'de> for RunningImageEvidence {
                     RunningImageEvidenceWire::MacosSpawnInode { device, inode } => {
                         Ok(Self::MacosSpawnInode { device, inode })
                     }
+                    _ => unreachable!(),
+                }
+            }
+            "windows_spawn_file_id" => {
+                match serde_json::from_value(value.into_value()).map_err(D::Error::custom)? {
+                    RunningImageEvidenceWire::WindowsSpawnFileId {
+                        volume_serial_number,
+                        file_id,
+                    } => Ok(Self::WindowsSpawnFileId {
+                        volume_serial_number,
+                        file_id,
+                    }),
                     _ => unreachable!(),
                 }
             }
@@ -1739,7 +1807,19 @@ pub enum PollKind {
     Liveness,
 }
 
+/// A registered module's catalog projection.
+///
+/// Use [`CatalogEntry::new`] and its `with_*` methods to construct entries so
+/// future fields do not require changes to callers.
+/// Struct literals and functional record updates are not supported outside this crate:
+///
+/// ```compile_fail,E0639
+/// use subc_control::CatalogEntry;
+/// let entry = CatalogEntry::new("provider", vec![], vec![]);
+/// let entry = CatalogEntry { ready: false, ..entry };
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct CatalogEntry {
     pub module_id: String,
     /// Whether the registered module currently accepts new route binds.
@@ -1793,6 +1873,75 @@ pub struct CatalogEntry {
     /// manifest. The daemon relays these declarations without interpreting them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_signals: Option<Vec<SelfSignalDeclaration>>,
+    /// Event declarations mirrored verbatim from the registering module's manifest.
+    /// Absent when the manifest omits `events`; an empty array records an affirmative
+    /// declaration that the module publishes no events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<Vec<EventDeclaration>>,
+}
+
+impl CatalogEntry {
+    /// Construct an entry with its required fields and wire-compatible defaults.
+    #[must_use]
+    pub fn new(
+        module_id: impl Into<String>,
+        roles: Vec<ProviderRole>,
+        control_ops: Vec<String>,
+    ) -> Self {
+        Self {
+            module_id: module_id.into(),
+            ready: default_true(),
+            not_ready: None,
+            module_version: None,
+            roles,
+            control_ops,
+            capabilities: None,
+            self_signals: None,
+            events: None,
+        }
+    }
+
+    /// Set the module's effective readiness.
+    #[must_use]
+    pub fn with_ready(mut self, ready: bool) -> Self {
+        self.ready = ready;
+        self
+    }
+
+    /// Set or clear the reason the module is not ready.
+    #[must_use]
+    pub fn with_not_ready(mut self, not_ready: Option<NotReadyReason>) -> Self {
+        self.not_ready = not_ready;
+        self
+    }
+
+    /// Set or clear the module's self-declared version.
+    #[must_use]
+    pub fn with_module_version(mut self, module_version: Option<String>) -> Self {
+        self.module_version = module_version;
+        self
+    }
+
+    /// Set or clear the module's static capability declarations.
+    #[must_use]
+    pub fn with_capabilities(mut self, capabilities: Option<CapabilityDeclarations>) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Set or clear the module's self-signal declarations.
+    #[must_use]
+    pub fn with_self_signals(mut self, self_signals: Option<Vec<SelfSignalDeclaration>>) -> Self {
+        self.self_signals = self_signals;
+        self
+    }
+
+    /// Set or clear the event declarations mirrored from the module manifest.
+    #[must_use]
+    pub fn with_events(mut self, events: Option<Vec<EventDeclaration>>) -> Self {
+        self.events = events;
+        self
+    }
 }
 
 /// Why a registered module is not accepting new route binds.
@@ -1915,8 +2064,24 @@ pub enum ModuleProtocol {
     None,
 }
 
+/// A supervised module's current state and process observations.
+///
+/// Use [`SupervisorEntry::new`] and its `with_*` methods to construct entries so
+/// future fields do not require changes to callers.
+/// Struct literals and functional record updates are not supported outside this crate:
+///
+/// ```compile_fail,E0639
+/// use subc_control::{SupervisorEntry, SupervisorHealthStatus};
+/// let entry = SupervisorEntry::new("provider", "running", true, true, SupervisorHealthStatus::Unknown);
+/// let entry = SupervisorEntry { resources: None, ..entry };
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct SupervisorEntry {
+    /// A hidden previous instance blocks only this module's next spawn. This
+    /// PID is not the supervised child and must not be presented as its identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for_previous_pid: Option<u32>,
     pub module_id: String,
     pub state: String,
     pub enabled: bool,
@@ -1939,6 +2104,13 @@ pub struct SupervisorEntry {
     /// on Windows. Non-wire modules receive no nonce on either platform.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_nonce_env: Option<bool>,
+    /// The daemon's Windows per-spawn delivery result: `pipe` after the spawned
+    /// process read all bytes, otherwise `env` for the offered environment copy.
+    /// Returned in `supervisor.list`, independently of the source the module
+    /// declares in `manifest.provenance.launch_nonce_source` when registering.
+    /// Processes that do not speak the wire protocol and stopped modules omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_nonce_source: Option<String>,
     pub health: SupervisorHealthStatus,
     /// Computed from the stored launch spec and observed process at list time;
     /// None means an older daemon did not report this comparison.
@@ -2041,6 +2213,175 @@ pub struct SupervisorEntry {
     pub resources: Option<ChildResourceUsage>,
 }
 
+impl SupervisorEntry {
+    /// Construct an entry with its required fields and wire-compatible defaults.
+    #[must_use]
+    pub fn new(
+        module_id: impl Into<String>,
+        state: impl Into<String>,
+        enabled: bool,
+        live: bool,
+        health: SupervisorHealthStatus,
+    ) -> Self {
+        Self {
+            module_id: module_id.into(),
+            state: state.into(),
+            waiting_for_previous_pid: None,
+            enabled,
+            live,
+            protocol: ModuleProtocol::default(),
+            launch_nonce_env: None,
+            launch_nonce_source: None,
+            health,
+            pending_reload: None,
+            last_probe_ms: None,
+            last_exit_code: None,
+            last_exit_signal: None,
+            last_exit_ms: None,
+            last_exit_kind: None,
+            restart_count: None,
+            max_restarts: None,
+            lifetime_restarts: None,
+            spawn_generation: None,
+            restart_window_secs: None,
+            drain_timeout_ms: None,
+            restart_backoff_ms: None,
+            restart_max_backoff_ms: None,
+            resources: None,
+        }
+    }
+
+    /// Set the module's declared wire protocol.
+    #[must_use]
+    pub fn with_protocol(mut self, protocol: ModuleProtocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
+    /// Set or clear the launch nonce environment indicator.
+    #[must_use]
+    pub fn with_launch_nonce_env(mut self, launch_nonce_env: Option<bool>) -> Self {
+        self.launch_nonce_env = launch_nonce_env;
+        self
+    }
+
+    pub fn with_launch_nonce_source(mut self, source: Option<String>) -> Self {
+        self.launch_nonce_source = source;
+        self
+    }
+
+    #[must_use]
+    pub fn with_waiting_for_previous_pid(mut self, pid: Option<u32>) -> Self {
+        self.waiting_for_previous_pid = pid;
+        self
+    }
+
+    /// Set or clear the comparison between the launch spec and observed process.
+    #[must_use]
+    pub fn with_pending_reload(mut self, pending_reload: Option<PendingReloadVerdict>) -> Self {
+        self.pending_reload = pending_reload;
+        self
+    }
+
+    /// Set or clear the last health collection timestamp.
+    #[must_use]
+    pub fn with_last_probe_ms(mut self, last_probe_ms: Option<u64>) -> Self {
+        self.last_probe_ms = last_probe_ms;
+        self
+    }
+
+    /// Set or clear the most recent process exit code.
+    #[must_use]
+    pub fn with_last_exit_code(mut self, last_exit_code: Option<i32>) -> Self {
+        self.last_exit_code = last_exit_code;
+        self
+    }
+
+    /// Set or clear the most recent process exit signal.
+    #[must_use]
+    pub fn with_last_exit_signal(mut self, last_exit_signal: Option<i32>) -> Self {
+        self.last_exit_signal = last_exit_signal;
+        self
+    }
+
+    /// Set or clear the most recent process exit timestamp.
+    #[must_use]
+    pub fn with_last_exit_ms(mut self, last_exit_ms: Option<u64>) -> Self {
+        self.last_exit_ms = last_exit_ms;
+        self
+    }
+
+    /// Set or clear the most recent process exit classification.
+    #[must_use]
+    pub fn with_last_exit_kind(mut self, last_exit_kind: Option<TerminalExitKind>) -> Self {
+        self.last_exit_kind = last_exit_kind;
+        self
+    }
+
+    /// Set or clear the restart count for the current crash budget.
+    #[must_use]
+    pub fn with_restart_count(mut self, restart_count: Option<u32>) -> Self {
+        self.restart_count = restart_count;
+        self
+    }
+
+    /// Set or clear the maximum restarts allowed by the crash budget.
+    #[must_use]
+    pub fn with_max_restarts(mut self, max_restarts: Option<u32>) -> Self {
+        self.max_restarts = max_restarts;
+        self
+    }
+
+    /// Set or clear the lifetime restart count.
+    #[must_use]
+    pub fn with_lifetime_restarts(mut self, lifetime_restarts: Option<u32>) -> Self {
+        self.lifetime_restarts = lifetime_restarts;
+        self
+    }
+
+    /// Set or clear the successful spawn count for this daemon incarnation.
+    #[must_use]
+    pub fn with_spawn_generation(mut self, spawn_generation: Option<u64>) -> Self {
+        self.spawn_generation = spawn_generation;
+        self
+    }
+
+    /// Set or clear the time window of the crash budget.
+    #[must_use]
+    pub fn with_restart_window_secs(mut self, restart_window_secs: Option<u64>) -> Self {
+        self.restart_window_secs = restart_window_secs;
+        self
+    }
+
+    /// Set or clear the effective drain budget in milliseconds.
+    #[must_use]
+    pub fn with_drain_timeout_ms(mut self, drain_timeout_ms: Option<u64>) -> Self {
+        self.drain_timeout_ms = drain_timeout_ms;
+        self
+    }
+
+    /// Set or clear the effective base restart delay in milliseconds.
+    #[must_use]
+    pub fn with_restart_backoff_ms(mut self, restart_backoff_ms: Option<u64>) -> Self {
+        self.restart_backoff_ms = restart_backoff_ms;
+        self
+    }
+
+    /// Set or clear the effective maximum restart delay in milliseconds.
+    #[must_use]
+    pub fn with_restart_max_backoff_ms(mut self, restart_max_backoff_ms: Option<u64>) -> Self {
+        self.restart_max_backoff_ms = restart_max_backoff_ms;
+        self
+    }
+
+    /// Set or clear the observed resource usage of the supervised process.
+    #[must_use]
+    pub fn with_resources(mut self, resources: Option<ChildResourceUsage>) -> Self {
+        self.resources = resources;
+        self
+    }
+}
+
 /// A module process's memory and CPU time as read at list time, or why none
 /// could be read.
 #[derive(Debug, Clone, PartialEq)]
@@ -2087,6 +2428,9 @@ open_string_enum! {
         /// Linux `VmRSS`: pages resident in RAM, shared file-backed pages
         /// included and swapped-out pages excluded.
         ResidentSet => "resident_set",
+        /// Windows `WorkingSetSize`: resident pageable memory, including shared
+        /// pages, not Unix RSS or private committed bytes.
+        WindowsWorkingSet => "windows_working_set",
     }
 }
 
@@ -2169,6 +2513,41 @@ pub struct SupervisorHealthEntry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn windows_running_image_evidence_round_trips_all_sixteen_id_bytes() {
+        let evidence = super::RunningImageEvidence::WindowsSpawnFileId {
+            volume_serial_number: u64::MAX,
+            file_id: [
+                0, 1, 2, 3, 4, 5, 6, 7, 128, 129, 130, 131, 252, 253, 254, 255,
+            ],
+        };
+        let agreement = super::RunningImageAgreement::Match { evidence };
+        let encoded = serde_json::to_string(&agreement).unwrap();
+        assert!(encoded.contains("windows_spawn_file_id"));
+        assert_eq!(
+            serde_json::from_str::<super::RunningImageAgreement>(&encoded).unwrap(),
+            agreement
+        );
+    }
+
+    #[test]
+    fn unix_running_image_evidence_keeps_original_wire_bytes() {
+        assert_eq!(
+            serde_json::to_string(&super::RunningImageEvidence::MacosSpawnInode {
+                device: 7,
+                inode: 11
+            })
+            .unwrap(),
+            "{\"method\":\"macos_spawn_inode\",\"device\":7,\"inode\":11}"
+        );
+        assert_eq!(
+            serde_json::to_string(&super::RunningImageEvidence::LinuxProcSha256 {
+                digest: "abc".to_owned()
+            })
+            .unwrap(),
+            "{\"method\":\"linux_proc_sha256\",\"digest\":\"abc\"}"
+        );
+    }
     use super::*;
     use subc_protocol::{BindIdentity, RouteTarget};
 
@@ -2386,6 +2765,14 @@ mod tests {
                 "running_executable_unreadable",
             ),
             (
+                RunningImageUnavailableReason::RunningExecutablePermissionDenied,
+                "running_executable_permission_denied",
+            ),
+            (
+                RunningImageUnavailableReason::ProcessHidden,
+                "process_hidden",
+            ),
+            (
                 RunningImageUnavailableReason::SpawnedPathUnreadable,
                 "spawned_path_unreadable",
             ),
@@ -2414,6 +2801,26 @@ mod tests {
             let decoded: TerminalDisposition = serde_json::from_str(&wire).unwrap();
             assert_eq!(decoded, value);
         }
+    }
+
+    #[test]
+    fn supervisor_waiting_previous_pid_is_optional_and_round_trips() {
+        let entry = SupervisorEntry::new(
+            "waiting-module",
+            "starting",
+            true,
+            false,
+            SupervisorHealthStatus::Unknown,
+        );
+        let old_wire = serde_json::to_value(&entry).unwrap();
+        assert!(old_wire.get("waiting_for_previous_pid").is_none());
+        let decoded: SupervisorEntry = serde_json::from_value(old_wire).unwrap();
+        assert_eq!(decoded.waiting_for_previous_pid, None);
+        let entry = entry.with_waiting_for_previous_pid(Some(42));
+        let wire = serde_json::to_value(&entry).unwrap();
+        assert_eq!(wire["waiting_for_previous_pid"], 42);
+        let decoded: SupervisorEntry = serde_json::from_value(wire).unwrap();
+        assert_eq!(decoded.waiting_for_previous_pid, Some(42));
     }
 
     #[test]

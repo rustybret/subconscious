@@ -5,6 +5,7 @@
     "bad_consumer_identity": "terminal",
     "capability_forbidden": "terminal",
     "forwarding_error": "terminal",
+    "frame_too_large": "terminal",
     "invalid_project_root": "terminal",
     "invalid_request": "terminal",
     "module_reloading": "retryable",
@@ -14,12 +15,16 @@
     "module_warming": "retryable",
     "op_not_allowed": "terminal",
     "route_limit": "terminal",
+    "scope_bind_proof_required": "terminal",
+    "scope_bind_proof_mismatch": "terminal",
+    "scope_epoch_in_use": "terminal",
     "scope_changed": "retryable",
     "scope_ended": "terminal",
     "scope_epoch_required": "terminal",
     "scope_not_carrier": "terminal",
     "scope_not_live": "terminal",
     "scope_not_synced": "retryable",
+    "target_agent_run_unsupported": "terminal",
     "target_flow_unsupported": "terminal",
     "target_unavailable": "retryable",
     "unknown_module": "terminal"
@@ -40,6 +45,8 @@
       { "code": "target_unavailable", "daemon_origin": true, "route_dead": false },
       { "code": "module_warming", "daemon_origin": false, "route_dead": false },
       { "code": "module_warming", "daemon_origin": true, "route_dead": false },
+      { "code": "frame_too_large", "daemon_origin": false, "route_dead": false },
+      { "code": "frame_too_large", "daemon_origin": true, "route_dead": false },
       { "code": "handler_failed", "daemon_origin": false, "route_dead": false },
       { "code": "handler_failed", "daemon_origin": true, "route_dead": false }
     ]

@@ -1,14 +1,39 @@
-use std::{fs, process::Command};
-use subc_test_support::TestTempDir;
+use cortexkit_test_support::ScratchDir;
+use std::{
+    fs,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
-#[test]
-fn manifest_is_emitted_offline_without_module_setup() {
-    let home = TestTempDir::new("subc-mcp-manifest");
-    let output = Command::new(env!("CARGO_BIN_EXE_ck-subc-mcp"))
+fn isolated_mcp_command(home: &ScratchDir) -> Command {
+    let mut command = cortexkit_test_support::dev_command(cortexkit_test_support::ckdev_binary(
+        env!("CARGO_BIN_EXE_ck-subc-mcp"),
+    ));
+    command
         .env_clear()
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("LOCALAPPDATA", home.path())
         .env("XDG_DATA_HOME", home.path())
         .env("XDG_RUNTIME_DIR", home.path())
         .env("XDG_CONFIG_HOME", home.path())
+        .env("CK_PROFILE_PATH", home.join("profile"));
+    if cfg!(windows) {
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            command.env("SystemRoot", system_root);
+        }
+    }
+    command
+}
+
+#[test]
+fn manifest_is_emitted_offline_without_module_setup() {
+    let home = ScratchDir::new("subc-mcp-manifest");
+    let output = isolated_mcp_command(&home)
         .arg("--manifest")
         .output()
         .expect("subc MCP manifest binary starts");
@@ -45,12 +70,76 @@ fn manifest_is_emitted_offline_without_module_setup() {
 }
 
 #[test]
+fn ck_domain_probe_is_a_single_line_response_before_startup_checks() {
+    let home = ScratchDir::new("subc-mcp-domain-probe");
+    let blocked_data_home = home.join("not-a-directory");
+    fs::write(&blocked_data_home, b"this path is a file, not a directory")
+        .expect("create an unusable data home");
+    let missing_runtime_dir = home.join("missing-runtime");
+    let started = Instant::now();
+    let mut child = isolated_mcp_command(&home)
+        // The cleared environment omits SUBC_MODULE_ID and SUBC_LAUNCH_NONCE. The
+        // file-valued data paths and absent runtime directory also make logging
+        // and connection-file access fail if startup reaches those steps.
+        .env("HOME", &blocked_data_home)
+        .env("USERPROFILE", &blocked_data_home)
+        .env("LOCALAPPDATA", &blocked_data_home)
+        .env("XDG_DATA_HOME", &blocked_data_home)
+        .env("XDG_RUNTIME_DIR", &missing_runtime_dir)
+        .env("XDG_CONFIG_HOME", &blocked_data_home)
+        .env("CK_PROFILE_PATH", blocked_data_home.join("profile"))
+        .arg("--ck-domain")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("subc MCP domain probe starts");
+
+    // This only bounds a broken probe that hangs; process startup speed is not
+    // part of the behavior this test measures.
+    let timeout = Duration::from_secs(30);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < timeout => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("subc MCP domain probe did not exit within {timeout:?}");
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("failed to wait for subc MCP domain probe: {error}");
+            }
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .expect("collect subc MCP domain probe output");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"CortexKit MCP gateway\n");
+    assert!(
+        output.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !home.join("cortexkit/ck-subc-mcp/logs").exists(),
+        "a domain probe must not initialize logging"
+    );
+}
+
+#[test]
 fn module_startup_writes_dated_r2_segment() {
-    let home = TestTempDir::new("subc-mcp-log");
-    let output = Command::new(env!("CARGO_BIN_EXE_ck-subc-mcp"))
-        .env("XDG_DATA_HOME", home.path())
-        .env("XDG_RUNTIME_DIR", home.path())
-        .env("XDG_CONFIG_HOME", home.path())
+    let home = ScratchDir::new("subc-mcp-log");
+    let output = isolated_mcp_command(&home)
         .env("CK_LOG", "info")
         .env("SUBC_MODULE_ID", "ck-subc-mcp")
         .env("SUBC_LAUNCH_NONCE", "test-nonce")
@@ -98,12 +187,8 @@ fn module_startup_writes_dated_r2_segment() {
 
 #[test]
 fn shim_logs_without_daemon_environment_or_protocol_stdout() {
-    let home = TestTempDir::new("subc-mcp-shim-log");
-    let output = Command::new(env!("CARGO_BIN_EXE_ck-subc-mcp"))
-        .env_remove("SUBC_MODULE_ID")
-        .env("XDG_DATA_HOME", home.path())
-        .env("XDG_RUNTIME_DIR", home.path())
-        .env("XDG_CONFIG_HOME", home.path())
+    let home = ScratchDir::new("subc-mcp-shim-log");
+    let output = isolated_mcp_command(&home)
         .env("CK_LOG", "info")
         .args(["shim", "--module-connection-file"])
         .arg(home.join("missing-connection.json"))

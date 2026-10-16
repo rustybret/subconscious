@@ -2,6 +2,7 @@
 
 pub mod scripted_daemon;
 
+use cortexkit_test_support::{ckdev_binary, dev_command, ScratchDir};
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -10,7 +11,6 @@ use std::{
     sync::{Arc, Once},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use subc_test_support::TestTempDir;
 
 use subc_daemon::{
     serve_listener, ConnectedClients, ControlHandler, ForwardingTable, ModuleProcessLiveness,
@@ -43,20 +43,40 @@ pub fn copy_executable(src: &Path, dst: &Path) {
 const TEST_DAEMON_VER: &str = "test-subc";
 const TEST_AUTH_DEADLINE: Duration = Duration::from_secs(2);
 
-/// Returns the dedicated CLI target after proving it contains the fixture-key
-/// support required by integration tests. A build-shape check makes a Cargo
-/// feature-resolution change fail before any test fixture can mask it.
+/// The daemon binary (`ck-subc`) published as `ckdev-subc` (see
+/// `cortexkit_test_support::ckdev_binary`). Privacy trampoline tests also pass
+/// this binary's path to a `Supervisor` as its trampoline executable.
+pub fn ckdev_subc() -> PathBuf {
+    ckdev_binary(env!("CARGO_BIN_EXE_ck-subc"))
+}
+
+/// The fault-injection daemon target (`ck-subc-under-test`) published as
+/// `ckdev-subc-under-test`.
+pub fn ckdev_subc_under_test() -> PathBuf {
+    ckdev_binary(env!("CARGO_BIN_EXE_ck-subc-under-test"))
+}
+
+/// The shipped CLI (`ck`) published as `ckdev-ck`.
+pub fn ckdev_ck() -> PathBuf {
+    ckdev_binary(env!("CARGO_BIN_EXE_ck"))
+}
+
+/// Returns the dedicated CLI target, run as `ckdev-under-test`, after proving
+/// it contains the fixture-key support required by integration tests. A
+/// build-shape check makes a Cargo feature-resolution change fail before any
+/// test fixture can mask it.
 pub fn ck_under_test_command() -> Command {
     assert_ck_under_test_build_shape();
-    Command::new(env!("CARGO_BIN_EXE_ck-under-test"))
+    dev_command(ckdev_binary(env!("CARGO_BIN_EXE_ck-under-test")))
 }
 
 fn assert_ck_under_test_build_shape() {
     static CHECKED: Once = Once::new();
 
     CHECKED.call_once(|| {
-        let path = Path::new(env!("CARGO_BIN_EXE_ck-under-test"));
-        let output = Command::new(path)
+        let placed = ckdev_binary(env!("CARGO_BIN_EXE_ck-under-test"));
+        let path = placed.as_path();
+        let output = dev_command(path)
             .arg("--ck-build-shape")
             .output()
             .unwrap_or_else(|error| panic!("could not inspect ck-under-test {}: {error}", path.display()));
@@ -75,7 +95,7 @@ pub struct TestDaemon {
     pub registry: Arc<Registry>,
     pub forwarding: Arc<ForwardingTable>,
     pub connection_file_path: PathBuf,
-    pub temp_dir: TestTempDir,
+    pub temp_dir: ScratchDir,
     pub task: JoinHandle<Result<(), subc_daemon::ServerError>>,
 }
 
@@ -88,7 +108,7 @@ impl TestDaemon {
 impl Drop for TestDaemon {
     fn drop(&mut self) {
         self.task.abort();
-        // The temp dir is owned by the `subc_test_support::TestTempDir` guard, whose `Drop` removes
+        // The temp dir is owned by the `cortexkit_test_support::ScratchDir` guard, whose `Drop` removes
         // the tree (or preserves it on panic).
     }
 }
@@ -279,6 +299,6 @@ pub async fn connect_authed_client(path: impl AsRef<Path>) -> io::Result<TcpStre
     Ok(stream)
 }
 
-fn unique_temp_dir(name: &str) -> TestTempDir {
-    TestTempDir::new(name)
+fn unique_temp_dir(name: &str) -> ScratchDir {
+    ScratchDir::new(name)
 }

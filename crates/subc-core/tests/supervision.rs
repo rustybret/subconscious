@@ -1,5 +1,6 @@
 use std::{ops::Deref, path::PathBuf, sync::Arc, time::Duration};
 
+use cortexkit_test_support::ScratchDir;
 use subc_control::{
     ChildMemoryKind, ChildResourceUnavailableReason, ChildResourceUsage, ClientControlRequest,
     ClientControlResponse, ModuleProtocol, SpawnCursor, SpawnEvent, SpawnEventKind, SpawnSnapshot,
@@ -11,7 +12,6 @@ use subc_daemon::{
     SupervisedModule, Supervisor, SupervisorHandle, SupervisorProcessLiveness,
 };
 use subc_protocol::{ErrorBody, Flags, FrameType, Priority};
-use subc_test_support::TestTempDir;
 use subc_transport::{read_frame, write_frame};
 use tokio::{
     io::AsyncWriteExt,
@@ -26,6 +26,101 @@ use common::{
 
 struct TestServer {
     daemon: TestDaemon,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delayed_call_receipt_precedes_crash_and_client_survives_respawn() {
+    let server = TestServer::start().await;
+    let supervisor = supervisor(&server, 3, Duration::from_millis(100))
+        .with_forwarding(Arc::clone(&server.forwarding));
+    let module_id = "delayed-crash-receipt";
+    let events = server.temp_dir.join("delayed-crash-events.jsonl");
+    let events_path = events.to_string_lossy();
+    let module = spawn_stub_with_env(
+        &server,
+        &supervisor,
+        module_id,
+        [
+            ("FAKE_AFT_CRASH_AFTER_MS", "2500"),
+            ("FAKE_AFT_EVENTS_PATH", events_path.as_ref()),
+        ],
+    )
+    .await;
+    let client = Arc::new(
+        subc_client_rs::SubcConsumer::connect(&server.connection_file_path, Default::default())
+            .await
+            .unwrap(),
+    );
+    let call_client = Arc::clone(&client);
+    let identity =
+        subc_protocol::BindIdentity::new(server.temp_dir.path(), "kill-regression", "receipt");
+    let call_identity = identity.clone();
+    let target = subc_protocol::RouteTarget::ToolProvider {
+        module_id: module_id.to_owned(),
+    };
+    let call_target = target.clone();
+    let call = tokio::spawn(async move {
+        call_client
+            .call(
+                call_target,
+                call_identity,
+                serde_json::to_vec(&serde_json::json!({
+                    "name": "fake_read", "arguments": { "delay_ms": 30_000 }
+                }))
+                .unwrap(),
+                subc_client_rs::CallOptions {
+                    timeout: Duration::from_secs(10),
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let received = std::fs::read_to_string(&events)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| {
+                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|event| {
+                    event["kind"] == "request_received"
+                        && event["body_json"]["name"] == "fake_read"
+                        && event["body_json"]["arguments"]["delay_ms"] == 30_000
+                })
+            });
+        if received {
+            break;
+        }
+        assert!(
+            !call.is_finished() && Instant::now() < deadline,
+            "the delayed request must be received before the initial crash"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!call.is_finished(), "receipt precedes response completion");
+    assert!(timeout(Duration::from_secs(5), call)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    wait_for_status(&module, Duration::from_secs(5), |status| {
+        status.spawn_generation == 2 && status.live
+    })
+    .await;
+    // The retained consumer can send to the replacement after its first call
+    // fails; observing receipt never requires waiting for a delayed response.
+    client
+        .call(
+            target,
+            identity,
+            serde_json::to_vec(&serde_json::json!({"name": "fake_read", "arguments": {}})).unwrap(),
+            subc_client_rs::CallOptions {
+                timeout: Duration::from_secs(2),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    module.stop().await.unwrap();
 }
 
 impl TestServer {
@@ -147,7 +242,7 @@ async fn assert_disable_cancels_backoff(kind: &str) {
         ));
     } else if kind == "spawn-retry" {
         let copy = server.temp_dir.join("copied-stub");
-        std::fs::copy(&spec.program, &copy).unwrap();
+        copy_executable(&spec.program, &copy);
         spec.program = copy;
     }
     let module = Arc::new(supervisor.spawn(spec.clone()).unwrap());
@@ -223,6 +318,11 @@ async fn health_budget_exhaustion_is_failed_with_budget_detail_and_start_revives
     assert_eq!(failed.state, ModuleState::Failed);
     assert!(failed.enabled);
     let history = module.terminal_history();
+    assert_eq!(
+        history.entries.len(),
+        1,
+        "Failed status must publish its terminal record before becoming visible"
+    );
     assert_eq!(history.entries[0].disposition, TerminalDisposition::Failed);
     assert_eq!(
         history.entries[0].disposition_detail.as_deref(),
@@ -345,6 +445,8 @@ async fn spawn_records_exact_process_facts() {
     let module_id = "fake-aft-spawn-facts";
     let spec = stub_spec(&server, module_id, std::iter::empty::<(&str, &str)>());
     let expected_program = spec.program.clone();
+    #[cfg(windows)]
+    let expected_program = std::fs::canonicalize(expected_program).unwrap();
     let before_spawn_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -479,7 +581,7 @@ async fn failed_spawn_during_enable_allows_a_later_retry() {
     let supervisor = supervisor(&server, 1, Duration::from_millis(10));
     // A path that must NOT exist: the spawn is made to fail for real. The guard
     // owns the parent dir; the program path itself is a never-created child.
-    let _dir = TestTempDir::new("missing-enable-program");
+    let _dir = ScratchDir::new("missing-enable-program");
     let missing_program = _dir.path().join("missing-program");
     assert!(!missing_program.exists());
     let module = supervisor
@@ -662,7 +764,7 @@ async fn operator_restart_spawn_failure_lands_failed_not_restarting() {
 
     // Per-test copy of the stub so deleting it cannot affect parallel tests.
     // The guard owns the parent dir; the stub copy is a file inside it.
-    let _dir = TestTempDir::new("fake-aft-stub-copy");
+    let _dir = ScratchDir::new("fake-aft-stub-copy");
     let stub_copy = _dir.path().join("fake-aft-stub");
     common::copy_executable(
         std::path::Path::new(env!("CARGO_BIN_EXE_fake-aft-stub")),
@@ -977,7 +1079,7 @@ fn supervisor(server: &TestServer, max_restarts: u32, backoff: Duration) -> Supe
         Arc::clone(&server.registry),
         RestartPolicy::new(max_restarts, backoff),
     )
-    .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
+    .with_privacy_trampoline(common::ckdev_subc())
     .with_drain_timeout(Duration::from_millis(25))
     .with_connection_file_path(server.connection_file_path.clone())
 }
@@ -1432,7 +1534,7 @@ async fn a_held_stderr_pipe_marks_the_tail_incomplete_and_its_late_output_stays_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn child_stdout_and_stderr_reach_the_capture_file_while_only_stderr_reaches_the_ring() {
     let server = TestServer::start().await;
-    let capture = TestTempDir::new("child-output-capture");
+    let capture = ScratchDir::new("child-output-capture");
     let logs_dir = capture.join("logs");
     let supervisor =
         supervisor(&server, 0, Duration::from_millis(10)).with_capture_logs_dir(&logs_dir);
@@ -1514,7 +1616,7 @@ async fn child_stdout_and_stderr_reach_the_capture_file_while_only_stderr_reache
 async fn concurrent_child_pipes_never_tear_a_line_in_the_capture_file() {
     const BURST: usize = 150;
     let server = TestServer::start().await;
-    let capture = TestTempDir::new("child-output-burst");
+    let capture = ScratchDir::new("child-output-burst");
     let logs_dir = capture.join("logs");
     let supervisor =
         supervisor(&server, 0, Duration::from_millis(10)).with_capture_logs_dir(&logs_dir);
@@ -1649,7 +1751,7 @@ impl SpawnEventHarness {
             Arc::clone(&server.registry),
             RestartPolicy::new(0, Duration::ZERO),
         )
-        .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
+        .with_privacy_trampoline(common::ckdev_subc())
         .with_process_liveness(process_liveness)
         .with_handle(handle.clone())
         .with_connection_file_path(server.connection_file_path.clone())
@@ -1796,7 +1898,7 @@ async fn supervisor_list_reports_a_running_childs_resources() {
         .iter()
         .find(|entry| entry.module_id == "list-resources-stub")
         .expect("stub is listed");
-    if cfg!(any(target_os = "linux", target_os = "macos")) {
+    if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
         let Some(ChildResourceUsage::Measured(reading)) = &entry.resources else {
             panic!("running stub was not measured: {:?}", entry.resources);
         };
@@ -1806,6 +1908,9 @@ async fn supervisor_list_reports_a_running_childs_resources() {
         );
         let expected_kind = if cfg!(target_os = "macos") {
             ChildMemoryKind::PhysFootprint
+        } else if cfg!(windows) {
+            assert_eq!(reading.swap_bytes, None);
+            ChildMemoryKind::WindowsWorkingSet
         } else {
             ChildMemoryKind::ResidentSet
         };
@@ -2050,4 +2155,32 @@ async fn closed_spawn_subscriber_is_removed_before_the_next_emit() {
     let module = harness.spawn("spawn-after-subscriber-close").await;
     assert_eq!(module.status().unwrap().spawn_generation, 1);
     module.stop().await.unwrap();
+}
+
+/// Copy an executable this test is about to run.
+///
+/// On Linux, a copy written by this process can fail to start with "Text file
+/// busy": while this test holds the new file open for writing, another test
+/// thread may fork, and the child keeps that writable descriptor until it
+/// execs. Writing the copy in a separate `cp` process means no descriptor of
+/// this process ever has it open for writing.
+fn copy_executable(from: &std::path::Path, to: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        let status = std::process::Command::new("cp")
+            .arg(from)
+            .arg(to)
+            .status()
+            .expect("run cp");
+        assert!(
+            status.success(),
+            "cp {} {} failed: {status}",
+            from.display(),
+            to.display()
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::copy(from, to).unwrap();
+    }
 }

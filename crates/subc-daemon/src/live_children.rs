@@ -23,8 +23,9 @@
 //! when recording that image, also retain the selected interpreter's identity.
 //! Matching never resolves the shell selection again after a crash or upgrade.
 //!
-//! On Windows the sweep signals nothing: the daemon's job object already ends
-//! a crashed daemon's children, and the record is read only to log it.
+//! On Windows the job object is the primary crash cleanup. The sweep is a
+//! fallback: only a matching creation time on a retained process handle permits
+//! a forced stop. An inaccessible process or reused PID is left alone.
 
 use std::{
     collections::BTreeSet,
@@ -66,6 +67,18 @@ pub(crate) struct ExecutableIdentity {
     /// field ignore it when reading.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     macos_sh_interpreter: Option<InterpreterIdentity>,
+    /// Older daemons reading version-1 `live-children.json` ignore unknown
+    /// executable fields, so adding this does not lose the roster on rollback.
+    /// Unix omits it, preserving its record bytes. Windows IDs stay here in full;
+    /// the legacy device/inode slots are zero, not a truncated Windows file ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    windows_file_identity: Option<WindowsFileIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct WindowsFileIdentity {
+    volume_serial_number: u64,
+    file_id: [u8; 16],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +99,22 @@ impl From<subc_os::FileIdentity> for ExecutableIdentity {
             device: identity.device,
             inode: identity.inode,
             macos_sh_interpreter,
+            windows_file_identity: None,
+        }
+    }
+}
+
+#[cfg(windows)]
+impl From<subc_os::WindowsFileIdentity> for ExecutableIdentity {
+    fn from(identity: subc_os::WindowsFileIdentity) -> Self {
+        Self {
+            device: 0,
+            inode: 0,
+            macos_sh_interpreter: None,
+            windows_file_identity: Some(WindowsFileIdentity {
+                volume_serial_number: identity.volume_serial_number,
+                file_id: identity.file_id,
+            }),
         }
     }
 }
@@ -280,6 +309,10 @@ impl AdoptedPids {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IdentityVerdict {
     Matches,
+    #[cfg(target_os = "linux")]
+    MatchesWithExecutablePermissionDenied,
+    #[cfg(target_os = "linux")]
+    ProcessHidden,
     PidDiffers,
     StartTimeUnrecorded,
     StartTimeDiffers,
@@ -289,9 +322,25 @@ pub(crate) enum IdentityVerdict {
 }
 
 impl IdentityVerdict {
+    #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
+    fn permits_signal(self) -> bool {
+        match self {
+            Self::Matches => true,
+            #[cfg(target_os = "linux")]
+            Self::MatchesWithExecutablePermissionDenied => true,
+            _ => false,
+        }
+    }
+
     fn describe(self) -> &'static str {
         match self {
             Self::Matches => "matches",
+            #[cfg(target_os = "linux")]
+            Self::MatchesWithExecutablePermissionDenied => {
+                "pid and start time match; executable not readable (non-dumpable)"
+            }
+            #[cfg(target_os = "linux")]
+            Self::ProcessHidden => "process still exists but its procfs entry is hidden",
             Self::PidDiffers => "the observed process has another pid",
             Self::StartTimeUnrecorded => "no start time was recorded at spawn",
             Self::StartTimeDiffers => {
@@ -346,10 +395,15 @@ pub(crate) enum SweepDecision {
     Mismatched(IdentityVerdict),
     /// The process could not be inspected; not signalled.
     Unverifiable(String),
+    #[cfg(target_os = "linux")]
+    AliveButUnobservable,
     /// Matched; exited after SIGTERM.
     Terminated,
     /// Matched; still running at the SIGTERM grace, exited after SIGKILL.
     Killed,
+    /// Windows forced stop, confirmed by waiting on the checked process handle.
+    #[cfg(windows)]
+    ForcedStopped,
     /// Matched and signalled, but still observed at the end of the bound.
     Survived,
     /// No process identity source on this platform; not signalled.
@@ -385,7 +439,7 @@ const POLL: Duration = Duration::from_millis(20);
 
 /// End every process the previous daemon's record lists that is still
 /// exactly the process recorded, except those in `adopted`, then replace the
-/// record with an empty one. Runs before any module is spawned.
+/// record with any alive-but-unobservable entries. Runs before any module is spawned.
 ///
 /// The record is the one in the run directory `owner` locks. Requiring the
 /// lock means the record cannot belong to a daemon that is still running:
@@ -413,9 +467,18 @@ pub(crate) async fn sweep_orphans(
     for (entry, decision) in &decisions {
         log_decision(entry, decision);
     }
-    // Everything listed has now been dealt with or deliberately left alone;
-    // a stale record would only have the next boot look at it again.
-    if let Err(error) = write_record(path, &[]) {
+    let retained: Vec<_> = decisions
+        .iter()
+        .filter_map(|(entry, _decision)| {
+            #[cfg(target_os = "linux")]
+            if *_decision == SweepDecision::AliveButUnobservable {
+                return Some(entry.clone());
+            }
+            let _ = entry;
+            None
+        })
+        .collect();
+    if let Err(error) = write_record(path, &retained) {
         warn!(path = %path.display(), %error, "could not reset the live-children record after the orphan sweep");
     }
     decisions
@@ -426,6 +489,16 @@ async fn sweep_entries(
     entries: Vec<LiveChild>,
     adopted: &AdoptedPids,
     bounds: SweepBounds,
+) -> Vec<(LiveChild, SweepDecision)> {
+    sweep_entries_with_verdict(entries, adopted, bounds, current_verdict).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn sweep_entries_with_verdict(
+    entries: Vec<LiveChild>,
+    adopted: &AdoptedPids,
+    bounds: SweepBounds,
+    verdict_for: impl Fn(&LiveChild, &subc_os::Process) -> Option<IdentityVerdict>,
 ) -> Vec<(LiveChild, SweepDecision)> {
     use subc_os::{Process, Signal};
     use tokio::time::{sleep, Instant};
@@ -450,9 +523,30 @@ async fn sweep_entries(
                 continue;
             }
         };
-        match current_verdict(&entry, &process) {
+        match verdict_for(&entry, &process) {
             None => decisions.push((entry, SweepDecision::Gone)),
-            Some(IdentityVerdict::Matches) => {
+            #[cfg(target_os = "linux")]
+            Some(IdentityVerdict::ProcessHidden) => {
+                decisions.push((entry, SweepDecision::AliveButUnobservable))
+            }
+            Some(verdict) if verdict.permits_signal() => {
+                #[cfg(target_os = "linux")]
+                if verdict == IdentityVerdict::MatchesWithExecutablePermissionDenied {
+                    info!(
+                        module_id = %entry.module_id,
+                        pid = entry.pid,
+                        pidfd = process.signals_through_pidfd(),
+                        "orphan sweep: pid and start time match; executable not readable (non-dumpable); sending SIGTERM"
+                    );
+                } else {
+                    info!(
+                        module_id = %entry.module_id,
+                        pid = entry.pid,
+                        pidfd = process.signals_through_pidfd(),
+                        "orphan sweep: previous daemon's child still running and matches pid, start time and executable; sending SIGTERM"
+                    );
+                }
+                #[cfg(not(target_os = "linux"))]
                 info!(
                     module_id = %entry.module_id,
                     pid = entry.pid,
@@ -472,14 +566,19 @@ async fn sweep_entries(
         }
     }
 
-    let exited = |entry: &LiveChild, process: &Process| {
-        current_verdict(entry, process) != Some(IdentityVerdict::Matches)
+    let departed = |entry: &LiveChild, process: &Process, exited| {
+        let verdict = verdict_for(entry, process);
+        #[cfg(target_os = "linux")]
+        if verdict == Some(IdentityVerdict::ProcessHidden) {
+            return Some(SweepDecision::AliveButUnobservable);
+        }
+        (!verdict.is_some_and(IdentityVerdict::permits_signal)).then_some(exited)
     };
     let term_deadline = Instant::now() + bounds.term_grace;
     loop {
         signalled.retain(|(entry, process)| {
-            if exited(entry, process) {
-                decisions.push((entry.clone(), SweepDecision::Terminated));
+            if let Some(decision) = departed(entry, process, SweepDecision::Terminated) {
+                decisions.push((entry.clone(), decision));
                 false
             } else {
                 true
@@ -495,7 +594,7 @@ async fn sweep_entries(
         // Checked again right before the signal: without a pidfd this is what
         // keeps a SIGKILL from reaching a process that took the pid after the
         // orphan exited.
-        if exited(entry, process) {
+        if !verdict_for(entry, process).is_some_and(IdentityVerdict::permits_signal) {
             continue;
         }
         warn!(
@@ -509,8 +608,8 @@ async fn sweep_entries(
     let kill_deadline = Instant::now() + bounds.kill_bound;
     loop {
         signalled.retain(|(entry, process)| {
-            if exited(entry, process) {
-                decisions.push((entry.clone(), SweepDecision::Killed));
+            if let Some(decision) = departed(entry, process, SweepDecision::Killed) {
+                decisions.push((entry.clone(), decision));
                 false
             } else {
                 true
@@ -533,12 +632,91 @@ async fn sweep_entries(
 /// recorded one.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn current_verdict(entry: &LiveChild, process: &subc_os::Process) -> Option<IdentityVerdict> {
-    process
-        .observe()
-        .map(|observed| identity_verdict(entry, process.pid(), &observed))
+    let Some((observed, access)) = process.observe_with_executable_access() else {
+        #[cfg(target_os = "linux")]
+        if process.is_alive_but_unobservable() {
+            return Some(IdentityVerdict::ProcessHidden);
+        }
+        return None;
+    };
+    Some(verdict_with_executable_access(
+        entry,
+        process.pid(),
+        &observed,
+        access,
+    ))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn verdict_with_executable_access(
+    entry: &LiveChild,
+    pid: u32,
+    observed: &subc_os::Observation,
+    _access: subc_os::ExecutableAccess,
+) -> IdentityVerdict {
+    let verdict = identity_verdict(entry, pid, observed);
+    // An ExecutableUnreadable verdict already confirms the recorded PID and
+    // Linux start time, ruling out PID reuse. Only permission denial permits
+    // signalling without the image; other read failures remain unverifiable.
+    #[cfg(target_os = "linux")]
+    if verdict == IdentityVerdict::ExecutableUnreadable
+        && _access == subc_os::ExecutableAccess::PermissionDenied
+    {
+        return IdentityVerdict::MatchesWithExecutablePermissionDenied;
+    }
+    verdict
+}
+
+#[cfg(windows)]
+async fn sweep_entries(
+    entries: Vec<LiveChild>,
+    adopted: &AdoptedPids,
+    bounds: SweepBounds,
+) -> Vec<(LiveChild, SweepDecision)> {
+    let mut decisions = Vec::new();
+    for entry in entries {
+        let decision = if adopted.contains(entry.pid) {
+            SweepDecision::Adopted
+        } else {
+            let recorded = entry.clone();
+            tokio::task::spawn_blocking(move || sweep_windows_entry(&recorded, bounds.kill_bound))
+                .await
+                .unwrap_or_else(|error| SweepDecision::Unverifiable(error.to_string()))
+        };
+        decisions.push((entry, decision));
+    }
+    decisions
+}
+
+#[cfg(windows)]
+fn sweep_windows_entry(entry: &LiveChild, wait_bound: Duration) -> SweepDecision {
+    let Some(expected) = entry.start_time else {
+        return SweepDecision::Mismatched(IdentityVerdict::StartTimeUnrecorded);
+    };
+    // Open once: creation-time validation, the forced stop and its wait all use
+    // this handle even if the PID is subsequently reused.
+    let process = match subc_os::Process::open(entry.pid) {
+        Ok(Some(process)) => process,
+        Ok(None) => return SweepDecision::Gone,
+        Err(error) => return SweepDecision::Unverifiable(error.to_string()),
+    };
+    let Some(observed) = process.observe() else {
+        return match process.wait_for_exit(Duration::ZERO) {
+            Ok(true) => SweepDecision::Gone,
+            _ => SweepDecision::Unverifiable("process creation time unavailable".to_owned()),
+        };
+    };
+    if observed.start_time != expected {
+        return SweepDecision::Mismatched(IdentityVerdict::StartTimeDiffers);
+    }
+    match process.force_stop(expected, wait_bound) {
+        Ok(true) => SweepDecision::ForcedStopped,
+        Ok(false) => SweepDecision::Survived,
+        Err(error) => SweepDecision::Unverifiable(error.to_string()),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 async fn sweep_entries(
     entries: Vec<LiveChild>,
     adopted: &AdoptedPids,
@@ -579,11 +757,20 @@ fn log_decision(entry: &LiveChild, decision: &SweepDecision) {
             %error,
             "orphan sweep: could not inspect the recorded pid; not signalled"
         ),
+        #[cfg(target_os = "linux")]
+        SweepDecision::AliveButUnobservable => info!(
+            module_id, pid,
+            "orphan sweep: previous child is alive but unobservable (process hidden); not signalled; keeping its record"
+        ),
         SweepDecision::Terminated => {
             info!(module_id, pid, "orphan sweep: previous daemon's child exited after SIGTERM")
         }
         SweepDecision::Killed => {
             info!(module_id, pid, "orphan sweep: previous daemon's child exited after SIGKILL")
+        }
+        #[cfg(windows)]
+        SweepDecision::ForcedStopped => {
+            info!(module_id, pid, "orphan sweep: previous daemon's child exited after a forced stop")
         }
         SweepDecision::Survived => warn!(
             module_id,
@@ -604,9 +791,401 @@ pub(crate) fn record_path(run_dir: &Path) -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
+
+    #[cfg(target_os = "linux")]
+    pub(crate) struct NonDumpableChild {
+        pub(crate) child: std::process::Child,
+        pub(crate) entry: LiveChild,
+        pub(crate) program: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for NonDumpableChild {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn spawn_non_dumpable_child(dir: &Path) -> NonDumpableChild {
+        let ready = dir.join("ready");
+        let program = std::env::current_exe().unwrap();
+        let child = std::process::Command::new(&program)
+            .args([
+                "--exact",
+                "live_children::tests::linux_non_dumpable_child_is_swept_and_image_is_not_readable",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("SUBC_NON_DUMPABLE_CHILD_READY", &ready)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut fixture = NonDumpableChild {
+            entry: LiveChild {
+                module_id: "previous".to_owned(),
+                pid: child.id(),
+                protocol: ModuleProtocol::None,
+                start_time: None,
+                executable: subc_os::file_identity(&program).map(ExecutableIdentity::from),
+                cgroup_name: None,
+            },
+            child,
+            program,
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let observed = subc_os::Process::open(fixture.child.id())
+                .unwrap()
+                .and_then(|process| process.observe());
+            if let Some(observed) = observed.filter(|observed| {
+                observed.executable.map(ExecutableIdentity::from) == fixture.entry.executable
+            }) {
+                fixture.entry.start_time = Some(observed.start_time);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "helper never completed exec"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Capture the executable inode and process start time before the child
+        // calls PR_SET_DUMPABLE, which can hide both from this parent.
+        std::io::Write::write_all(fixture.child.stdin.as_mut().unwrap(), b"x").unwrap();
+        while !ready.exists() {
+            assert!(
+                fixture.child.try_wait().unwrap().is_none(),
+                "helper exited before readiness"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "helper never became non-dumpable"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        fixture
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires an unprivileged Linux process with procfs hidepid=0"]
+    async fn linux_non_dumpable_child_is_swept_and_image_is_not_readable() {
+        if let Some(ready) = std::env::var_os("SUBC_NON_DUMPABLE_CHILD_READY") {
+            let mut release = [0u8; 1];
+            std::io::Read::read_exact(&mut std::io::stdin(), &mut release).unwrap();
+            rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+                .unwrap();
+            std::fs::write(ready, b"ready").unwrap();
+            std::io::Read::read_exact(&mut std::io::stdin(), &mut release).unwrap();
+            return;
+        }
+        let dir = ScratchDir::new("non-dumpable-sweep");
+        let mut fixture = spawn_non_dumpable_child(&dir).await;
+        let pid = fixture.child.id();
+        let program = &fixture.program;
+        let entry = fixture.entry.clone();
+        let process = subc_os::Process::open(pid).unwrap().unwrap();
+        let (observed, access) = process.observe_with_executable_access().unwrap_or_else(|| {
+            panic!(
+                "non-dumpable child must remain observable: stat={:?}, status={:?}, wait={:?}",
+                std::fs::read_to_string(format!("/proc/{pid}/stat")),
+                std::fs::read_to_string(format!("/proc/{pid}/status")),
+                fixture.child.try_wait()
+            );
+        });
+        assert_eq!(access, subc_os::ExecutableAccess::PermissionDenied);
+        assert_eq!(observed.executable, None);
+        assert_eq!(process.observe(), Some(observed));
+        let error = std::fs::File::open(format!("/proc/{pid}/exe")).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(std::fs::read_to_string(format!("/proc/{pid}/status")).is_ok());
+
+        assert!(entry.executable.is_some());
+        assert_eq!(
+            current_verdict(&entry, &process),
+            Some(IdentityVerdict::MatchesWithExecutablePermissionDenied)
+        );
+        let mut reused = entry.clone();
+        reused.start_time = Some(observed.start_time + 1);
+        assert_eq!(
+            current_verdict(&reused, &process),
+            Some(IdentityVerdict::StartTimeDiffers)
+        );
+        reused.start_time = None;
+        assert_eq!(
+            current_verdict(&reused, &process),
+            Some(IdentityVerdict::StartTimeUnrecorded)
+        );
+        reused = entry.clone();
+        reused.pid += 1;
+        assert_eq!(
+            current_verdict(&reused, &process),
+            Some(IdentityVerdict::PidDiffers)
+        );
+        reused = entry.clone();
+        reused.executable = None;
+        assert_eq!(
+            current_verdict(&reused, &process),
+            Some(IdentityVerdict::ExecutableUnrecorded)
+        );
+
+        let probe = crate::provenance::ExecutableIdentityProbe::default();
+        assert_eq!(
+            probe
+                .observe(Some(pid), Some(program), None, Some(observed.start_time))
+                .await,
+            subc_control::RunningImageAgreement::Unavailable {
+                reason:
+                    subc_control::RunningImageUnavailableReason::RunningExecutablePermissionDenied,
+            }
+        );
+        assert_eq!(
+            probe
+                .observe(
+                    Some(pid),
+                    Some(program),
+                    None,
+                    Some(observed.start_time + 1)
+                )
+                .await,
+            subc_control::RunningImageAgreement::Unavailable {
+                reason: subc_control::RunningImageUnavailableReason::ProcessIdentityUnconfirmed,
+            }
+        );
+
+        let path = record_path(&dir);
+        write_record(&path, std::slice::from_ref(&entry)).unwrap();
+        let decisions = sweep_orphans(
+            &RunDirLock::acquire(&path).unwrap(),
+            &AdoptedPids::none(),
+            SweepBounds {
+                term_grace: Duration::from_millis(300),
+                kill_bound: Duration::from_secs(2),
+            },
+        )
+        .await;
+        assert_eq!(decisions, vec![(entry, SweepDecision::Terminated)]);
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(fixture.child.wait().unwrap().signal(), Some(15));
+        assert!(read_record(&path).unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    mod hidden_processes {
+        use super::*;
+        use crate::registry::Registry;
+        use crate::supervise::{ModuleOverlap, ModuleSpec, RestartPolicy, Supervisor};
+        use std::sync::Arc;
+
+        fn spec(module_id: &str) -> ModuleSpec {
+            ModuleSpec {
+                module_id: module_id.to_owned(),
+                program: PathBuf::from("/bin/sleep"),
+                args: vec!["60".to_owned()],
+                env: vec![],
+                reserved: false,
+                reserved_prefixes: vec![],
+                protocol: ModuleProtocol::None,
+                overlap: ModuleOverlap::Exclusive,
+            }
+        }
+
+        async fn retained_fixture(dir: &Path) -> NonDumpableChild {
+            let fixture = spawn_non_dumpable_child(dir).await;
+            assert!(
+                subc_os::Process::open(fixture.entry.pid)
+                    .unwrap()
+                    .unwrap()
+                    .is_alive_but_unobservable(),
+                "this gate requires procfs hidepid=invisible"
+            );
+            let path = record_path(dir);
+            write_record(&path, std::slice::from_ref(&fixture.entry)).unwrap();
+            sweep_orphans(
+                &RunDirLock::acquire(&path).unwrap(),
+                &AdoptedPids::none(),
+                SweepBounds::default(),
+            )
+            .await;
+            fixture
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Linux procfs hidepid=invisible"]
+        async fn linux_hidden_non_dumpable_child_is_retained_and_image_is_hidden() {
+            let dir = ScratchDir::new("hidden-sweep");
+            let mut fixture = spawn_non_dumpable_child(&dir).await;
+            let process = subc_os::Process::open(fixture.entry.pid).unwrap().unwrap();
+            assert!(process.is_alive_but_unobservable());
+            rustix::process::test_kill_process(
+                rustix::process::Pid::from_raw(fixture.entry.pid as i32).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::metadata(format!("/proc/{}/stat", fixture.entry.pid))
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::NotFound
+            );
+            assert!(process.observe().is_none());
+            let identity = subc_os::process_identity::ProcessStart::parse(&format!(
+                "linux-v1-{}",
+                fixture.entry.start_time.unwrap()
+            ))
+            .unwrap();
+            assert_eq!(
+                subc_os::process_identity::liveness(fixture.entry.pid, Some(&identity)),
+                subc_os::process_identity::Liveness::Unknown
+            );
+            let image = crate::provenance::ExecutableIdentityProbe::default()
+                .observe(
+                    Some(fixture.entry.pid),
+                    Some(&fixture.program),
+                    None,
+                    fixture.entry.start_time,
+                )
+                .await;
+            assert_eq!(
+                image,
+                subc_control::RunningImageAgreement::Unavailable {
+                    reason: subc_control::RunningImageUnavailableReason::ProcessHidden,
+                }
+            );
+            let path = record_path(&dir);
+            write_record(&path, std::slice::from_ref(&fixture.entry)).unwrap();
+            let decisions = sweep_orphans(
+                &RunDirLock::acquire(&path).unwrap(),
+                &AdoptedPids::none(),
+                SweepBounds::default(),
+            )
+            .await;
+            assert_eq!(
+                decisions,
+                vec![(fixture.entry.clone(), SweepDecision::AliveButUnobservable)]
+            );
+            assert_eq!(read_record(&path).unwrap(), vec![fixture.entry.clone()]);
+            assert!(
+                fixture.child.try_wait().unwrap().is_none(),
+                "hidden child must never be signalled"
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Linux procfs hidepid=invisible"]
+        async fn linux_hidden_orphan_blocks_only_its_module_and_refuses_start_requests() {
+            let dir = ScratchDir::new("hidden-blocks-one");
+            let mut fixture = retained_fixture(&dir).await;
+            let supervisor =
+                Supervisor::new(Arc::new(Registry::default()), RestartPolicy::default())
+                    .with_live_children_record(record_path(&dir));
+            let waiting = supervisor
+                .supervise_configured_with_health(
+                    spec("previous"),
+                    true,
+                    crate::supervise::HealthConfig::default(),
+                    None,
+                    RestartPolicy::default(),
+                )
+                .unwrap();
+            let other = supervisor
+                .supervise_configured(spec("unrelated"), true)
+                .unwrap();
+            let other_live = other.status().unwrap().live;
+            let refused = waiting.set_enabled(true).await.unwrap_err().to_string();
+            assert!(refused.contains(&format!("waiting: previous instance (pid {}) is still running but hidden; it cannot be identified", fixture.entry.pid)));
+            assert!(waiting.restart(None).await.is_err());
+            assert!(waiting.reload().await.is_err());
+            assert!(waiting.swap(None).await.is_err());
+            assert!(supervisor.spawn(spec("previous")).is_err());
+            tokio::time::sleep(Duration::from_millis(5200)).await;
+            let status = waiting.status().unwrap();
+            let orphan_alive = fixture.child.try_wait().unwrap().is_none();
+            waiting.stop().await.unwrap();
+            other.stop().await.unwrap();
+            assert!(
+                other_live,
+                "an unrelated configured module must start normally"
+            );
+            assert!(!status.process_alive && status.pid.is_none());
+            assert_eq!(status.waiting_for_previous_pid, Some(fixture.entry.pid));
+            assert_eq!(status.spawn_generation, 0);
+            assert!(
+                orphan_alive,
+                "blocking must never signal the previous instance"
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Linux procfs hidepid=invisible"]
+        async fn linux_hidden_orphan_module_starts_after_previous_pid_exits() {
+            let dir = ScratchDir::new("hidden-starts-after-exit");
+            let mut fixture = retained_fixture(&dir).await;
+            let supervisor =
+                Supervisor::new(Arc::new(Registry::default()), RestartPolicy::default())
+                    .with_live_children_record(record_path(&dir));
+            let waiting = supervisor
+                .supervise_configured(spec("previous"), true)
+                .unwrap();
+            assert_eq!(
+                waiting.status().unwrap().waiting_for_previous_pid,
+                Some(fixture.entry.pid)
+            );
+            fixture.child.kill().unwrap();
+            fixture.child.wait().unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+            let status = loop {
+                let status = waiting.status().unwrap();
+                if status.process_alive {
+                    break status;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    waiting.stop().await.unwrap();
+                    panic!("module never started after the orphan exited");
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            let record = read_record(&record_path(&dir)).unwrap();
+            waiting.stop().await.unwrap();
+            assert_eq!(status.waiting_for_previous_pid, None);
+            assert_eq!(status.restart_count, 0);
+            assert_eq!(status.lifetime_restarts, 0);
+            assert_eq!(status.spawn_generation, 1);
+            assert_eq!(record.len(), 1);
+            assert_eq!(record[0].pid, status.pid.unwrap());
+            assert_ne!(record[0].pid, fixture.entry.pid);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires Linux procfs hidepid=invisible"]
+        async fn linux_hidden_orphan_record_survives_roster_rewrites() {
+            let dir = ScratchDir::new("hidden-record-rewrite");
+            let mut fixture = retained_fixture(&dir).await;
+            let path = record_path(&dir);
+            let roster = crate::child_roster::ChildRoster::default();
+            roster.record_to(path.clone());
+            let guard = roster.admit(
+                "unrelated".to_owned(),
+                std::process::id(),
+                ModuleProtocol::None,
+                None,
+                crate::child_roster::RecordedIdentity::default(),
+            );
+            assert!(read_record(&path).unwrap().contains(&fixture.entry));
+            drop(guard);
+            assert_eq!(read_record(&path).unwrap(), vec![fixture.entry.clone()]);
+            fixture.child.kill().unwrap();
+            fixture.child.wait().unwrap();
+            assert_eq!(roster.previous_instance_pid("previous"), None);
+            assert!(read_record(&path).unwrap().is_empty());
+        }
+    }
 
     fn child(module_id: &str, pid: u32) -> LiveChild {
         LiveChild {
@@ -618,6 +1197,7 @@ mod tests {
                 device: 7,
                 inode: 11,
                 macos_sh_interpreter: None,
+                windows_file_identity: None,
             }),
             cgroup_name: Some(format!("{module_id}-a")),
         }
@@ -645,7 +1225,7 @@ mod tests {
         );
         let mut entry = child("sh-script", 40);
         entry.executable = Some(ExecutableIdentity::from(launcher));
-        let dir = TestTempDir::new("sh-interpreter-record");
+        let dir = ScratchDir::new("sh-interpreter-record");
         let path = record_path(&dir);
         write_record(&path, &[entry]).unwrap();
         let recorded = read_record(&path).unwrap().pop().unwrap();
@@ -758,7 +1338,7 @@ mod tests {
             device: 7,
             inode: 12,
         });
-        let dir = TestTempDir::new("previous-roster-reader");
+        let dir = ScratchDir::new("previous-roster-reader");
         let path = record_path(&dir);
         write_record(&path, &[entry]).unwrap();
         let bytes = fs::read(&path).unwrap();
@@ -789,7 +1369,7 @@ mod tests {
 
     #[test]
     fn record_round_trips() {
-        let dir = TestTempDir::new("live-children-round-trip");
+        let dir = ScratchDir::new("live-children-round-trip");
         let path = record_path(&dir);
         let mut subc = child("aft", 41);
         subc.protocol = ModuleProtocol::Subc;
@@ -804,8 +1384,135 @@ mod tests {
     }
 
     #[test]
+    fn windows_file_id_record_is_full_width_and_readable_by_rollback_reader() {
+        #[derive(Deserialize)]
+        struct PreviousImage {
+            device: u64,
+            inode: u64,
+        }
+        #[derive(Deserialize)]
+        struct PreviousChild {
+            module_id: String,
+            pid: u32,
+            protocol: ModuleProtocol,
+            start_time: Option<u64>,
+            executable: Option<PreviousImage>,
+            cgroup_name: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct PreviousRecord {
+            version: u32,
+            children: Vec<PreviousChild>,
+        }
+        let dir = ScratchDir::new("windows-file-id-rollback");
+        let path = record_path(&dir);
+        let mut entry = child("windows-child", 40);
+        let image = entry.executable.as_mut().unwrap();
+        image.device = 0;
+        image.inode = 0;
+        image.windows_file_identity = Some(WindowsFileIdentity {
+            volume_serial_number: u64::MAX,
+            file_id: [
+                0, 1, 2, 3, 4, 5, 6, 7, 128, 129, 130, 131, 252, 253, 254, 255,
+            ],
+        });
+        write_record(&path, std::slice::from_ref(&entry)).unwrap();
+        assert_eq!(read_record(&path).unwrap(), vec![entry]);
+        let previous: PreviousRecord = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(previous.version, 1);
+        let previous = &previous.children[0];
+        assert_eq!(previous.module_id, "windows-child");
+        assert_eq!(previous.pid, 40);
+        assert_eq!(previous.protocol, ModuleProtocol::None);
+        assert_eq!(previous.start_time, Some(1_000));
+        assert_eq!(previous.cgroup_name.as_deref(), Some("windows-child-a"));
+        assert_eq!(previous.executable.as_ref().unwrap().device, 0);
+        assert_eq!(previous.executable.as_ref().unwrap().inode, 0);
+    }
+
+    #[test]
+    fn unix_record_without_windows_identity_keeps_original_bytes() {
+        let dir = ScratchDir::new("unix-record-bytes");
+        let path = record_path(&dir);
+        write_record(&path, &[child("nats", 40)]).unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), "{\n  \"version\": 1,\n  \"children\": [\n    {\n      \"module_id\": \"nats\",\n      \"pid\": 40,\n      \"protocol\": \"none\",\n      \"start_time\": 1000,\n      \"executable\": {\n        \"device\": 7,\n        \"inode\": 11\n      },\n      \"cgroup_name\": \"nats-a\"\n    }\n  ]\n}");
+    }
+
+    #[cfg(windows)]
+    mod windows_processes {
+        use super::*;
+        use std::os::windows::process::CommandExt;
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+
+        fn spawn_recorded() -> (ChildGuard, LiveChild) {
+            // Suspended test executable: a real process identity without running
+            // another test suite or depending on an installed helper program.
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .creation_flags(0x4)
+                .spawn()
+                .unwrap();
+            let entry = LiveChild {
+                module_id: "previous".to_owned(),
+                pid: child.id(),
+                protocol: ModuleProtocol::None,
+                start_time: subc_os::start_time(child.id()),
+                executable: None,
+                cgroup_name: None,
+            };
+            assert!(entry.start_time.is_some());
+            (ChildGuard(child), entry)
+        }
+
+        #[tokio::test]
+        async fn windows_orphan_sweep_leaves_different_creation_time_alone() {
+            let (mut child, mut entry) = spawn_recorded();
+            entry.start_time = entry.start_time.map(|time| time + 1);
+            let dir = ScratchDir::new("windows-sweep-reused-pid");
+            let path = record_path(&dir);
+            write_record(&path, std::slice::from_ref(&entry)).unwrap();
+            let owner = RunDirLock::acquire(&path).unwrap();
+            let decisions =
+                sweep_orphans(&owner, &AdoptedPids::none(), SweepBounds::default()).await;
+            assert_eq!(
+                decisions,
+                vec![(
+                    entry,
+                    SweepDecision::Mismatched(IdentityVerdict::StartTimeDiffers)
+                )]
+            );
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "unrelated process was terminated"
+            );
+        }
+
+        #[tokio::test]
+        async fn windows_orphan_sweep_force_stops_matching_creation_time() {
+            let (mut child, entry) = spawn_recorded();
+            let dir = ScratchDir::new("windows-sweep-matched");
+            let path = record_path(&dir);
+            write_record(&path, std::slice::from_ref(&entry)).unwrap();
+            let owner = RunDirLock::acquire(&path).unwrap();
+            let decisions =
+                sweep_orphans(&owner, &AdoptedPids::none(), SweepBounds::default()).await;
+            assert_eq!(decisions, vec![(entry, SweepDecision::ForcedStopped)]);
+            assert!(
+                child.0.try_wait().unwrap().is_some(),
+                "sweep did not await forced exit"
+            );
+        }
+    }
+
+    #[test]
     fn a_missing_record_is_empty_and_an_unknown_version_is_refused() {
-        let dir = TestTempDir::new("live-children-missing");
+        let dir = ScratchDir::new("live-children-missing");
         let path = record_path(&dir);
         assert_eq!(read_record(&path).unwrap(), Vec::new());
         fs::write(&path, br#"{"version":99,"children":[]}"#).unwrap();
@@ -819,7 +1526,7 @@ mod tests {
     /// rename must leave the previous record whole and no temp file behind.
     #[test]
     fn a_failed_write_leaves_the_previous_record_whole() {
-        let dir = TestTempDir::new("live-children-failed-write");
+        let dir = ScratchDir::new("live-children-failed-write");
         let path = record_path(&dir);
         let previous = vec![child("nats", 40)];
         write_record(&path, &previous).unwrap();
@@ -849,7 +1556,7 @@ mod tests {
     /// would sooner or later see a torn one.
     #[test]
     fn a_concurrent_reader_never_sees_a_partial_record() {
-        let dir = TestTempDir::new("live-children-concurrent");
+        let dir = ScratchDir::new("live-children-concurrent");
         let path = record_path(&dir);
         let short = vec![child("nats", 40)];
         let long: Vec<LiveChild> = (0..200).map(|pid| child("module", pid)).collect();
@@ -971,7 +1678,7 @@ mod tests {
     /// always lists exactly the processes the daemon has running.
     #[test]
     fn the_roster_keeps_the_record_in_step_with_admits_and_releases() {
-        let dir = TestTempDir::new("roster-record");
+        let dir = ScratchDir::new("roster-record");
         let path = record_path(&dir);
         let roster = crate::child_roster::ChildRoster::default();
         roster.record_to(path.clone());
@@ -981,6 +1688,7 @@ mod tests {
                 device: 1,
                 inode: 2,
                 macos_sh_interpreter: None,
+                windows_file_identity: None,
             }),
             cgroup_name: Some("nats-a".to_owned()),
             #[cfg(target_os = "linux")]
@@ -1090,7 +1798,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_recorded_child_still_running_is_terminated_at_boot() {
-            let dir = TestTempDir::new("sweep-terminates");
+            let dir = ScratchDir::new("sweep-terminates");
             let path = record_path(&dir);
             let (mut child, entry) = spawn_recorded(&executable("sleep"), &["60"]);
             write_record(&path, std::slice::from_ref(&entry)).unwrap();
@@ -1108,9 +1816,45 @@ mod tests {
             assert_eq!(read_record(&path).unwrap(), Vec::new());
         }
 
+        #[cfg(target_os = "linux")]
+        #[tokio::test]
+        async fn linux_child_with_other_executable_read_failure_is_not_signalled() {
+            let (mut child, entry) = spawn_recorded(&executable("sleep"), &["60"]);
+            // Inject an unavailable image into a live child's observation. Unlike
+            // EACCES/EPERM, an ENOENT or I/O failure must still prevent signalling
+            // even when the recorded PID and start time match.
+            let decisions = sweep_entries_with_verdict(
+                vec![entry.clone()],
+                &AdoptedPids::none(),
+                quick(),
+                |entry, process| {
+                    let mut observed = process.observe().unwrap();
+                    observed.executable = None;
+                    Some(verdict_with_executable_access(
+                        entry,
+                        process.pid(),
+                        &observed,
+                        subc_os::ExecutableAccess::Unavailable,
+                    ))
+                },
+            )
+            .await;
+            let alive = still_running(&mut child);
+            child.kill().unwrap();
+            child.wait().unwrap();
+            assert_eq!(
+                decisions,
+                vec![(
+                    entry,
+                    SweepDecision::Mismatched(IdentityVerdict::ExecutableUnreadable)
+                )]
+            );
+            assert!(alive, "the sweep must leave the unreadable child running");
+        }
+
         #[tokio::test]
         async fn a_recorded_child_ignoring_sigterm_is_killed_after_the_grace() {
-            let dir = TestTempDir::new("sweep-kills");
+            let dir = ScratchDir::new("sweep-kills");
             let path = record_path(&dir);
             // `read` is a shell builtin, so the shell itself waits on the
             // piped stdin with SIGTERM ignored; nothing else is exec'd. The
@@ -1147,7 +1891,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_pid_now_held_by_an_unrelated_process_is_not_signalled() {
-            let dir = TestTempDir::new("sweep-reused-pid");
+            let dir = ScratchDir::new("sweep-reused-pid");
             let path = record_path(&dir);
             let (mut child, entry) = spawn_recorded(&executable("sleep"), &["60"]);
             // The record says the pid belonged to a process started at
@@ -1180,7 +1924,7 @@ mod tests {
 
         #[tokio::test]
         async fn same_pid_and_start_time_running_another_executable_is_not_signalled() {
-            let dir = TestTempDir::new("sweep-other-executable");
+            let dir = ScratchDir::new("sweep-other-executable");
             let path = record_path(&dir);
             let (mut child, entry) = spawn_recorded(&executable("sleep"), &["60"]);
             let mut other = entry.clone();
@@ -1212,7 +1956,7 @@ mod tests {
 
         #[tokio::test]
         async fn an_entry_for_a_gone_process_is_dropped() {
-            let dir = TestTempDir::new("sweep-gone");
+            let dir = ScratchDir::new("sweep-gone");
             let path = record_path(&dir);
             let (mut child, entry) = spawn_recorded(&executable("sleep"), &["60"]);
             child.kill().unwrap();
@@ -1232,7 +1976,7 @@ mod tests {
 
         #[tokio::test]
         async fn an_adopted_pid_is_left_running() {
-            let dir = TestTempDir::new("sweep-adopted");
+            let dir = ScratchDir::new("sweep-adopted");
             let path = record_path(&dir);
             let (mut child, entry) = spawn_recorded(&executable("sleep"), &["60"]);
             write_record(&path, std::slice::from_ref(&entry)).unwrap();
@@ -1252,7 +1996,7 @@ mod tests {
 
         #[tokio::test]
         async fn an_unconfirmed_trampoline_image_is_never_signalled_by_orphan_cleanup() {
-            let dir = TestTempDir::new("sweep-unconfirmed-trampoline");
+            let dir = ScratchDir::new("sweep-unconfirmed-trampoline");
             let path = record_path(&dir);
             let (mut child, mut entry) = spawn_recorded(&executable("sleep"), &["60"]);
             entry.executable = None;

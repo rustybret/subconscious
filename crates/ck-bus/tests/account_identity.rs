@@ -1,5 +1,5 @@
-//! Ladder row "Machine id and account" (slice 4 of `docs/specs/ck-bus-module.md`, with
-//! the key and first-boot rules of `docs/designs/nats-install-trust-chain.md`).
+//! Ladder row "Machine id and account" (slice 4 of `docs/ck-bus.md`, with
+//! the key and first-boot rules of `docs/nats-install-trust-chain.md`).
 //! served-by: harness-signer.
 //!
 //! A supervised ck-bus boots against a real `nats-server` configured the way `ck setup`
@@ -35,13 +35,13 @@ mod harness;
 #[path = "../src/runtime/seams.rs"]
 mod runtime;
 
+use cortexkit_test_support::ScratchDir;
 use std::{
     collections::BTreeSet,
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
 };
-use subc_test_support::TestTempDir;
 
 use async_nats::jetstream::{self, consumer::pull};
 use async_trait::async_trait;
@@ -123,7 +123,7 @@ async fn start(machine_id: &str) -> Option<Plane> {
 }
 
 async fn start_run(
-    root: TestTempDir,
+    root: ScratchDir,
     trust: &TrustChain,
     server: &BusServer,
     machine_id: &str,

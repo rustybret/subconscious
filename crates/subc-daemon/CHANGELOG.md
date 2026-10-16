@@ -1,5 +1,199 @@
 # Changelog
 
+## 0.36.5
+
+- Always refuse module→client frames whose header plus body exceeds the client sink's total egress byte budget (4 MiB), even though previously they could pass through an empty queue. Oversized replies become daemon-origin `ERROR frame_too_large` on the same channel/epoch/correlation, ending only that request; other routes on the connection remain usable. Oversized reverse Requests are answered with the same ERROR to the module instead of reaching the client. This backstop complements the fleet's 3 MiB per-frame rule. A frame that would fit an empty queue but meets a full one is different: the client has stopped reading, so the slow client is still closed as before. The same applies when the replacement ERROR itself meets a full queue, so the module's frame reader never waits on a stuck client.
+- An oversized Push remains the one oversize case that closes the client connection, with a WARN naming the module, client principal, channel, frame size and limit. Route-local recovery requires a dedicated `route.closed` reason and a decoder-first rollout because deployed Rust clients cannot decode new reason variants. Control and other egress admission accounting is unchanged.
+
+## 0.36.4
+
+- Slow `route.open` dispatch warnings now name the target module and attested opener and report time spent in admission and scope checks, project-root filesystem resolution, egress reservation, bind send, and the bind ACK wait. Fast opens emit no additional logs; routing and scope admission semantics are unchanged. Refusals before opener attestation report `principal=unresolved`.
+
+## 0.36.3
+
+- Require scope bind proofs only from non-reserved daemon-stamped openers, both at admission and before captured relay. Launch-attested reserved owners and carriers need no proof and ignore any proof sent. Their binds do not count toward idle-only rotation, and their `hold_presence` records no presence. Advertise `scope-bind-proof/v2` alongside v1 and `scope-replace-if-idle/v1`; owners can gate hashes on v2.
+
+## 0.36.2
+
+- With `replace_only_if_idle: true`, atomically refuse epoch replacement or same-epoch bind-proof change with per-record `scope_epoch_in_use` while the live epoch has routes, admitted binds in flight, or connection-held presence. An absent or false flag keeps unconditional replacement and its usual route drains. Scoped opens can hold presence until client disconnect or epoch end, surviving target restart; cap holders at eight, so further connections may bind but acquire no presence. Refused opens leave no presence. Advertise `scope-replace-if-idle/v1` in HELLO_ACK and `server.describe`.
+
+## 0.36.1
+
+- Advertise `scope-bind-proof/v1` in HELLO_ACK and `server.describe`. Owners should set `bind_proof_sha256` only when the connected daemon advertises this capability.
+
+## 0.36.0
+
+- **Breaking wire dependency upgrade.** Store optional scope bind-proof hashes. When a scope has one, every route open under it needs the matching proof: from the scope's owner and from every principal the owner lists as a carrier alike. It's checked at admission and again just before the bind is relayed to the module, in case the owner re-registered the scope meanwhile. Decode unpadded base64url of 32 bytes, hash the decoded bytes with SHA-256 and compare digest bytes in constant time. Without a hash, admission remains unchanged and proofs are ignored. Proofs never enter describe replies, logs, refusal details, activity attribution or module bind stamps; the hash stays out of describe and bind stamps.
+
+## 0.35.0
+
+- Shared peer sockets detected on macOS or Linux are described as "an unidentified local process" and use connection-keyed cooldowns rather than attributing requests to whichever holder is found first. Caller and executable-cooldown tests open their connecting socket in a re-exec child that never forks, so unrelated child spawns cannot make their identity ambiguous.
+- Explicitly unlock the singleton start lock when its bootstrap owner is dropped. Closing the daemon's descriptor alone can leave an inherited open file description locked until a concurrent child execs; restart can now reacquire immediately. Blocking filesystem tasks still retain their lock guards until the protected work finishes.
+- **Breaking.** Add the top-level daemon config key `privileged_operator_prompt` (`log` or `enforce`; omitted means `log`, any other value fails loading and rescan answers `invalid_daemon_config`). It adds the public `DaemonConfig::privileged_operator_prompt` field, the `PrivilegedOperatorPrompt` enum and the `RestartRequiredSection::PrivilegedOperatorPrompt` variant (`ALL` now has six entries), so struct literals and exhaustive matches must be updated. The key is restart-required: a rescan that changes it reports `privileged_operator_prompt` and the running mode stays until the daemon restarts, because the setting guards rescan itself.
+- Classify every client channel-0 request in one exhaustive match. Restart, swap, reload, applying rescan, set_enabled and release_reserved are privileged; reads, `route.open`, `route.poll`, health probes and the rescan preview are not. A connection that owns a module registration still gets `unsupported_control_frame` for them, unchanged in both modes.
+- In `log` (the default), every privileged client request runs as before and logs one INFO line naming the operation, target and caller that would have been prompted.
+- In `enforce`, the daemon holds each privileged client request and asks the operator through the same provider, queue and limits as `operator.confirm`. It runs the request as received only on approval; a decline or withdrawal answers `operator_declined` and no possible prompt answers `operator_presence_unavailable`, both with the existing `detail.reason` strings. No wire code is added. Held requests do not block their connection's reader, and a disconnect withdraws the prompt and runs nothing. Linux keeps refusing with `operator_presence_unavailable`.
+- The prompt text is built by the daemon from the operation, its target and the caller, never from client text, and fits the `operator.confirm` 200-character summary rule (`privileged_prompt::prompt_text`). An applying rescan's prompt promises no module count: the config is read after approval.
+- Add `caller_identity::CallerIdentity`, which resolves the pid and executable of the process on the other end of an accepted loopback connection (libproc on macOS, `/proc` socket inodes on Linux, `GetExtendedTcpTable` on Windows, through `subc-os` 0.1.17). A failed lookup is described as "an unidentified local process" and never refuses a request on its own.
+- Three person declines of privileged requests within a sliding 10 minutes from one executable (one connection when the executable is unresolved) start a 10-minute cooldown and log one WARN line naming the executable. During it, that executable's requests, including ones already queued and a reconnect, are answered at once with `operator_declined` and `detail.reason` `backoff`, without a prompt, and audited with `prompt_shown` false. Disconnects, withdrawals, timeouts and unavailability do not count, and refusals during the cooldown do not extend it.
+
+## 0.34.10
+
+- Change the reason to “approve a request from {module_id}: {summary} (requested by {opener}).” The macOS Touch ID sheet places that reason after “{app} is trying to,” so this verb phrase makes the whole sentence grammatical.
+
+## 0.34.9
+
+- Register every accepted configured module with the supervisor before publishing the connection file, in `starting` or `disabled` state. Start enabled processes and their monitors only after publication, so children can read their `--subc` file and discovery-time status requests cannot incorrectly report an accepted configured module as unsupervised. Preserve per-module health, restart and drain policies and record spawn failures on the existing status handle. Entries refused during registration are logged and skipped without preventing publication or startup of the other modules.
+- Keep `configured module supervised` as the activation-time log, separate from the earlier registration log. Verify that a configured `protocol: "none"` child's first spawn persists its PID, start time and executable identity without a HELLO. The shutdown child roster (`ChildRoster::admit`) still writes `live-children.json` synchronously, with macOS executable confirmation following the trampoline's exec acknowledgement.
+
+## 0.34.8
+
+- Withdraws 0.34.7, which was never published: listing configured modules before the connection file is published returns in a later release with a fix for the orphan-sweep regression it caused. The code is identical to 0.34.6.
+
+## 0.34.6
+
+- Keep a crash's `route.closed` non-terminal when the supervisor has reserved the last available restart slot but has not yet published `Restarting`. Publish the pending-recovery fact atomically with the budget reservation, so connection cleanup cannot mistake the replacement's exhausted budget for the crashed process's recovery verdict. Terminal exit history still precedes the visible state change. Add a deterministic terminal-record barrier regression test.
+
+## 0.34.5
+
+- Publish the connection file at startup from tokio's blocking-thread pool instead of an async worker thread. The write fsyncs, and on a slow or busy disk that held a runtime worker for seconds (an in-process daemon in a test harness may share two workers with everything else). The order and guarantees are unchanged: the file is still written owner-only, fsynced and atomically renamed, only after the readiness probe authenticates, and the singleton start lock stays held until the write finishes, even if the startup future is dropped meanwhile. If the write task panics or is cancelled, startup fails with `ConnectionFileWrite` naming the file. Loading or minting the machine id, which fsyncs a newly minted file, also moved to the blocking pool, holding the start and run-directory locks the same way.
+
+## 0.34.4
+
+- Test only: the lifecycle provenance test waits for macOS exec confirmation before reading the running image, instead of failing when the status read comes first.
+
+## 0.34.3
+
+- List a module in `catalog.list`, and advance the catalog generation, only once its forwarding endpoint is installed and `route.open` can reach it. A HELLO now reserves the module's registry entry unpublished (the id is claimed, so a duplicate HELLO is still refused), installs the forwarding endpoint (queueing HELLO_ACK first, as before), then publishes the entry. Previously a client that opened a route as soon as the module was listed could be refused `target_unavailable` ("has no live forwarding connection"). While the entry is reserved but not yet published, `catalog.list` omits it but `route.open` and supervisor lookups still find it, so `route.open` answers `target_unavailable`, never `unknown_module`. A HELLO whose forwarding registration fails leaves the catalog generation unchanged. Swap candidates are published the same way, so the swap supervisor no longer sees a candidate as registered before the candidate's forwarding endpoint exists, which could fail the cutover. Add `Registry::register_unpublished_with_control_ops`, `register_unpublished_candidate_with_control_ops`, `publish_registration`, `published_registration` and `list_registered_modules`; the existing `register_with_control_ops` and `register_candidate_with_control_ops` still publish immediately.
+
+## 0.34.2
+
+- Record best-effort `subc.module_started` activity when a registered module's running-image identity differs from its latest start entry still present in the retained activity log. Compare the complete provenance evidence: Linux SHA-256 digest, macOS device/inode, or Windows volume/file ID. Include the tagged values in `details.old_evidence` and `details.new_evidence`, and identify the control requester as actor, or `reserved:subc` (the daemon itself) for a start with no requester. Count a skipped start only when no running-image evidence is available. A change between evidence methods, for example after moving a module to another platform, records a new start because identities measured by different methods cannot establish that the executable is unchanged.
+- Record requested stop, restart/reload, swap cutover, disable and roster-changing rescan outcomes with the requester's verified principal. Refusals, no-ops, crash restarts and unrequested exits do not produce transition events.
+- Queue lifecycle appends without waiting on storage or spending module rate credit. Count and warn with the event kind on failed or dropped appends; expose `activity_lifecycle_append_failures` and `activity_started_digest_skips` alongside the activity capability in `server.describe`.
+
+## 0.34.1
+
+- Add `ActivityConfig`, `load_with_activity` and a bootstrap retention builder without changing the public `DaemonConfig` struct or exhaustive wire enums. Module and activity policies are parsed from the same config document during bootstrap and rescan.
+- Serve `activity.query` and `activity.subscribe` for Direct readers and nonce-verified `reserved:callosum` / `reserved:ckbus`. A registered module connection uses that module's reserved principal and ignores any supplied consumer identity, so only Callosum and ck-bus can read activity data through that connection. A separate consumer connection presenting no consumer identity is Direct, including one opened by a supervised module: the daemon cannot distinguish it from the operator's `ck` connection, so it retains local operator read access.
+- Filter retained JSONL by agent, project, module, kind and inclusive time bounds, ordered by sequence with exclusive sequence pagination. Pin every query's current-incarnation head and file handles/lengths under the writer lock; scan after unlocking, off the connection reader. Count and skip malformed lines and repair incomplete tails on reopen.
+- Replay successful appends from the current incarnation's 1024-entry ring and end a lagging feed after its queued entries with `activity_subscriber_lagged`. After restart, a query's head cursor combines the new daemon's incarnation ID with the previous daemon's highest retained sequence; it is accepted while no entry after that cursor has left the ring, but once eviction would leave a gap it refuses `activity_cursor_too_old` and requires query recovery. Foreign incarnation cursors refuse `activity_cursor_incarnation_mismatch`.
+- Add `activity.max_age_days` (30) and `activity.max_total_mb` (64), both positive integers. Bootstrap uses these bounds and executed `supervisor.rescan` reopens the sink under the writer lock to apply changes without a restart; previews do not prune. The size budget includes the active file plus rotated generations, scaling per-file size for budgets beyond 256 MiB.
+
+## 0.34.0
+
+- **Breaking.** Upgrade direct dependencies to `subc-protocol` 0.31, `subc-control` 0.30 and `subc-transport` 0.12 together with the daemon: its public API passes their types to consumers. Replace `ScopeStamp` literals with its constructor and setters and account for optional `call_mode` in raw bind constructors and exhaustive patterns. Restart the daemon before scope owners send delegating runs. Providers must read every bind's mode, handle all three known modes and refuse unknown modes before declaring `call-modes/v1`; the daemon does not enforce per-tool mode restrictions.
+- Require subc-protocol 0.31. Targets declaring `call-modes/v1` receive a scope-derived `call_mode` on every bind and `expires_at_ms` on stamps with deadlines. Legacy targets receive neither new field: non-delegating runs still bind through `agent-run-scopes/v1`, and flows through `flow-scopes/v1`. Both route admission and the captured relay endpoint require `call-modes/v1` or the matching legacy capability.
+- Accept delegating run scope records, but refuse their binds unless the target declares `call-modes/v1`. Older run providers assumed no delegated agent authority; the refusal names that delegation and a relay refusal releases its reservation.
+- Include the immutable epoch deadline in `scope.describe` stamps. Existing Rust stamp decoders accept extra fields, and Swift's management reply path preserves them. The TypeScript client has no describe API or reply decoder; its provider bind decoder ignores extra fields. Swift has no provider bind decoder.
+- Update the record-validation test that formerly required `run_id` with `delegates` to be refused: delegation is now checked against each route's target, not rejected in scope records. Add daemon bind golden fixtures and reconnect tests that replace an admitted declarer with a legacy endpoint, verifying field omission and delegation refusal at relay re-check.
+
+## 0.33.12
+
+- On a daemon cut, `route.closed` keeps `reason: restart` and now reports the module connection's measured `drained` result, just like a single-module restart. A quiet route reports `true`; a drain that exceeds the two-second budget, fails, or has no recorded measurement reports `false`. Results belong to the connection drained by the cut, not a replacement registration with the same module id. `abandoned` still counts route.bind relays torn down separately and is not covered by `drained`.
+
+## 0.33.11
+
+- Correct activity tests that failed in CI: compare Windows project roots without the verbatim path prefix, and drop a test that read this changelog. No runtime change from 0.33.10, which was never published.
+
+## 0.33.10
+
+- Serve additive `activity.record` requests from registered modules and advertise `activity-ledger/v1` in HELLO_ACK and server.describe. The daemon verifies route ownership/epoch and live scope tags before recording the verified identity of the client that opened the route, its project and scope attributes. Events with no route or scope citation identify the calling module.
+- Append `activity.jsonl` beside the terminal journal through cortexkit-log on a bounded single-writer queue. Replies follow successful writes, sequence numbers resume across retained rotated files, and reopening adds a newline after an incomplete final record so it cannot swallow the next append. Open/write failures and queue saturation refuse recording without holding connection readers or stopping routing, supervision or shutdown.
+- Enforce module-owned kinds, Unicode scalar and compact JSON size limits, strict request shape and incarnation-long per-module token buckets (60 initial tokens, 10/s). Add controlled-clock, fault-injection and isolated TCP daemon tests.
+
+## 0.33.9
+
+- Sweep recorded Linux children whose PID and start time match when executable access is denied with EACCES/EPERM. Log at info that the executable is not readable (non-dumpable), without claiming image agreement. Missing recorded identities, PID reuse, different executables, and other read failures still refuse signalling; macOS and Windows are unchanged.
+- Report permission-denied running images with a distinct unavailable reason after confirming the process start time. This remains unavailable, not an image match, for reload and upgrade decisions.
+- On Linux procfs with `hidepid`, keep alive-but-unobservable orphans without signalling them. Merge their records across roster rewrites, block only their module IDs with an explicit previous-PID waiting reason, and keep unrelated modules serving. Recheck existence with signal-zero about every five seconds; only ESRCH releases the record and permits normal configured startup, without spending crash-restart budget. Start, restart, reload, swap, and route requests report the waiting reason while that previous instance exists.
+
+## 0.33.8
+
+- Record terminal history before publishing a health-budget failure or clearing the reaped child's process facts. Apply the same ordering to every child-bearing drain, ordinary exit and daemon-shutdown exit; failed waits and drain teardown errors record their unknown exit before publishing failure. Journal errors still retain the exit record in memory and publish the requested stopped, disabled, restarting or failed state. A panic during terminal recording also publishes that state before resuming the unwind. No-child spawn failures remain failures without fabricated exit records.
+- Add a test-only socket barrier at the terminal writer to prove health-budget and ordinary exits cannot publish failure or process death before history is available, plus health-budget journal-error and recording-panic coverage.
+
+## 0.33.7
+
+- Give each Windows module process a separate named pipe, including a replacement started alongside a still-serving module. Before writing the nonce, the server requires the connected process's PID to equal the PID returned when the daemon spawned that module. Keep `SUBC_LAUNCH_NONCE` and `SUBC_LAUNCH_NONCE_PIPE_FALLBACK=env` until every module reads the pipe, so failed pipe preparation or delivery does not prevent registration. Only after the client reads every byte does the daemon record `pipe` in `supervisor.list` and `supervisor.provenance` under `daemon_observed.launch_nonce_source`; module list/status displays that record.
+- Keep the process handle used for Windows executable-identity and resource checks alongside the pipe handles. Remove the fallback permission with the environment copy once every module reads the pipe; keeping the copy still exposes the secret to other processes running as the same user.
+
+## 0.33.6
+
+- Compare Windows configured and spawned paths after OS canonicalization so ordinary and verbatim spellings do not falsely require a reload. A different resolved configured program still requires a reload even when the child's executable matches the file at its original spawn path.
+- Preserve Windows launches by explicit path to extensionless executable images; only try the `.exe` suffix when the exact path is absent.
+- Capture Windows executable identity before suspended spawn and retain the child's handle for provenance and resource readings. Provenance now reports match, mismatch or unavailable using creation time and the full file ID; orphan cleanup only forces a stop on a matching creation time, and waits for exit. Persist Windows file IDs as additive version-1 fields so rollback readers keep reading the roster; Unix records and supervision are unchanged.
+
+## 0.33.5
+
+- Advertise `catalog-events/v1` in `server.describe`, so a consumer can tell a catalog entry without `events` (the module declares none) from a daemon that does not report declared events.
+- Create Windows run directories with protected owner-only DACLs instead of trusting inherited permissions, including redirected paths. Tighten existing run directories and remove broad inherited access from unprotected descendants using `subc-os`.
+
+## 0.33.4
+
+- Include each registered module's declared bus events in `catalog.list` without changing entries whose manifests omit events.
+- Rate-limit pre-authentication rejection logs per listener instead of process-wide, so one listener's rejects can no longer suppress another listener's first line.
+
+## 0.33.3
+
+- Keep an exited child's stdout reader running to EOF when it exceeds the 250 ms restart wait, just like stderr. Aborting that reader discarded output still buffered in the pipe, which could leave Windows capture files permanently short after a burst. The restart remains bounded; late output from either pipe may arrive after the replacement starts.
+
+## 0.33.2
+
+- Log pre-authentication rejections at info level with the peer, elapsed time, and a reason that distinguishes capacity waits, handshake deadlines, invalid proofs, malformed messages, and peers that close early. Rate-limit each reason and include its accumulated suppressed count on the next permitted line.
+
+## 0.33.1
+
+- Fix a route that `route.open` reported as open but that silently dropped the client's first requests. When a module answered the route bind very quickly, the daemon could commit the route and then, a moment later, also tell the module to drop it (a GOODBYE on the route's channel). The client got "accepted", the module logged `dropped module frame without a matching route binding cause=unbound_channel` for the client's requests, and the client waited forever for answers. The daemon now sends that GOODBYE only for a bind it really abandoned (the client went away, or the module began draining, before the module answered), and never for a route it committed. A bind the module acked for a client that had already gone still gets exactly one GOODBYE.
+
+## 0.33.0
+
+- Enforce scope deadlines (`expires_at_ms`) on wall-clock time: an expired scope ends with every route under it closed as `scope_ended`, and is refused if resent. A route.open under a scope past its deadline is refused `scope_not_live` even before the next sweep. The expiry check runs only while some live scope has a deadline, so a daemon without deadlines never wakes for it.
+- Serve `scope.apply` (advertised in `subc_ops`) and the `run_id` rules, with the `agent-run-scopes/v1` admission gate checked at admission and again on the captured relay connection.
+- **Breaking.** Requires `subc-protocol` 0.30, `subc-control` 0.29 and `subc-transport` 0.11, whose types appear in this crate's public API.
+
+## 0.32.16
+
+- Test-only: the tests' helpers (temporary directories, process-liveness checks, and copies of test programs under `ckdev-` names) now come from the published `cortexkit-test-support` crate, which other CortexKit repositories also use, instead of a private copy in this repository. No runtime change.
+
+## 0.32.15
+
+- Log each mutating supervisor request before handling it, including the daemon-verified caller principal and connection id. Preview rescans and read-only requests are not logged.
+
+## 0.32.14
+
+- Log each module registration ending (`module registration ended`, with the reason: connection closed, goodbye, supervisor stop or restart, failed registration, or replaced), and log when a swap restart promotes the new process's registration over the old one (`module registration promoted`). The existing `module registered` line is unchanged.
+
+## 0.32.13
+
+- Park running children that have no health check instead of polling registration every 10 ms. For modules that register over the subc wire, health probing now starts and stops on registry notifications (HELLO, reconnect, disconnect, catalog updates and swap promotion) instead of a timer; live HTTP health configuration still changes through supervisor commands. Non-wire children without HTTP health wait only for exit or commands. Unknown-health snapshots are written only when their fields change. The advertised-health jittered cadence (30–33 seconds by default) and exit/registration-release waits are unchanged.
+
+## 0.32.12
+
+- Test only: three supervisor tests no longer fail when tests run in parallel. The test log capture keeps a second log dispatcher alive, so a parallel test with no subscriber can't make the logging library cache a log line as disabled; the exec-status test waits for the module's process id instead of reading it once; and the warming-snapshot test uses a fixture with no live supervisor task.
+
+## 0.32.11
+
+- 0.32.10 was never published (its CI failed on a Linux lint error); this release carries its changes plus that fix.
+- Connect `operator.confirm` to the isolated macOS LocalAuthentication and Windows Hello/CredUI providers. Only a successful OS authentication confirms; errors remain fail-closed. Linux still returns `unsupported_platform` without a prompt. Withdrawing a prompt that is on screen is supported only after the person-present checks in subc-presence's README pass on that platform.
+
+## 0.32.9
+
+- Build time only: the build script watches the workspace `Cargo.lock` only when it exists. Built from a registry or vendored copy there is no workspace lock two levels up, and cargo treats a missing watched path as always changed, so every consumer rebuilt this crate on every build.
+
+## 0.32.8
+
+- Build time only, no runtime change: the build script, which stamps the git commit into the binary, no longer recompiles the crate on every cargo run in a git worktree. It watched `.git/HEAD` and `.git/refs` paths that don't exist when `.git` is a worktree's file, and cargo treats a missing watched path as always changed. It now resolves paths with `git rev-parse --git-path` and watches only the existing HEAD, current branch ref, `packed-refs` and index, so a rebuild happens only when the checked-out commit or the index changes.
+
+## 0.32.7
+
+- Serve and advertise the additive `operator.confirm` operation with nonce/route permission checks, validated summaries, a bounded FIFO queue, decline back-off, independent withdraw/timeout/stuck timers, and bounded answer delivery. Audit every outcome with an escaped summary. Until a platform prompt is installed, every request is answered `operator_presence_unavailable`, so nothing can be approved by default. The scripted provider used by tests exists only with the `test-support` feature and only for daemons running under a `ckdev-` name, so a production `ck-subc` can never approve through it.
+
+## 0.32.6
+
+- Validate optional module event declarations at HELLO before registry admission, refusing malformed blocks with `invalid_event_declaration` and a field-naming reason. Requires subc-protocol 0.29.3, whose manifest decoder retains `events` in the registry alongside the other manifest data. Older modules without events are unchanged.
+- Declarations are **not yet served** in `catalog.list`, `server.describe`, or `ck catalog`; serving lands in the next subc-control minor release. Older daemons drop the field. Deploy readers before publishers depend on event discovery; this validation-only release is not a discovery guarantee.
+
 ## 0.32.5
 
 - Record the exhausted crash budget's terminal history before publishing the module as `failed`, so status readers cannot observe the failure before its exit record. Journal write failures still leave the module failed; an exit-recording panic publishes failure before continuing its unwind. Commands and health actions remain serialized by the supervisor, and journal I/O does not hold the status snapshot lock.

@@ -49,6 +49,21 @@ pub struct ModuleManifest {
     /// the daemon validates before accepting a HELLO.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<CapabilityDeclarations>,
+    /// Events published as notices on `ck.{acct}.event.{module_id}.{event}.v{N}`.
+    /// The publisher serves the body; declared headers are filter hints, never authority.
+    ///
+    /// `None` means the module has not declared events. `Some(vec![])` affirmatively
+    /// declares that it publishes none. Absence remains absent on the wire.
+    ///
+    /// Declarations are validated at HELLO and retained in the daemon registry,
+    /// but no client can read them yet: `catalog.list`, `server.describe` and
+    /// `ck catalog` do not return them, because subc-control's `CatalogEntry`
+    /// has no field for them and adding one is a breaking change. A daemon built
+    /// before this field existed drops it silently. So a flow engine cannot yet
+    /// discover a module's events from the catalog, and a module must not depend
+    /// on that discovery until a daemon that serves declarations is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<Vec<EventDeclaration>>,
     /// Periodic or event-driven behavior this module performs against an external
     /// surface, so later analysts can account for the resulting self-shaped time
     /// series.
@@ -101,6 +116,7 @@ pub struct ModuleManifestBuilder {
     consumes: Vec<ConsumerRole>,
     bindings: Option<Bindings>,
     capabilities: Option<CapabilityDeclarations>,
+    events: Option<Vec<EventDeclaration>>,
     self_signals: Option<Vec<SelfSignalDeclaration>>,
     provenance: Option<ManifestProvenance>,
 }
@@ -127,6 +143,7 @@ impl ModuleManifest {
             consumes: Vec::new(),
             bindings: None,
             capabilities: None,
+            events: None,
             self_signals: None,
             provenance: None,
         }
@@ -180,6 +197,12 @@ impl ModuleManifestBuilder {
         self
     }
 
+    /// Adds optional bus event declarations; an empty list declares no events.
+    pub fn events(mut self, events: Option<Vec<EventDeclaration>>) -> Self {
+        self.events = events;
+        self
+    }
+
     /// Adds optional periodic or event-driven behavior declarations.
     pub fn self_signals(mut self, self_signals: Option<Vec<SelfSignalDeclaration>>) -> Self {
         self.self_signals = self_signals;
@@ -204,6 +227,7 @@ impl ModuleManifestBuilder {
             consumes: self.consumes,
             bindings: self.bindings,
             capabilities: self.capabilities,
+            events: self.events,
             self_signals: self.self_signals,
             provenance: self.provenance,
         }
@@ -244,6 +268,8 @@ struct ModuleManifestWire {
     #[serde(default)]
     capabilities: Option<CapabilityDeclarations>,
     #[serde(default)]
+    events: Option<Value>,
+    #[serde(default)]
     self_signals: Option<Vec<SelfSignalDeclaration>>,
     #[serde(default)]
     provenance: Option<ManifestProvenance>,
@@ -262,6 +288,12 @@ impl<'de> Deserialize<'de> for ModuleManifest {
         let wire = ModuleManifestWire::deserialize(deserializer)?;
         validate_runtime_computed(wire.runtime_computed.as_ref(), "runtime_computed")
             .map_err(D::Error::custom)?;
+        validate_events_value(wire.events.as_ref()).map_err(D::Error::custom)?;
+        let events = wire
+            .events
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(D::Error::custom)?;
         let mut builder = Self::builder(wire.module_id, wire.module_version)
             .protocol_ver(wire.protocol_ver)
             .trust_tier(wire.trust_tier);
@@ -273,6 +305,7 @@ impl<'de> Deserialize<'de> for ModuleManifest {
             .consumes(wire.consumes)
             .bindings(wire.bindings)
             .capabilities(wire.capabilities)
+            .events(events)
             .self_signals(wire.self_signals)
             .provenance(wire.provenance)
             .build();
@@ -281,6 +314,218 @@ impl<'de> Deserialize<'de> for ModuleManifest {
             .map_err(D::Error::custom)?;
         Ok(manifest)
     }
+}
+
+/// The `server.describe` capability a daemon advertises when `catalog.list`
+/// carries each module's declared `events`. Without it, an entry with no
+/// `events` cannot tell "this module declares none" from "this daemon never
+/// reports them", so a consumer that acts on declared events checks for this
+/// first.
+pub const CAP_CATALOG_EVENTS_V1: &str = "catalog-events/v1";
+
+/// A daemon advertising this capability stores scope `bind_proof_sha256` hashes
+/// and enforces `bind_proof` on scoped route opens. A scope owner should set the
+/// hash only when the daemon it is connected to advertises this capability.
+pub const CAP_SCOPE_BIND_PROOF_V1: &str = "scope-bind-proof/v1";
+
+/// Bind proofs are required only from non-attested openers; reserved modules
+/// are exempt. Owners relying on this exemption should set `bind_proof_sha256`
+/// only when the connected daemon advertises this capability.
+pub const CAP_SCOPE_BIND_PROOF_V2: &str = "scope-bind-proof/v2";
+
+/// Atomic idle-only scope rotation and connection-held scope presence.
+pub const CAP_SCOPE_REPLACE_IF_IDLE_V1: &str = "scope-replace-if-idle/v1";
+
+/// A versioned bus event notice whose body is served by the publisher.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EventDeclaration {
+    /// One NATS subject token: `[a-z0-9][a-z0-9_]{0,62}`.
+    ///
+    /// This is the event token rule in `cortexkit-bus-naming` 0.2.0,
+    /// [`token.rs`, lines 91–143](https://docs.rs/cortexkit-bus-naming/0.2.0/src/cortexkit_bus_naming/token.rs.html#91-143).
+    pub name: String,
+    /// Event schema version, at least 1.
+    pub version: u32,
+    /// Header names every notice carries, for filtering only, never authority.
+    /// Names match `[a-z][a-z0-9_]{0,31}` and are unique within the declaration.
+    pub headers: Vec<String>,
+    /// Short human line for consent cards, at most 200 characters without controls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+impl EventDeclaration {
+    /// Starts an event declaration with no filter headers or summary.
+    /// Validation happens when decoding a manifest or admitting its HELLO.
+    pub fn new(name: impl Into<String>, version: u32) -> Self {
+        Self {
+            name: name.into(),
+            version,
+            headers: Vec::new(),
+            summary: None,
+        }
+    }
+
+    /// Sets the header names carried by every notice of this event.
+    pub fn with_headers(mut self, headers: Vec<String>) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    /// Sets or removes the short human summary.
+    pub fn with_summary(mut self, summary: Option<String>) -> Self {
+        self.summary = summary;
+        self
+    }
+}
+
+/// A safe-to-report event declaration failure, without echoing untrusted values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct EventDeclarationError {
+    field: String,
+    reason: &'static str,
+}
+
+impl EventDeclarationError {
+    fn new(field: impl Into<String>, reason: &'static str) -> Self {
+        Self {
+            field: field.into(),
+            reason,
+        }
+    }
+
+    /// The precise malformed field path, relative to the manifest.
+    pub fn field(&self) -> &str {
+        &self.field
+    }
+}
+
+impl fmt::Display for EventDeclarationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid event declaration: field {} {}",
+            self.field, self.reason
+        )
+    }
+}
+
+impl std::error::Error for EventDeclarationError {}
+
+/// Validates event declarations before HELLO decoding can lose field context.
+pub fn validate_hello_event_declarations(hello: &Value) -> Result<(), EventDeclarationError> {
+    validate_events_value(
+        hello
+            .get("manifest")
+            .and_then(|manifest| manifest.get("events")),
+    )
+}
+
+fn is_valid_event_name(name: &str) -> bool {
+    (1..=63).contains(&name.len())
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn validate_events_value(value: Option<&Value>) -> Result<(), EventDeclarationError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| EventDeclarationError::new("events", "must be a list"))?;
+    if entries.len() > 64 {
+        return Err(EventDeclarationError::new(
+            "events",
+            "must contain at most 64 declarations",
+        ));
+    }
+    let mut pairs = HashSet::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let field = format!("events[{index}]");
+        let entry = entry
+            .as_object()
+            .ok_or_else(|| EventDeclarationError::new(&field, "must be an object"))?;
+        let name_field = format!("{field}.name");
+        let name = entry
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| EventDeclarationError::new(&name_field, "must be a string"))?;
+        if !is_valid_event_name(name) {
+            return Err(EventDeclarationError::new(
+                name_field,
+                "must match [a-z0-9][a-z0-9_]{0,62}",
+            ));
+        }
+        let version = entry
+            .get("version")
+            .and_then(Value::as_u64)
+            .filter(|version| (1..=u32::MAX as u64).contains(version))
+            .ok_or_else(|| {
+                EventDeclarationError::new(
+                    format!("{field}.version"),
+                    "must be an integer between 1 and u32::MAX",
+                )
+            })?;
+        if !pairs.insert((name, version)) {
+            return Err(EventDeclarationError::new(
+                &field,
+                "duplicates an event (name, version) pair",
+            ));
+        }
+        let headers_field = format!("{field}.headers");
+        let headers = entry
+            .get("headers")
+            .and_then(Value::as_array)
+            .ok_or_else(|| EventDeclarationError::new(&headers_field, "must be a list"))?;
+        if headers.len() > 16 {
+            return Err(EventDeclarationError::new(
+                headers_field,
+                "must contain at most 16 headers",
+            ));
+        }
+        let mut names = HashSet::new();
+        for (header_index, header) in headers.iter().enumerate() {
+            let header_field = format!("{headers_field}[{header_index}]");
+            let header = header
+                .as_str()
+                .ok_or_else(|| EventDeclarationError::new(&header_field, "must be a string"))?;
+            if !(1..=32).contains(&header.len())
+                || !header.as_bytes()[0].is_ascii_lowercase()
+                || !header
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+            {
+                return Err(EventDeclarationError::new(
+                    header_field,
+                    "must match [a-z][a-z0-9_]{0,31}",
+                ));
+            }
+            if !names.insert(header) {
+                return Err(EventDeclarationError::new(
+                    header_field,
+                    "duplicates a header name",
+                ));
+            }
+        }
+        if let Some(summary) = entry.get("summary").filter(|value| !value.is_null()) {
+            let summary_field = format!("{field}.summary");
+            let summary = summary
+                .as_str()
+                .ok_or_else(|| EventDeclarationError::new(&summary_field, "must be a string"))?;
+            if summary.chars().count() > 200 || summary.chars().any(char::is_control) {
+                return Err(EventDeclarationError::new(
+                    summary_field,
+                    "must contain at most 200 characters and no control characters",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A raw HELLO declaration error that can be reported before serde drops context.
@@ -592,7 +837,8 @@ pub struct ManifestProvenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_schema_version: Option<String>,
     /// Where the running module read its launch nonce from: `fd` (the pipe
-    /// the daemon hands over as descriptor 3) or `env` (the environment
+    /// the daemon hands over as descriptor 3), `pipe` (the Windows named pipe),
+    /// or `env` (the environment
     /// variable kept while modules move to the pipe). Absent means the module
     /// did not say. This is a fact about the running process, not the build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -610,6 +856,8 @@ pub struct ManifestProvenance {
 pub enum LaunchNonceSource {
     /// Read from the inherited descriptor the daemon passes.
     Fd,
+    /// Read from the PID-authenticated Windows named pipe.
+    Pipe,
     /// Read from the `SUBC_LAUNCH_NONCE` environment variable.
     Env,
     ForwardCompatibleUnknown(String),
@@ -620,6 +868,7 @@ impl LaunchNonceSource {
     pub fn wire_name(&self) -> &str {
         match self {
             Self::Fd => "fd",
+            Self::Pipe => "pipe",
             Self::Env => "env",
             Self::ForwardCompatibleUnknown(value) => value,
         }
@@ -629,6 +878,7 @@ impl LaunchNonceSource {
     pub fn from_wire_name(value: &str) -> Self {
         match value {
             "fd" => Self::Fd,
+            "pipe" => Self::Pipe,
             "env" => Self::Env,
             _ => Self::ForwardCompatibleUnknown(value.to_string()),
         }

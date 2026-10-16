@@ -4,7 +4,7 @@
 //! registered connection synced it, never a value in the request, and the
 //! `ref` is an opaque string unique within that owner only. The design is
 //! `docs/designs/daemon-scopes.md`; the wire shapes here are the owner-facing
-//! half of it (`scope.sync`, `scope.describe`).
+//! half of it (`scope.sync`, `scope.apply`, `scope.describe`).
 //!
 //! Every record type refuses unknown fields. A field this daemon does not know
 //! may be one that narrows authority in a later version (a carrier's target
@@ -49,6 +49,29 @@ fn deserialize_scope_principals<'de, D: serde::Deserializer<'de>>(
         .map(|principals| principals.into_iter().map(Into::into).collect())
 }
 
+/// A scope bind-proof hash is the lowercase hexadecimal SHA-256 digest.
+pub fn validate_bind_proof_sha256(hash: &str) -> Result<(), &'static str> {
+    if hash.len() == 64
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        Ok(())
+    } else {
+        Err("bind_proof_sha256 must be exactly 64 lowercase hexadecimal characters")
+    }
+}
+
+fn deserialize_bind_proof_sha256<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let hash = Option::<String>::deserialize(deserializer)?;
+    if let Some(hash) = &hash {
+        validate_bind_proof_sha256(hash).map_err(serde::de::Error::custom)?;
+    }
+    Ok(hash)
+}
+
 /// The `server.describe` capability a daemon advertises when it admits routes
 /// under scopes. A carrier that needs a scoped route and does not see it fails
 /// the call (`scope_unsupported`) instead of opening an unscoped route.
@@ -62,6 +85,9 @@ pub const CAP_ROUTE_ROLE_VERSIONS_V1: &str = "route-role-versions/v1";
 
 /// Module-to-subc op that registers an owner's full scope set.
 pub const SCOPE_SYNC_OP: &str = "scope.sync";
+/// Module-to-subc op that upserts or ends scopes without replacing the owner's
+/// full scope set.
+pub const SCOPE_APPLY_OP: &str = "scope.apply";
 /// Module-to-subc op that reads one scope's current state.
 pub const SCOPE_DESCRIBE_OP: &str = "scope.describe";
 
@@ -75,6 +101,9 @@ pub const MAX_SCOPE_ATTRIBUTE_BYTES: usize = 4 * 1024;
 pub const MAX_SCOPE_TOMBSTONES_PER_OWNER: usize = 1_000;
 /// Most modules one targeted carrier entry may list.
 pub const MAX_CARRIER_TARGETS: usize = 16;
+/// Most milliseconds a new scope epoch's deadline may be ahead of the daemon's
+/// current Unix wall clock: 24 hours.
+pub const MAX_SCOPE_EXPIRY_AHEAD_MS: u64 = 86_400_000;
 
 /// What a scope stands for. Closed, and fixed for the life of one
 /// `scope_epoch`: a different kind needs a new epoch, which ends the old scope.
@@ -90,12 +119,23 @@ pub enum ScopeKind {
 /// epoch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ScopeParent {
     #[serde(deserialize_with = "deserialize_scope_principal")]
     pub owner: Principal,
     #[serde(rename = "ref")]
     pub scope_ref: String,
     pub scope_epoch: u64,
+}
+
+impl ScopeParent {
+    pub fn new(owner: Principal, scope_ref: impl Into<String>, scope_epoch: u64) -> Self {
+        Self {
+            owner,
+            scope_ref: scope_ref.into(),
+            scope_epoch,
+        }
+    }
 }
 
 /// Who, besides the owner, may open routes under a scope.
@@ -106,6 +146,7 @@ pub struct ScopeParent {
 /// read as either "none" or "all".
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ScopeCarrier {
     #[serde(deserialize_with = "deserialize_scope_principal")]
     pub principal: Principal,
@@ -113,17 +154,42 @@ pub struct ScopeCarrier {
     pub targets: Option<Vec<String>>,
 }
 
+impl ScopeCarrier {
+    pub fn new(principal: Principal) -> Self {
+        Self {
+            principal,
+            targets: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_targets(mut self, targets: Option<Vec<String>>) -> Self {
+        self.targets = targets;
+        self
+    }
+}
+
 /// Declaring this in a manifest's `capabilities.provides` promises that the
 /// module recognises a scope carrying `flow_id` and applies flow behaviour:
 /// it never treats the flow as its owner agent.
+/// During migration, either this capability or
+/// [`crate::call_mode::CALL_MODES_CAPABILITY`] admits flow scopes.
 pub const FLOW_SCOPES_CAPABILITY: &str = "flow-scopes/v1";
 
-/// The attributes the daemon stamps without interpreting. They bear authority,
-/// so only an owner module named in the daemon config's `scope_authority_owners`
+/// Declaring this in a manifest's `capabilities.provides` promises that the
+/// module recognises `run_id` as one agent run and does not exercise the agent's
+/// delegated authority under that scope.
+/// During migration it admits non-delegating run scopes; delegating runs require
+/// [`crate::call_mode::CALL_MODES_CAPABILITY`] instead.
+pub const AGENT_RUN_SCOPES_CAPABILITY: &str = "agent-run-scopes/v1";
+
+/// The authority attributes the daemon copies into scope stamps unchanged.
+/// Only an owner module named in the daemon config's `scope_authority_owners`
 /// list (by default the module that owns agent sessions) may set them; a scope
 /// owned by any other module must leave them empty.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ScopeAttributes {
     /// The agent the scope's session belongs to. Identity, never permission.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -142,16 +208,59 @@ pub struct ScopeAttributes {
     /// compare to notice a change), and every route under the scope is closed
     /// with the reason `scope_delegation_changed`, so no live route keeps the
     /// old identity.
-    /// A target must provide [`FLOW_SCOPES_CAPABILITY`] before the daemon may
-    /// send a bind stamped with this field. Decoding it alone is not enough:
+    /// A target must provide [`FLOW_SCOPES_CAPABILITY`] or
+    /// [`crate::call_mode::CALL_MODES_CAPABILITY`] before the daemon may send a
+    /// bind stamped with this field. Decoding it alone is not enough:
     /// the target must also apply flow behaviour instead of agent behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_id: Option<String>,
+    /// Identifies one run carried out on behalf of `agent_id`. Requires
+    /// `agent_id`, forbids `flow_id`, and uses
+    /// [`validate_run_id`]'s token rule.
+    /// Adding, changing or removing it within an epoch increments the scope's
+    /// content version and closes routes under the scope with
+    /// `scope_delegation_changed`. The daemon sends this field in a bind only to
+    /// a target module providing [`AGENT_RUN_SCOPES_CAPABILITY`] or
+    /// [`crate::call_mode::CALL_MODES_CAPABILITY`]. A delegating run scope is
+    /// accepted as a record, but binds only to a target providing the latter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 impl ScopeAttributes {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_agent_id(mut self, agent_id: Option<String>) -> Self {
+        self.agent_id = agent_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_delegates(mut self, delegates: bool) -> Self {
+        self.delegates = delegates;
+        self
+    }
+
+    #[must_use]
+    pub fn with_flow_id(mut self, flow_id: Option<String>) -> Self {
+        self.flow_id = flow_id;
+        self
+    }
+
+    #[must_use]
+    pub fn with_run_id(mut self, run_id: Option<String>) -> Self {
+        self.run_id = run_id;
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.agent_id.is_none() && !self.delegates && self.flow_id.is_none()
+        self.agent_id.is_none()
+            && !self.delegates
+            && self.flow_id.is_none()
+            && self.run_id.is_none()
     }
 }
 
@@ -162,9 +271,16 @@ pub fn validate_flow_id(flow_id: &str) -> Result<(), crate::tool_call::OpaqueFie
     crate::tool_call::validate_opaque_field("flow_id", flow_id)
 }
 
-/// One scope as its owner registers it in `scope.sync`.
+/// Check a run id using the shared opaque-token rule: 1–256 ASCII bytes in
+/// `0x21`–`0x7E`. Errors name `run_id`.
+pub fn validate_run_id(run_id: &str) -> Result<(), crate::tool_call::OpaqueFieldError> {
+    crate::tool_call::validate_opaque_field("run_id", run_id)
+}
+
+/// One scope as its owner registers it in `scope.sync` or `scope.apply`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ScopeRecord {
     #[serde(rename = "ref")]
     pub scope_ref: String,
@@ -173,6 +289,25 @@ pub struct ScopeRecord {
     /// restart, and uses a higher one when it reuses the ref for a new session.
     pub scope_epoch: u64,
     pub kind: ScopeKind,
+    /// Only the holder of the scope's bind proof can bind it when this hash is
+    /// present. Without a hash, admission is unchanged and proofs are ignored.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_bind_proof_sha256"
+    )]
+    pub bind_proof_sha256: Option<String>,
+    /// Refuse an epoch replacement or bind-proof change while routes are bound
+    /// to the live epoch, including binds admitted but not yet committed, or
+    /// connected presence holders remain. Send only after capability discovery.
+    /// This is a request condition, not a stored scope attribute.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replace_only_if_idle: bool,
+    /// Absolute Unix wall-clock deadline in milliseconds. It cannot be added,
+    /// changed or removed within this scope epoch; absent means no deadline.
+    /// This is not an authority attribute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ScopeParent>,
     /// Principals, other than the owner, allowed to register child scopes under
@@ -189,13 +324,124 @@ pub struct ScopeRecord {
     pub attributes: ScopeAttributes,
 }
 
+impl ScopeRecord {
+    pub fn new(scope_ref: impl Into<String>, scope_epoch: u64, kind: ScopeKind) -> Self {
+        Self {
+            scope_ref: scope_ref.into(),
+            scope_epoch,
+            kind,
+            bind_proof_sha256: None,
+            replace_only_if_idle: false,
+            expires_at_ms: None,
+            parent: None,
+            child_owners: Vec::new(),
+            carriers: Vec::new(),
+            attributes: ScopeAttributes::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_bind_proof_sha256(mut self, hash: Option<String>) -> Self {
+        self.bind_proof_sha256 = hash;
+        self
+    }
+
+    #[must_use]
+    pub fn with_replace_only_if_idle(mut self, replace_only_if_idle: bool) -> Self {
+        self.replace_only_if_idle = replace_only_if_idle;
+        self
+    }
+
+    #[must_use]
+    pub fn with_expires_at_ms(mut self, expires_at_ms: Option<u64>) -> Self {
+        self.expires_at_ms = expires_at_ms;
+        self
+    }
+
+    #[must_use]
+    pub fn with_parent(mut self, parent: Option<ScopeParent>) -> Self {
+        self.parent = parent;
+        self
+    }
+
+    #[must_use]
+    pub fn with_child_owners(mut self, child_owners: Vec<Principal>) -> Self {
+        self.child_owners = child_owners;
+        self
+    }
+
+    #[must_use]
+    pub fn with_carriers(mut self, carriers: Vec<ScopeCarrier>) -> Self {
+        self.carriers = carriers;
+        self
+    }
+
+    #[must_use]
+    pub fn with_attributes(mut self, attributes: ScopeAttributes) -> Self {
+        self.attributes = attributes;
+        self
+    }
+}
+
+/// A request to end one scope session in `scope.apply`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ScopeEnd {
+    #[serde(rename = "ref")]
+    pub scope_ref: String,
+    pub scope_epoch: u64,
+}
+
+impl ScopeEnd {
+    pub fn new(scope_ref: impl Into<String>, scope_epoch: u64) -> Self {
+        Self {
+            scope_ref: scope_ref.into(),
+            scope_epoch,
+        }
+    }
+}
+
+/// What `scope.apply` did with one requested end.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeEndOutcome {
+    /// The named scope ref was live at this epoch and was ended.
+    Ended,
+    /// The named scope ref was not live at this epoch; this end request changed
+    /// nothing.
+    NotLive,
+}
+
+/// The per-end result in a `scope.apply` reply, in request order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[non_exhaustive]
+pub struct ScopeEndResult {
+    #[serde(rename = "ref")]
+    pub scope_ref: String,
+    pub scope_epoch: u64,
+    pub outcome: ScopeEndOutcome,
+}
+
+impl ScopeEndResult {
+    pub fn new(scope_ref: impl Into<String>, scope_epoch: u64, outcome: ScopeEndOutcome) -> Self {
+        Self {
+            scope_ref: scope_ref.into(),
+            scope_epoch,
+            outcome,
+        }
+    }
+}
+
 /// The scope a `route.open` asks to be admitted under.
 ///
 /// `scope_epoch` is optional on the wire only so that leaving it out is
 /// refused by name (`scope_epoch_required`) rather than as a malformed body:
 /// every opener must name it, the owner included.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ScopeSelector {
     #[serde(deserialize_with = "deserialize_scope_principal")]
     pub owner: Principal,
@@ -203,6 +449,58 @@ pub struct ScopeSelector {
     pub scope_ref: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope_epoch: Option<u64>,
+    /// Base64url-encoded 32-byte secret, without padding. Ignored for records
+    /// without a bind-proof hash, so holders may always send their proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind_proof: Option<String>,
+    /// Keep connection-held presence after an admitted open, even if its route
+    /// closes. Send only to daemons advertising `scope-replace-if-idle/v1`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold_presence: bool,
+}
+
+impl ScopeSelector {
+    pub fn new(owner: Principal, scope_ref: impl Into<String>, scope_epoch: Option<u64>) -> Self {
+        Self {
+            owner,
+            scope_ref: scope_ref.into(),
+            scope_epoch,
+            bind_proof: None,
+            hold_presence: false,
+        }
+    }
+
+    #[must_use]
+    pub fn with_bind_proof(mut self, proof: Option<String>) -> Self {
+        self.bind_proof = proof;
+        self
+    }
+
+    #[must_use]
+    pub fn with_hold_presence(mut self, hold_presence: bool) -> Self {
+        self.hold_presence = hold_presence;
+        self
+    }
+}
+
+impl std::fmt::Debug for ScopeSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopeSelector")
+            .field("owner", &self.owner)
+            .field("scope_ref", &self.scope_ref)
+            .field("scope_epoch", &self.scope_epoch)
+            .field(
+                "bind_proof",
+                &self.bind_proof.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+impl std::fmt::Display for ScopeSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self, f)
+    }
 }
 
 /// The state of a scope's parent link.
@@ -219,7 +517,7 @@ pub enum ParentState {
     Ended,
 }
 
-/// What a `scope.sync` did with one record.
+/// What a `scope.sync` or `scope.apply` did with one record.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ScopeRecordOutcome {
@@ -232,12 +530,12 @@ pub enum ScopeRecordOutcome {
     /// The ref was live at this epoch with identical content; its `version`
     /// did not move.
     Unchanged,
-    /// The record was refused on its own merits (`code` says why) and the ref
-    /// keeps whatever state it had before this sync.
+    /// The record was refused on its own merits (`code` says why). The refusal
+    /// itself does not change the ref or undo any expiry processing.
     Refused,
 }
 
-/// The per-record result in a `scope.sync` reply, in request order.
+/// The per-record result in a `scope.sync` or `scope.apply` reply, in request order.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScopeRecordResult {
     #[serde(rename = "ref")]
@@ -260,8 +558,9 @@ pub struct ScopeRecordResult {
     pub parent_state: Option<ParentState>,
 }
 
-/// A scope of the syncing owner that the sync ended, by removal or by a
-/// higher epoch for the same ref.
+/// A scope session of the calling owner that ended through omission from
+/// `scope.sync`, an explicit `scope.apply` end, replacement by a higher epoch
+/// for the same ref or expiry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ScopeEnded {
     #[serde(rename = "ref")]
@@ -285,7 +584,9 @@ pub enum ScopeStatus {
 }
 
 /// The fields the daemon stamps for a live scope.
+/// Build with [`ScopeStamp::new`] and the setters so future fields are additive.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ScopeStamp {
     pub owner: Principal,
     #[serde(rename = "ref")]
@@ -301,6 +602,64 @@ pub struct ScopeStamp {
     /// Whether the owner is listed in the daemon's `scope_authority_owners`.
     /// Providers decide on this flag and keep no copy of the list.
     pub owner_authorized: bool,
+    /// Absolute Unix wall-clock deadline in milliseconds, fixed for this epoch.
+    /// On route binds the daemon sends this deadline only to targets declaring
+    /// [`crate::call_mode::CALL_MODES_CAPABILITY`], because older providers may
+    /// reject unfamiliar scope-stamp fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_ms: Option<u64>,
+}
+
+impl ScopeStamp {
+    /// A stamp with no parent, attributes or deadline, and no owner authority.
+    pub fn new(
+        owner: Principal,
+        scope_ref: impl Into<String>,
+        scope_epoch: u64,
+        kind: ScopeKind,
+    ) -> Self {
+        Self {
+            owner,
+            scope_ref: scope_ref.into(),
+            scope_epoch,
+            kind,
+            parent: None,
+            parent_state: None,
+            attributes: ScopeAttributes::new(),
+            owner_authorized: false,
+            expires_at_ms: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_parent(mut self, parent: Option<ScopeParent>) -> Self {
+        self.parent = parent;
+        self
+    }
+
+    #[must_use]
+    pub fn with_parent_state(mut self, parent_state: Option<ParentState>) -> Self {
+        self.parent_state = parent_state;
+        self
+    }
+
+    #[must_use]
+    pub fn with_attributes(mut self, attributes: ScopeAttributes) -> Self {
+        self.attributes = attributes;
+        self
+    }
+
+    #[must_use]
+    pub fn with_owner_authorized(mut self, owner_authorized: bool) -> Self {
+        self.owner_authorized = owner_authorized;
+        self
+    }
+
+    #[must_use]
+    pub fn with_expires_at_ms(mut self, expires_at_ms: Option<u64>) -> Self {
+        self.expires_at_ms = expires_at_ms;
+        self
+    }
 }
 
 #[cfg(test)]

@@ -1,14 +1,21 @@
 #![forbid(unsafe_code)]
 
+pub mod activity;
 pub mod consumer;
 pub mod policy_cache;
+#[cfg(any(test, feature = "test-support"))]
+mod stand_in;
+#[cfg(feature = "test-support")]
+pub mod test_support;
+pub use activity::*;
 pub use consumer::{
     is_retryable_route_open_code, CallError, CallOptions, CatalogList, CloseRouteOptions,
-    ConnectionState, ConsumerError, ConsumerOptions, ControlPush, OutcomeUnknownCause, PushEvent,
-    RetryBackoff, ReverseRequestContext, ReverseRequestError, ReverseRequestRegistrationError,
-    ReverseRequestRegistry, RouteCloseDisposition, RouteCloseReason, RouteEndReason,
-    RoutePollResult, ScopeSelector, SpawnStreamError, SpawnSubscription, SubcConsumer,
-    SubscribeOptions, Subscription, SubscriptionClosed, DEFAULT_CALL_TIMEOUT,
+    ConnectionState, ConsumerCapabilityError, ConsumerError, ConsumerOptions, ControlPush,
+    OutcomeUnknownCause, PushEvent, RetryBackoff, ReverseRequestContext, ReverseRequestError,
+    ReverseRequestRegistrationError, ReverseRequestRegistry, RouteCloseDisposition,
+    RouteCloseReason, RouteEndReason, RoutePollResult, ScopeBindProofRefusal, ScopeSelector,
+    SpawnStreamError, SpawnSubscription, SubcConsumer, SubscribeOptions, Subscription,
+    SubscriptionClosed, SupervisorEntry, SupervisorListResponse, DEFAULT_CALL_TIMEOUT,
     DEFAULT_LIVENESS_PROBE_WINDOW, DEFAULT_ROUTE_RETRY_DEADLINE, SPAWN_CURSOR_INCARNATION_MISMATCH,
     SPAWN_CURSOR_TOO_OLD, SPAWN_SUBSCRIBER_LAGGED,
 };
@@ -37,25 +44,30 @@ use std::{
 pub use async_trait::async_trait;
 pub use subc_control::{CatalogEntry, ConsumerIdentity};
 /// The one launch-nonce reader for a module process: `launch_nonce()` reads
-/// the inherited descriptor (or, while the daemon still sets it, the
-/// `SUBC_LAUNCH_NONCE` environment copy) once and caches it. The SDK's HELLO and route opens go through it too; a module's
-/// own readers must as well, and it should call it before spawning anything.
+/// the inherited Unix descriptor, the Windows named pipe, or, when neither is
+/// named, the `SUBC_LAUNCH_NONCE` environment copy once and caches it. The SDK's
+/// HELLO and route opens go through it too; a module's own readers must as well.
+/// Read before spawning children so they cannot inherit an unread Unix pipe
+/// containing the module's credential.
 pub use subc_os::launch_nonce;
 use subc_protocol::{
+    call_mode::derive_call_mode,
+    error_codes,
     manifest::ModuleManifest,
     scope::{
-        ScopeEnded, ScopeRecord, ScopeRecordResult, ScopeStamp, ScopeStatus, SCOPE_DESCRIBE_OP,
-        SCOPE_SYNC_OP,
+        ScopeEnd, ScopeEndResult, ScopeEnded, ScopeRecord, ScopeRecordResult, ScopeStamp,
+        ScopeStatus, SCOPE_APPLY_OP, SCOPE_DESCRIBE_OP, SCOPE_SYNC_OP,
     },
     session::{
         ModuleControlCommand, ModuleControlRequest, ModuleControlRequestFromModule,
-        ModuleControlResponse, ModuleControlResponseToModule, MODULE_CONTROL_OP_HEALTH_CHECK,
-        MODULE_TO_SUBC_OP_CATALOG_UPDATE,
+        ModuleControlResponse, ModuleControlResponseToModule, OperatorConfirmReply,
+        OperatorConfirmRequest, MODULE_CONTROL_OP_HEALTH_CHECK, MODULE_TO_SUBC_OP_CATALOG_UPDATE,
     },
     BindIdentity, ErrorBody, Flags, Frame, FrameBuildError, FrameType, ModuleHelloAckBody,
     ModuleHelloBody, Principal, Priority, RouteTarget, PROTOCOL_VERSION, SUBC_MODULE_ID_ENV,
 };
 pub use subc_protocol::{
+    call_mode::{CallMode, CALL_MODES_CAPABILITY},
     manifest::{
         build_provenance, CapabilityDeclarations, CapabilityNeed, CapabilityRequirement,
         ExecutionMode, LaunchNonceSource, ManifestProvenance, ProvenanceFormError, ProviderRole,
@@ -76,12 +88,14 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufWriter},
     net::TcpStream,
     sync::{mpsc, oneshot, Semaphore},
-    time::{timeout, Instant},
+    time::{timeout, timeout_at, Instant},
 };
 use tokio_util::sync::{CancellationToken, WaitForCancellationFuture};
 
 const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const CATALOG_UPDATE_TIMEOUT: Duration = Duration::from_secs(10);
+const OPERATOR_CONFIRM_TIMEOUT: Duration = Duration::from_secs(290);
+const OPERATOR_CONFIRM_OP: &str = "operator.confirm";
 const EGRESS_BUFFER: usize = 64;
 const HANDLER_TASK_CAPACITY: usize = 64;
 /// A full dispatcher is normal during a burst. Report dispatch impairment only
@@ -247,8 +261,26 @@ pub struct ScopeSyncReply {
     /// own merits is here with outcome `refused` and its code; the rest of the
     /// sync still applied.
     pub results: Vec<ScopeRecordResult>,
-    /// Scopes of this owner that the sync ended, by leaving them out or by
-    /// sending a higher epoch for the same ref.
+    /// Scopes of this owner that the sync ended, by leaving them out, sending
+    /// a higher epoch for the same ref, or sweeping their expired deadlines.
+    pub ended: Vec<ScopeEnded>,
+}
+
+/// The daemon's answer to an accepted [`ModuleHandle::scope_apply`].
+///
+/// A refusal of the whole delta is [`ScopeCallError::Refused`]; nothing changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ScopeApplyReply {
+    /// The generation the daemon accepted, echoed from the request.
+    pub generation: u64,
+    /// One result per upsert, in request order, including per-record refusals.
+    pub results: Vec<ScopeRecordResult>,
+    /// One result per requested end, in request order. A ref not live at the
+    /// named epoch has outcome `not_live`, which does not refuse the delta.
+    pub end_results: Vec<ScopeEndResult>,
+    /// Scopes this call ended, once each, through explicit ends, higher-epoch
+    /// upserts, or the calling owner's expiry sweep.
     pub ended: Vec<ScopeEnded>,
 }
 
@@ -276,6 +308,7 @@ type CatalogUpdateReply =
 type CatalogUpdateWaiter =
     oneshot::Receiver<Result<ModuleControlResponseToModule, CatalogUpdateError>>;
 type CatalogUpdateRequest = (u64, mpsc::Sender<Frame>, CatalogUpdateWaiter);
+type OperatorConfirmRequestWaiter = (u64, mpsc::Sender<Frame>, oneshot::Receiver<Frame>);
 
 /// Future returned by [`serve_with_handle`] that runs the module until GOODBYE or EOF.
 pub type ModuleServeFuture = Pin<Box<dyn Future<Output = Result<(), SubcModuleError>> + Send>>;
@@ -414,10 +447,15 @@ pub struct ModuleHandle {
 
 struct ModuleHandleShared {
     negotiated_ver: u8,
+    daemon_capabilities: Vec<String>,
     supports_catalog_update: bool,
     supports_live_roots: bool,
     supports_scope_sync: bool,
+    supports_scope_apply: bool,
     supports_scope_describe: bool,
+    supports_operator_confirm: bool,
+    supports_activity: bool,
+    connection_runtime: tokio::runtime::Handle,
     connection_token: u64,
     machine_id: Option<MachineId>,
     live_routes: Mutex<HashMap<u16, RouteHandle>>,
@@ -430,6 +468,8 @@ struct ModuleHandleState {
     writer: Option<mpsc::Sender<Frame>>,
     next_corr: Option<u64>,
     pending_catalog_updates: HashMap<u64, CatalogUpdateReply>,
+    pending_operator_confirms: HashMap<u64, oneshot::Sender<Frame>>,
+    pending_activity_records: HashMap<u64, oneshot::Sender<Frame>>,
     closed: bool,
 }
 
@@ -439,17 +479,26 @@ impl ModuleHandle {
         writer: mpsc::Sender<Frame>,
         connection_token: u64,
         close_token: CancellationToken,
+        connection_runtime: tokio::runtime::Handle,
     ) -> Self {
         Self {
             shared: Arc::new(ModuleHandleShared {
                 negotiated_ver: ack.negotiated_ver,
+                daemon_capabilities: ack.subc_capabilities.clone(),
                 supports_catalog_update: ack
                     .subc_ops
                     .iter()
                     .any(|op| op == MODULE_TO_SUBC_OP_CATALOG_UPDATE),
                 supports_live_roots: ack.subc_ops.iter().any(|op| op == "supervisor.live_roots"),
                 supports_scope_sync: ack.subc_ops.iter().any(|op| op == SCOPE_SYNC_OP),
+                supports_scope_apply: ack.subc_ops.iter().any(|op| op == SCOPE_APPLY_OP),
                 supports_scope_describe: ack.subc_ops.iter().any(|op| op == SCOPE_DESCRIBE_OP),
+                supports_operator_confirm: ack.subc_ops.iter().any(|op| op == OPERATOR_CONFIRM_OP),
+                supports_activity: ack
+                    .subc_capabilities
+                    .iter()
+                    .any(|capability| capability == ACTIVITY_LEDGER_CAPABILITY),
+                connection_runtime,
                 connection_token,
                 // A value that does not parse is treated like an absent one:
                 // the module learns nothing rather than a name that is wrong.
@@ -464,6 +513,8 @@ impl ModuleHandle {
                     writer: Some(writer),
                     next_corr: Some(HELLO_CORR + 1),
                     pending_catalog_updates: HashMap::new(),
+                    pending_operator_confirms: HashMap::new(),
+                    pending_activity_records: HashMap::new(),
                     closed: false,
                 }),
             }),
@@ -478,6 +529,26 @@ impl ModuleHandle {
     /// a substitute. The id is a name, never an authority: see [`MachineId`].
     pub fn machine_id(&self) -> Option<&MachineId> {
         self.shared.machine_id.as_ref()
+    }
+
+    /// The daemon capability identifiers delivered in this connection's HELLO_ACK.
+    ///
+    /// The list preserves the daemon's order and unknown capability identifiers.
+    pub fn daemon_capabilities(&self) -> &[String] {
+        &self.shared.daemon_capabilities
+    }
+
+    /// Whether this daemon advertised `capability` in this connection's HELLO_ACK.
+    ///
+    /// Scope owners should check
+    /// `daemon_supports(subc_protocol::manifest::CAP_SCOPE_BIND_PROOF_V1)`
+    /// before setting `ScopeRecord.bind_proof_sha256` on records sent over
+    /// this connection.
+    pub fn daemon_supports(&self, capability: &str) -> bool {
+        self.shared
+            .daemon_capabilities
+            .iter()
+            .any(|advertised| advertised == capability)
     }
 
     /// Resolves once this module's connection to the daemon has closed: after a
@@ -655,6 +726,48 @@ impl ModuleHandle {
         }
     }
 
+    /// Apply a delta to this module's scope set (`scope.apply`).
+    ///
+    /// This connection must first have established sync authority through an
+    /// accepted [`Self::scope_sync`]. `generation` shares the full-sync sequence
+    /// and must exceed the last accepted generation. Unnamed scopes stay live;
+    /// `end` ends only the named ref at the named epoch.
+    ///
+    /// Whole-call refusals return [`ScopeCallError::Refused`] without changing
+    /// the set or generation. Per-record refusals and `not_live` ends remain in
+    /// the reply. Without `scope.apply` in HELLO_ACK, nothing is sent.
+    pub async fn scope_apply(
+        &self,
+        generation: u64,
+        upsert: Vec<ScopeRecord>,
+        end: Vec<ScopeEnd>,
+    ) -> Result<ScopeApplyReply, ScopeCallError> {
+        if !self.shared.supports_scope_apply {
+            return Err(ScopeCallError::NotSupported { op: SCOPE_APPLY_OP });
+        }
+        let request = ModuleControlRequestFromModule::ScopeApply {
+            generation,
+            upsert,
+            end,
+        };
+        match self.scope_call(SCOPE_APPLY_OP, &request).await? {
+            ModuleControlResponseToModule::ScopeApply {
+                generation,
+                results,
+                end_results,
+                ended,
+            } => Ok(ScopeApplyReply {
+                generation,
+                results,
+                end_results,
+                ended,
+            }),
+            other => Err(ScopeCallError::Protocol(format!(
+                "unexpected {SCOPE_APPLY_OP} response: {other:?}"
+            ))),
+        }
+    }
+
     /// Read one scope's current state (`scope.describe`). Any registered
     /// module may read any owner's scope.
     ///
@@ -692,6 +805,104 @@ impl ModuleHandle {
             other => Err(ScopeCallError::Protocol(format!(
                 "unexpected {SCOPE_DESCRIBE_OP} response: {other:?}"
             ))),
+        }
+    }
+
+    /// Ask the operator to authorise one in-flight, unchanged write.
+    ///
+    /// Every error means the module must refuse the write. `Ok(())` authorises
+    /// only the write this call was made for; it must never be cached or reused.
+    /// The daemon checks the summary and whether this module may ask for the
+    /// caller's route. No failure is retried.
+    ///
+    /// A consumer call that may trigger confirmation must set
+    /// [`CallOptions::timeout`] to at least 300 seconds. This helper waits up to
+    /// 290 seconds, including egress backpressure, and dropping it withdraws an
+    /// accepted request.
+    pub async fn confirm_operator(
+        &self,
+        summary: &str,
+        caller_route: &RouteHandle,
+    ) -> Result<(), OperatorConfirmError> {
+        self.confirm_operator_with_deadline(summary, caller_route, OPERATOR_CONFIRM_TIMEOUT)
+            .await
+    }
+
+    pub(crate) async fn confirm_operator_with_deadline(
+        &self,
+        summary: &str,
+        caller_route: &RouteHandle,
+        duration: Duration,
+    ) -> Result<(), OperatorConfirmError> {
+        if caller_route.connection_token() != self.shared.connection_token {
+            return Err(OperatorConfirmError::NotPermitted);
+        }
+        if !self.shared.supports_operator_confirm {
+            return Err(OperatorConfirmError::Unsupported);
+        }
+        // Use the same absolute deadline for both capacity and the reply: a
+        // slow writer must not extend the time a confirmation can remain live.
+        let deadline = Instant::now() + duration;
+        let body = serde_json::to_vec(&OperatorConfirmRequest::new(
+            summary,
+            caller_route.channel,
+            caller_route.epoch,
+        ))
+        .map_err(|_| OperatorConfirmError::PresenceUnavailable)?;
+        let (corr, writer, rx) = self.shared.begin_operator_confirm()?;
+        let mut guard = OperatorConfirmGuard {
+            shared: Arc::clone(&self.shared),
+            runtime: self.shared.connection_runtime.clone(),
+            writer: writer.clone(),
+            corr,
+            accepted: false,
+            armed: true,
+        };
+        let frame = Frame::build_with_version(
+            self.shared.negotiated_ver,
+            FrameType::Request,
+            control_flags(),
+            0,
+            0,
+            corr,
+            body,
+        )
+        .map_err(|_| OperatorConfirmError::PresenceUnavailable)?;
+        tokio::select! {
+            result = timeout_at(deadline, writer.send(frame)) => {
+                result.map_err(|_| OperatorConfirmError::PresenceUnavailable)?
+                    .map_err(|_| OperatorConfirmError::PresenceUnavailable)?;
+            }
+            _ = self.shared.close_token.cancelled() => {
+                return Err(OperatorConfirmError::PresenceUnavailable);
+            }
+        }
+        guard.accepted = true;
+        let reply = timeout_at(deadline, rx)
+            .await
+            .map_err(|_| OperatorConfirmError::PresenceUnavailable)?
+            .map_err(|_| OperatorConfirmError::PresenceUnavailable)?;
+        guard.armed = false;
+        match reply.header.ty {
+            FrameType::Response => {
+                match serde_json::from_slice::<OperatorConfirmReply>(&reply.body) {
+                    Ok(body) if body.outcome == "confirmed" => Ok(()),
+                    _ => Err(OperatorConfirmError::PresenceUnavailable),
+                }
+            }
+            FrameType::Error => match serde_json::from_slice::<ErrorBody>(&reply.body) {
+                Ok(body) => Err(match body.code.as_str() {
+                    error_codes::OPERATOR_DECLINED => OperatorConfirmError::Declined,
+                    error_codes::OPERATOR_SUMMARY_INVALID => OperatorConfirmError::SummaryInvalid,
+                    error_codes::OPERATOR_REQUEST_NOT_PERMITTED | "not_registered" => {
+                        OperatorConfirmError::NotPermitted
+                    }
+                    "unsupported_control_frame" => OperatorConfirmError::Unsupported,
+                    _ => OperatorConfirmError::PresenceUnavailable,
+                }),
+                Err(_) => Err(OperatorConfirmError::PresenceUnavailable),
+            },
+            _ => Err(OperatorConfirmError::PresenceUnavailable),
         }
     }
 
@@ -840,6 +1051,24 @@ impl ModuleHandle {
     }
 
     fn handle_control_reply(&self, frame: Frame) -> bool {
+        let activity_reply = self
+            .shared
+            .lock_inner()
+            .pending_activity_records
+            .remove(&frame.header.corr);
+        if let Some(reply) = activity_reply {
+            let _ = reply.send(frame);
+            return true;
+        }
+        let operator_reply = self
+            .shared
+            .lock_inner()
+            .pending_operator_confirms
+            .remove(&frame.header.corr);
+        if let Some(reply) = operator_reply {
+            let _ = reply.send(frame);
+            return true;
+        }
         let Some(reply) = self.shared.take_pending_catalog_update(frame.header.corr) else {
             return false;
         };
@@ -880,30 +1109,37 @@ impl ModuleHandleShared {
             return Err(CatalogUpdateError::ConnectionClosed);
         }
         let Some(writer) = inner.writer.clone() else {
-            inner.closed = true;
-            self.close_token.cancel();
             drop(inner);
-            self.clear_live_routes();
+            self.close_connection();
             return Err(CatalogUpdateError::ConnectionClosed);
         };
         let Some(corr) = next_module_control_corr(&mut inner) else {
-            inner.closed = true;
-            inner.writer = None;
-            let pending = inner
-                .pending_catalog_updates
-                .drain()
-                .map(|(_, reply)| reply)
-                .collect::<Vec<_>>();
-            self.close_token.cancel();
             drop(inner);
-            self.clear_live_routes();
-            for reply in pending {
-                let _ = reply.send(Err(CatalogUpdateError::ConnectionClosed));
-            }
+            self.close_connection();
             return Err(CatalogUpdateError::ConnectionClosed);
         };
         let (tx, rx) = oneshot::channel();
         inner.pending_catalog_updates.insert(corr, tx);
+        Ok((corr, writer, rx))
+    }
+
+    fn begin_operator_confirm(&self) -> Result<OperatorConfirmRequestWaiter, OperatorConfirmError> {
+        let mut inner = self.lock_inner();
+        if inner.closed {
+            return Err(OperatorConfirmError::PresenceUnavailable);
+        }
+        let Some(writer) = inner.writer.clone() else {
+            drop(inner);
+            self.close_connection();
+            return Err(OperatorConfirmError::PresenceUnavailable);
+        };
+        let Some(corr) = next_module_control_corr(&mut inner) else {
+            drop(inner);
+            self.close_connection();
+            return Err(OperatorConfirmError::PresenceUnavailable);
+        };
+        let (tx, rx) = oneshot::channel();
+        inner.pending_operator_confirms.insert(corr, tx);
         Ok((corr, writer, rx))
     }
 
@@ -924,6 +1160,9 @@ impl ModuleHandleShared {
             inner.closed = true;
             inner.writer = None;
             self.close_token.cancel();
+            // Dropping these senders wakes raw-frame waiters immediately.
+            inner.pending_operator_confirms.clear();
+            inner.pending_activity_records.clear();
             inner
                 .pending_catalog_updates
                 .drain()
@@ -954,6 +1193,79 @@ fn next_module_control_corr(inner: &mut ModuleHandleState) -> Option<u64> {
     inner.next_corr = corr.checked_add(1);
     Some(corr)
 }
+
+struct OperatorConfirmGuard {
+    shared: Arc<ModuleHandleShared>,
+    runtime: tokio::runtime::Handle,
+    writer: mpsc::Sender<Frame>,
+    corr: u64,
+    accepted: bool,
+    armed: bool,
+}
+
+impl Drop for OperatorConfirmGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.shared
+            .lock_inner()
+            .pending_operator_confirms
+            .remove(&self.corr);
+        if !self.accepted {
+            return;
+        }
+        let Ok(cancel) = Frame::build_with_version(
+            self.shared.negotiated_ver,
+            FrameType::Cancel,
+            control_flags(),
+            0,
+            0,
+            self.corr,
+            Vec::new(),
+        ) else {
+            return;
+        };
+        match self.writer.try_send(cancel) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(cancel)) => {
+                // The connection owns this task even if the future was polled
+                // on another runtime or dropped from a plain thread. A full
+                // egress buffer delays withdrawal; it must not discard it.
+                let writer = self.writer.clone();
+                self.runtime.spawn(async move {
+                    let _ = writer.send(cancel).await;
+                });
+            }
+        }
+    }
+}
+
+/// Failure to authorise a write through [`ModuleHandle::confirm_operator`].
+/// Every variant requires the module to refuse the write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OperatorConfirmError {
+    Declined,
+    PresenceUnavailable,
+    SummaryInvalid,
+    NotPermitted,
+    Unsupported,
+}
+
+impl fmt::Display for OperatorConfirmError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Declined => "operator declined the write",
+            Self::PresenceUnavailable => "operator confirmation is unavailable",
+            Self::SummaryInvalid => "operator confirmation summary is invalid",
+            Self::NotPermitted => "operator confirmation is not permitted for this route",
+            Self::Unsupported => "daemon does not support operator confirmation",
+        })
+    }
+}
+
+impl Error for OperatorConfirmError {}
 
 /// Errors returned by [`ModuleHandle::catalog_update`].
 #[derive(Debug)]
@@ -998,12 +1310,14 @@ impl fmt::Display for CatalogUpdateError {
 
 impl Error for CatalogUpdateError {}
 
-/// Errors returned by [`ModuleHandle::scope_sync`] and
+/// Errors returned by [`ModuleHandle::scope_sync`], [`ModuleHandle::scope_apply`] and
 /// [`ModuleHandle::scope_describe`].
 ///
 /// Non-exhaustive so a later failure kind can be added without breaking
-/// callers' matches; match the variants you handle and treat the rest as an
-/// unverifiable answer.
+/// callers' matches. Match the variants you handle, and treat any other variant
+/// as a call whose effect you cannot know: after `scope_sync` or `scope_apply`,
+/// send a full `scope_sync` at a higher generation rather than assume the change
+/// did or did not apply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ScopeCallError {
@@ -1015,7 +1329,7 @@ pub enum ScopeCallError {
     /// `subc_protocol::error_codes` (`SCOPE_SYNC_STALE`,
     /// `SCOPE_SYNC_NOT_AUTHORITY`, `SCOPE_LIVE_LIMIT_EXCEEDED`, ...).
     Refused { code: String, message: String },
-    /// No reply arrived in time. The daemon may still have applied a sync.
+    /// No reply arrived in time. The daemon may still have applied the change.
     Timeout,
     /// The connection closed before a reply arrived.
     ConnectionClosed,
@@ -1380,10 +1694,12 @@ pub struct RouteBindRequest {
     pub target: RouteTarget,
     pub identity: BindIdentity,
     pub principal: Option<Principal>,
-    /// Consumer-declared reverse-request capabilities for this bind. This is a
-    /// declaration, not a verified privilege; providers treat an absent field as
-    /// no reverse-request capability. Known MCP method-family values today are
-    /// "elicitation", "sampling", and "roots".
+    /// Consumer-declared reverse-request families and provider-contract
+    /// capabilities for this bind. For example, `content/v1` declares that a
+    /// consumer understands the tool-provider content result format. This is an
+    /// unverified declaration, not a privilege grant; providers treat an absent
+    /// field as no declared capability. Known MCP method-family values today
+    /// are "elicitation", "sampling", and "roots".
     pub consumer_capabilities: Option<Vec<String>>,
     /// The versions of provider roles the consumer declared it speaks on this
     /// route, role name to version (`{"tool-provider": "v1"}`), as the daemon
@@ -1401,12 +1717,16 @@ pub struct RouteBindRequest {
     /// the route. `None` means the route was opened without a scope, or by a
     /// daemon that predates scopes.
     pub scope: Option<ScopeStamp>,
+    /// The daemon's call mode, or the mode derived from `scope` when an older
+    /// daemon omits it. Providers must refuse [`CallMode::Unknown`].
+    pub call_mode: CallMode,
 }
 
 impl RouteBindRequest {
     /// A bind with the members every bind has and every optional one absent:
     /// no principal, no consumer capabilities, no role versions, no admission
-    /// facts and no scope. Set those with the `with_*` methods.
+    /// facts and no scope. The call mode is classic. Set fields with the
+    /// `with_*` methods.
     pub fn new(handle: RouteHandle, target: RouteTarget, identity: BindIdentity) -> Self {
         Self {
             handle,
@@ -1417,6 +1737,7 @@ impl RouteBindRequest {
             role_versions: None,
             admission_facts: None,
             scope: None,
+            call_mode: derive_call_mode(None),
         }
     }
 
@@ -1447,9 +1768,17 @@ impl RouteBindRequest {
         self
     }
 
-    /// Set [`Self::scope`].
+    /// Set [`Self::scope`] and derive its call mode. To override the derived
+    /// mode, call [`Self::with_call_mode`] afterwards.
     pub fn with_scope(mut self, scope: ScopeStamp) -> Self {
+        self.call_mode = derive_call_mode(Some(&scope));
         self.scope = Some(scope);
+        self
+    }
+
+    /// Set [`Self::call_mode`], overriding the mode derived from the scope.
+    pub fn with_call_mode(mut self, call_mode: CallMode) -> Self {
+        self.call_mode = call_mode;
         self
     }
 }
@@ -1490,7 +1819,30 @@ enum BindDecisionKind {
 /// authenticates, sends HELLO, waits for HELLO_ACK, then serves frames until
 /// GOODBYE or clean EOF. Which of those ended it is passed to
 /// [`ModuleHandler::on_connection_end`].
-pub async fn serve<H>(mut manifest: ModuleManifest, handler: H) -> Result<(), SubcModuleError>
+pub async fn serve<H>(manifest: ModuleManifest, handler: H) -> Result<(), SubcModuleError>
+where
+    H: ModuleHandler,
+{
+    let (_handle, serve_future) = serve_from_env_with_handle(manifest, handler).await?;
+    serve_future.await
+}
+
+/// Connect and register using the same launch inputs as [`serve`], returning a
+/// cloneable handle and the future that keeps the module serving.
+///
+/// Reads `--subc <connection-file>` (or `--subc=<connection-file>`) from argv
+/// and overrides the manifest's module id with `SUBC_MODULE_ID` when present.
+/// Authentication, the launch-secret pipe, HELLO and their errors are identical
+/// to [`serve`]. Unlike [`serve_with_handle`], the caller need not duplicate
+/// argument parsing or launch-environment handling.
+///
+/// The returned serve future **must be awaited or spawned**. A module can give
+/// the returned handle to its handler's shared state before starting that future,
+/// so the handler can call [`ModuleHandle::confirm_operator`].
+pub async fn serve_from_env_with_handle<H>(
+    mut manifest: ModuleManifest,
+    handler: H,
+) -> Result<(ModuleHandle, ModuleServeFuture), SubcModuleError>
 where
     H: ModuleHandler,
 {
@@ -1498,7 +1850,7 @@ where
     if let Some(module_id) = module_id_from_env()? {
         manifest.module_id = module_id;
     }
-    serve_with(&connection_file, manifest, handler).await
+    serve_with_handle(&connection_file, manifest, handler).await
 }
 
 /// Run a module with an explicit connection-file path. The manifest is sent as
@@ -1528,6 +1880,7 @@ where
     let stream = connect_to_subc(connection_file).await?;
     let (mut read_half, write_half) = tokio::io::split(stream);
     let (tx, rx) = mpsc::channel::<Frame>(EGRESS_BUFFER);
+    let connection_runtime = tokio::runtime::Handle::current();
     let writer = tokio::spawn(drain_writer(write_half, rx));
     let handler = Arc::new(handler);
 
@@ -1538,9 +1891,32 @@ where
     let connection_token = checked_increment(&NEXT_MODULE_CONNECTION_TOKEN)
         .ok_or(SubcModuleError::ConnectionTokenExhausted)?;
     let close_token = CancellationToken::new();
-    let handle = ModuleHandle::new(&ack, tx.clone(), connection_token, close_token);
+    let handle = ModuleHandle::new(
+        &ack,
+        tx.clone(),
+        connection_token,
+        close_token,
+        connection_runtime,
+    );
+    let serve_future = connection_serve_future(read_half, tx, handler, handle.clone(), writer);
+    Ok((handle, serve_future))
+}
+
+// Both real connections and the in-memory test stand-in run this lifecycle,
+// including request cancellation, connection-end hooks and the writer drain.
+fn connection_serve_future<R, H>(
+    read_half: R,
+    tx: mpsc::Sender<Frame>,
+    handler: Arc<H>,
+    handle: ModuleHandle,
+    writer: tokio::task::JoinHandle<Result<(), FrameIoError>>,
+) -> ModuleServeFuture
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    H: ModuleHandler,
+{
     let serve_handle = handle.clone();
-    let serve_future = Box::pin(async move {
+    Box::pin(async move {
         // Connection loss ends this serve future. Module serving retains no
         // reconnect task or in-flight reconnect gate; a supervisor that needs
         // recovery starts a fresh serve_with_handle invocation.
@@ -1589,8 +1965,7 @@ where
             (Ok(()), Ok(Err(writer_err))) => Err(SubcModuleError::FrameIo(writer_err)),
             (Ok(()), Err(join_err)) => Err(join_err),
         }
-    });
-    Ok((handle, serve_future))
+    })
 }
 
 async fn module_loop<R, H>(
@@ -2040,6 +2415,7 @@ where
             role_versions,
             admission_facts,
             scope,
+            call_mode,
         } => {
             // Implicit-replace rule (wire spec 3.3.0): the daemon never rebinds a live
             // channel, but its route-gone GOODBYE to modules is best-effort, so a bind
@@ -2084,6 +2460,7 @@ where
                 consumer_capabilities,
                 role_versions,
                 admission_facts,
+                call_mode: call_mode.unwrap_or_else(|| derive_call_mode(scope.as_ref())),
                 scope,
             };
             let decision = handler.on_bind(&req).await;
@@ -2437,6 +2814,9 @@ impl From<serde_json::Error> for SubcModuleError {
 }
 
 #[cfg(test)]
+mod call_mode_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2520,11 +2900,21 @@ mod tests {
             storage: None,
             machine_id: None,
         };
-        (ModuleHandle::new(&ack, tx, 1, CancellationToken::new()), rx)
+        (
+            ModuleHandle::new(
+                &ack,
+                tx,
+                1,
+                CancellationToken::new(),
+                tokio::runtime::Handle::current(),
+            ),
+            rx,
+        )
     }
 
     #[test]
     fn module_handle_exposes_the_acked_machine_id_and_none_otherwise() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
         let handle_for = |machine_id: Option<&str>| {
             let (tx, _rx) = mpsc::channel(1);
             let ack = ModuleHelloAckBody {
@@ -2534,7 +2924,13 @@ mod tests {
                 storage: None,
                 machine_id: machine_id.map(str::to_owned),
             };
-            ModuleHandle::new(&ack, tx, 1, CancellationToken::new())
+            ModuleHandle::new(
+                &ack,
+                tx,
+                1,
+                CancellationToken::new(),
+                runtime.handle().clone(),
+            )
         };
         assert_eq!(
             handle_for(Some("0123456789abcdef0123456789abcdef"))
@@ -2662,6 +3058,156 @@ mod tests {
             }
         );
         assert!(timeout(Duration::from_millis(75), rx.recv()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn scope_apply_sends_nothing_without_its_own_advertised_op() {
+        for ops in [&[][..], &[SCOPE_SYNC_OP, SCOPE_DESCRIBE_OP][..]] {
+            let (handle, mut rx) = test_module_handle(ops);
+            assert_eq!(
+                handle.scope_apply(2, Vec::new(), Vec::new()).await,
+                Err(ScopeCallError::NotSupported { op: SCOPE_APPLY_OP })
+            );
+            assert!(timeout(Duration::from_millis(75), rx.recv()).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn scope_apply_sends_the_delta_and_preserves_per_entry_outcomes() {
+        let (handle, mut rx) = test_module_handle(&[SCOPE_APPLY_OP]);
+        let apply = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                handle
+                    .scope_apply(
+                        2,
+                        vec![ScopeRecord::new(
+                            "run",
+                            1,
+                            subc_protocol::scope::ScopeKind::Ephemeral,
+                        )
+                        .with_expires_at_ms(Some(12345))],
+                        vec![ScopeEnd::new("old", 3), ScopeEnd::new("missing", 1)],
+                    )
+                    .await
+            }
+        });
+        let request = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.header.ty, FrameType::Request);
+        assert_eq!(request.header.channel, 0);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap(),
+            serde_json::json!({
+                "op": "scope.apply", "generation": 2,
+                "upsert": [{"ref": "run", "scope_epoch": 1, "kind": "ephemeral", "expires_at_ms": 12345}],
+                "end": [{"ref": "old", "scope_epoch": 3}, {"ref": "missing", "scope_epoch": 1}]
+            })
+        );
+        let body = serde_json::to_vec(&serde_json::json!({
+            "op": "scope.apply", "generation": 2,
+            "results": [{"ref": "run", "scope_epoch": 1, "outcome": "refused", "code": "scope_expired"}],
+            "end_results": [
+                {"ref": "old", "scope_epoch": 3, "outcome": "ended"},
+                {"ref": "missing", "scope_epoch": 1, "outcome": "not_live"}
+            ],
+            "ended": [{"ref": "old", "scope_epoch": 3}]
+        }))
+        .unwrap();
+        assert!(handle.handle_control_reply(control_reply(
+            FrameType::Response,
+            request.header.corr,
+            body
+        )));
+        let reply = apply.await.unwrap().unwrap();
+        assert_eq!(reply.generation, 2);
+        assert_eq!(reply.results.len(), 1);
+        assert_eq!(reply.results[0].scope_ref, "run");
+        assert_eq!(
+            reply.results[0].outcome,
+            subc_protocol::scope::ScopeRecordOutcome::Refused
+        );
+        assert_eq!(reply.results[0].code.as_deref(), Some("scope_expired"));
+        assert_eq!(reply.end_results.len(), 2);
+        assert_eq!(reply.end_results[0].scope_ref, "old");
+        assert_eq!(reply.end_results[0].scope_epoch, 3);
+        assert_eq!(
+            reply.end_results[0].outcome,
+            subc_protocol::scope::ScopeEndOutcome::Ended
+        );
+        assert_eq!(reply.end_results[1].scope_ref, "missing");
+        assert_eq!(
+            reply.end_results[1].outcome,
+            subc_protocol::scope::ScopeEndOutcome::NotLive
+        );
+        assert_eq!(reply.ended.len(), 1);
+        assert_eq!(reply.ended[0].scope_ref, "old");
+        assert_eq!(reply.ended[0].scope_epoch, 3);
+    }
+
+    #[tokio::test]
+    async fn scope_apply_rejects_a_reply_for_another_op() {
+        let (handle, mut rx) = test_module_handle(&[SCOPE_APPLY_OP]);
+        let apply = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.scope_apply(2, Vec::new(), Vec::new()).await }
+        });
+        let request = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let body = serde_json::to_vec(&ModuleControlResponseToModule::ScopeSync {
+            generation: 2,
+            results: Vec::new(),
+            ended: Vec::new(),
+        })
+        .unwrap();
+        assert!(handle.handle_control_reply(control_reply(
+            FrameType::Response,
+            request.header.corr,
+            body
+        )));
+        assert!(matches!(
+            apply.await.unwrap(),
+            Err(ScopeCallError::Protocol(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn scope_apply_preserves_whole_call_refusal_codes() {
+        let (handle, mut rx) = test_module_handle(&[SCOPE_APPLY_OP]);
+        for code in [
+            subc_protocol::error_codes::SCOPE_SYNC_REQUIRED,
+            subc_protocol::error_codes::SCOPE_SYNC_STALE,
+            subc_protocol::error_codes::SCOPE_SYNC_NOT_AUTHORITY,
+            "not_registered",
+        ] {
+            let apply = tokio::spawn({
+                let handle = handle.clone();
+                async move { handle.scope_apply(2, Vec::new(), Vec::new()).await }
+            });
+            let request = timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let body = serde_json::to_vec(&ErrorBody::new(code, "why")).unwrap();
+            assert!(handle.handle_control_reply(control_reply(
+                FrameType::Error,
+                request.header.corr,
+                body
+            )));
+            let error = apply.await.unwrap().unwrap_err();
+            assert_eq!(
+                error,
+                ScopeCallError::Refused {
+                    code: code.to_string(),
+                    message: "why".to_string()
+                }
+            );
+            assert_eq!(error.code(), Some(code));
+        }
     }
 
     /// A reply carrying another op's body is not taken as an answer.
@@ -3290,6 +3836,7 @@ mod tests {
             role_versions: None,
             admission_facts: None,
             scope: None,
+            call_mode: None,
         })
         .unwrap();
         Frame::build(FrameType::Request, control_flags(), 0, 0, corr, body).unwrap()
@@ -3508,8 +4055,8 @@ mod tests {
             .expect("epoch-5 install must be live after implicit replace");
     }
 
-    #[test]
-    fn module_control_corr_is_monotonic_and_exhausts_without_wrap() {
+    #[tokio::test]
+    async fn module_control_corr_is_monotonic_and_exhausts_without_wrap() {
         let (module_handle, _rx) = test_module_handle(&[MODULE_TO_SUBC_OP_CATALOG_UPDATE]);
         let mut inner = module_handle.shared.lock_inner();
         inner.next_corr = Some(u64::MAX);
@@ -3519,19 +4066,14 @@ mod tests {
 }
 
 /// How a served module ends when its connection closes, driven against a stand-in
-/// daemon on a real socket so the writer task and its drain are the real ones.
+/// daemon on a framed in-memory connection with the real writer task and drain.
 #[cfg(test)]
 mod module_close_tests {
     use std::time::Instant;
 
-    use subc_protocol::manifest::ModuleManifest;
-    use subc_test_support::TestTempDir;
-    use subc_transport::{
-        authenticate_server, generate_daemon_id, generate_key, write_atomic, ConnectionInfo,
-        Endpoint, SCHEMA_VERSION,
-    };
-    use tokio::{net::TcpListener, sync::Notify, task::JoinHandle};
+    use tokio::{io::DuplexStream, sync::Notify};
 
+    use super::stand_in::{serve_against_stand_in_with_ops, Served};
     use super::*;
 
     /// How the test handler treats the one request it is given.
@@ -3567,78 +4109,12 @@ mod module_close_tests {
         }
     }
 
-    struct Served {
-        daemon: TcpStream,
-        handle: ModuleHandle,
-        serve: JoinHandle<Result<(), SubcModuleError>>,
-        _dir: TestTempDir,
-    }
-
-    /// Serve `handler` against a stand-in daemon that authenticates the module
-    /// and acknowledges its HELLO, then hands the daemon's socket to the test.
+    /// Serve `handler` on the shared stand-in and hand its framed connection to the test.
     async fn serve_against_stand_in<H: ModuleHandler>(handler: H) -> Served {
-        let dir = TestTempDir::new("subc-client-rs-module-close");
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let connection = ConnectionInfo {
-            schema: SCHEMA_VERSION,
-            wire_version: None,
-            endpoints: vec![Endpoint {
-                host: "127.0.0.1".to_string(),
-                port: listener.local_addr().unwrap().port(),
-            }],
-            key: generate_key().unwrap(),
-            daemon_id: generate_daemon_id().unwrap(),
-            pid: std::process::id(),
-            daemon_ver: "subc-client-rs-module-close".to_string(),
-        };
-        let path = dir.join("subc-conn.json");
-        write_atomic(&path, &connection).unwrap();
-
-        let manifest = ModuleManifest::builder("close-test", env!("CARGO_PKG_VERSION")).build();
-        let serving =
-            tokio::spawn(async move { serve_with_handle(&path, manifest, handler).await });
-        let (mut daemon, _) = listener.accept().await.unwrap();
-        authenticate_server(
-            &mut daemon,
-            &connection.key,
-            &connection.daemon_id,
-            &connection.daemon_ver,
-            Duration::from_secs(2),
-        )
-        .await
-        .unwrap();
-        let hello = read_frame(&mut daemon).await.unwrap().unwrap();
-        assert_eq!(hello.header.ty, FrameType::Hello);
-        let ack = ModuleHelloAckBody {
-            negotiated_ver: PROTOCOL_VERSION,
-            subc_ops: Vec::new(),
-            subc_capabilities: Vec::new(),
-            storage: None,
-            machine_id: None,
-        };
-        send(
-            &mut daemon,
-            Frame::build(
-                FrameType::HelloAck,
-                control_flags(),
-                0,
-                0,
-                HELLO_CORR,
-                serde_json::to_vec(&ack).unwrap(),
-            )
-            .unwrap(),
-        )
-        .await;
-        let (handle, serve_future) = serving.await.unwrap().unwrap();
-        Served {
-            daemon,
-            handle,
-            serve: tokio::spawn(serve_future),
-            _dir: dir,
-        }
+        serve_against_stand_in_with_ops(|_| handler, &[]).await
     }
 
-    async fn send(daemon: &mut TcpStream, frame: Frame) {
+    async fn send(daemon: &mut DuplexStream, frame: Frame) {
         write_frame(daemon, &frame).await.unwrap();
         daemon.flush().await.unwrap();
     }
@@ -3662,6 +4138,7 @@ mod module_close_tests {
             role_versions: None,
             admission_facts: None,
             scope: None,
+            call_mode: None,
         })
         .unwrap();
         send(
@@ -3773,7 +4250,6 @@ mod module_close_tests {
             daemon,
             handle,
             serve: _serve,
-            _dir,
         } = serve_against_stand_in(EchoHandler).await;
         assert!(!handle.is_closed());
         drop(daemon);
@@ -4004,6 +4480,9 @@ mod module_close_tests {
 }
 
 #[cfg(test)]
+mod operator_confirm_tests;
+
+#[cfg(test)]
 mod detailed_error_body_tests {
     use serde_json::json;
 
@@ -4054,9 +4533,10 @@ fn retained_launch_nonce() -> Option<String> {
     RETAINED_LAUNCH_NONCE.get().cloned()
 }
 
-/// Where this process read its launch nonce, in the form module provenance
-/// reports it (`fd` or `env`), or `None` when it has none or could not read
-/// it. For a module that builds its provenance block itself:
+/// The cached launch-nonce source (`fd`, `pipe` or `env`), or `None` when no
+/// nonce is available. The SDK records this in the registration message's
+/// `manifest.provenance.launch_nonce_source`; the daemon stores that declaration
+/// for `ck provenance` to display. A module constructing that record can use:
 /// `.with_launch_nonce_source(subc_client_rs::launch_nonce_source())`.
 pub fn launch_nonce_source() -> Option<LaunchNonceSource> {
     launch_nonce()

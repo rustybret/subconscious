@@ -19,7 +19,7 @@ use super::{
         RuntimeState, SetupObserved, SetupOperation, SetupRequest,
     },
     planner::{execute_setup, ExecutionMode, SetupExecutor, SetupPlan},
-    runtime::{self, RuntimePlatform, RuntimeStatus, SystemCommandRunner},
+    runtime::{self, CommandRunner, RuntimePlatform, RuntimeStatus, SystemCommandRunner},
     uninstall,
     upgrade::{binary_version, DaemonCatalogBuild},
     validation::{self, Validator},
@@ -30,7 +30,7 @@ pub struct SetupBackend {
     paths: SetupPaths,
     platform: RuntimePlatform,
     inventory: Inventory,
-    runner: SystemCommandRunner,
+    runner: Box<dyn CommandRunner>,
     artifacts: ReleaseArtifactSource,
     runtime_status: RuntimeStatus,
     uninstall_report: Option<uninstall::UninstallReport>,
@@ -86,7 +86,7 @@ impl SetupBackend {
             },
             platform,
             inventory,
-            runner: SystemCommandRunner,
+            runner: Box::new(SystemCommandRunner),
             artifacts: ReleaseArtifactSource::current(),
             runtime_status: RuntimeStatus::default(),
             uninstall_report: None,
@@ -95,6 +95,20 @@ impl SetupBackend {
     }
 
     pub fn observe(&mut self, request: &SetupRequest) -> Result<SetupObserved, String> {
+        if !request.uninstall {
+            // `CK_TEST_SETUP_PREFLIGHT_OK` skips only this check, for tests that
+            // exercise the real setup path on a Linux CI runner, which has no
+            // systemd user manager to satisfy it.
+            #[cfg(feature = "test-support")]
+            let stub_runtime = env::var_os("CK_TEST_SETUP_CONTROL_OK").is_some()
+                || env::var_os("CK_TEST_SETUP_PREFLIGHT_OK").is_some();
+            #[cfg(not(feature = "test-support"))]
+            let stub_runtime = false;
+            if !stub_runtime {
+                runtime::preflight(self.platform, &mut self.runner)?;
+            }
+        }
+
         #[cfg(feature = "test-support")]
         if env::var_os("CK_TEST_SETUP_CONTROL_OK").is_some() {
             // `CK_TEST_SETUP_CONTROL_OK` is the test-support control that stubs
@@ -445,6 +459,9 @@ impl SetupBackend {
             }
         }
         println!("Done.");
+        if let Some(hint) = runtime::linger_hint(self.platform, &mut self.runner) {
+            println!("{hint}");
+        }
         if plan.operations.iter().any(|operation| {
             matches!(
                 operation,
@@ -539,8 +556,19 @@ impl SetupBackend {
     fn running_ck_adoption(&self) -> Option<PathBuf> {
         let binary_home = fs::canonicalize(&self.paths.binary_home)
             .unwrap_or_else(|_| self.paths.binary_home.clone());
-        self.executable
-            .starts_with(binary_home)
+        // The installer keeps the operator command in cmd/ while setup owns
+        // daemon and module binaries in bin/; both bootstrap locations may
+        // contain an unowned ck that setup must adopt.
+        let command_home = self.paths.data_dir.join("cmd");
+        let command_home = fs::canonicalize(&command_home).unwrap_or(command_home);
+        // Resolve the executable the same way as the two folders, so a symlink in
+        // the data folder's path (macOS reaches its temp and some home folders
+        // through /var -> /private/var) cannot make a bootstrap ck look foreign.
+        let executable =
+            fs::canonicalize(&self.executable).unwrap_or_else(|_| self.executable.clone());
+        let is_bootstrap_ck =
+            executable.starts_with(&binary_home) || executable.starts_with(&command_home);
+        is_bootstrap_ck
             .then(|| self.executable.clone())
             .filter(|path| path.is_file())
             .filter(|path| !self.inventory.owns_path("managed-binary", path))
@@ -920,7 +948,7 @@ pub fn default_claustrum_key_path() -> Result<Option<PathBuf>, String> {
     }
 }
 
-fn data_directory() -> Result<PathBuf, String> {
+pub(crate) fn data_directory() -> Result<PathBuf, String> {
     if cfg!(windows) {
         return env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
@@ -943,6 +971,30 @@ pub(super) fn user_home() -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cortexkit_test_support::ScratchDir;
+
+    struct UnavailableUserManager;
+
+    impl CommandRunner for UnavailableUserManager {
+        fn run(
+            &mut self,
+            _program: &str,
+            args: &[String],
+        ) -> Result<runtime::CommandResult, String> {
+            if args.first().is_some_and(|arg| arg == "--user") {
+                return Ok(runtime::CommandResult {
+                    success: false,
+                    stdout: String::new(),
+                    stderr: "DBUS_SESSION_BUS_ADDRESS and XDG_RUNTIME_DIR not defined".to_string(),
+                });
+            }
+            Ok(runtime::CommandResult {
+                success: true,
+                stdout: "system manager is running".to_string(),
+                stderr: String::new(),
+            })
+        }
+    }
 
     #[test]
     fn live_daemon_missing_an_otherwise_correct_module_is_configured() {
@@ -958,13 +1010,93 @@ mod tests {
             "a stopped daemon cannot expose its registry"
         );
     }
+
+    #[test]
+    fn setup_refuses_without_writing_when_the_user_manager_is_unavailable() {
+        let root = ScratchDir::new("setup-user-manager-preflight");
+        let mut backend = backend_without_user_manager(&root);
+
+        let error = backend
+            .observe(&SetupRequest::install(Vec::new()))
+            .unwrap_err();
+
+        assert!(
+            error.contains("systemd-user-manager-unavailable"),
+            "{error}"
+        );
+        assert!(error.contains("loginctl enable-linger $USER"), "{error}");
+        assert!(
+            !root.join("installer-manifest.json").exists(),
+            "setup must not save its inventory"
+        );
+        assert!(
+            !backend.paths.binary_home.exists(),
+            "setup must not create the binary directory"
+        );
+        assert!(
+            !backend.paths.config_path.exists(),
+            "setup must not write configuration"
+        );
+        assert!(
+            !backend.paths.runtime_paths.definition.exists(),
+            "setup must not write a service definition"
+        );
+    }
+
+    #[test]
+    fn setup_uninstall_does_not_refuse_when_the_user_manager_is_unavailable() {
+        let root = ScratchDir::new("setup-uninstall-without-user-manager");
+        let mut backend = backend_without_user_manager(&root);
+        let mut request = SetupRequest::install(Vec::new());
+        request.uninstall = true;
+
+        if let Err(error) = backend.observe(&request) {
+            assert!(
+                !error.contains("systemd-user-manager-unavailable"),
+                "{error}"
+            );
+            assert!(!error.contains("systemd-unavailable"), "{error}");
+        }
+    }
+
+    fn backend_without_user_manager(root: &ScratchDir) -> SetupBackend {
+        let binary_home = root.join("bin");
+        let inventory_path = root.join("installer-manifest.json");
+        let platform = RuntimePlatform::Linux;
+        let inventory = Inventory::load(&inventory_path, "linux-x64").unwrap();
+        SetupBackend {
+            executable: binary_home.join("ck"),
+            paths: SetupPaths {
+                data_dir: root.join("data"),
+                binary_home: binary_home.clone(),
+                config_path: root.join("subc.jsonc"),
+                claustrum_key_path: None,
+                runtime_paths: runtime::runtime_paths(platform, &binary_home, root.path()),
+            },
+            platform,
+            inventory,
+            runner: Box::new(UnavailableUserManager),
+            artifacts: ReleaseArtifactSource::from_index(
+                super::super::release_index::ReleaseIndex {
+                    schema: 1,
+                    channel: "alpha".to_string(),
+                    generated_at_ms: 0,
+                    components: BTreeMap::new(),
+                },
+                super::super::model::AlphaTarget::LinuxX64,
+            ),
+            runtime_status: RuntimeStatus::default(),
+            uninstall_report: None,
+            component_steps: BTreeMap::new(),
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
 mod adoption_tests {
     use super::*;
     use crate::setup::test_exec::write_executable;
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
 
     /// Rollback after a later refusal must delete only what this run wrote.
     /// An adopted binary existed before the run (and may be the image a
@@ -973,7 +1105,7 @@ mod adoption_tests {
     /// binaries to the other behaviour.
     #[test]
     fn rollback_deletes_placed_binaries_but_only_unrecords_adopted_ones() {
-        let root = TestTempDir::new("setup-rollback-adopted");
+        let root = ScratchDir::new("setup-rollback-adopted");
         let binary_home = root.join("bin");
         fs::create_dir_all(&binary_home).unwrap();
         let placed = binary_home.join("ck-claustrum");
@@ -996,7 +1128,7 @@ mod adoption_tests {
             },
             platform,
             inventory,
-            runner: SystemCommandRunner,
+            runner: Box::new(SystemCommandRunner),
             artifacts: ReleaseArtifactSource::from_index(
                 super::super::release_index::ReleaseIndex {
                     schema: 1,
@@ -1030,7 +1162,7 @@ mod adoption_tests {
 
     #[test]
     fn bootstrap_placed_ck_is_adopted_as_managed_binary() {
-        let root = TestTempDir::new("setup-adopt-running-ck");
+        let root = ScratchDir::new("setup-adopt-running-ck");
         let binary_home = root.join("bin");
         fs::create_dir_all(&binary_home).unwrap();
         let placed = binary_home.join("ck");
@@ -1051,7 +1183,7 @@ mod adoption_tests {
             },
             platform,
             inventory,
-            runner: SystemCommandRunner,
+            runner: Box::new(SystemCommandRunner),
             artifacts: ReleaseArtifactSource::from_index(
                 super::super::release_index::ReleaseIndex {
                     schema: 1,
@@ -1092,8 +1224,126 @@ mod adoption_tests {
     }
 
     #[test]
+    fn installer_placed_cmd_ck_is_adopted_and_self_updated_in_place() {
+        let root = ScratchDir::new("setup-adopt-cmd-ck");
+        let data_dir = root.join("cortexkit");
+        let binary_home = data_dir.join("bin");
+        let command_home = data_dir.join("cmd");
+        fs::create_dir_all(&binary_home).unwrap();
+        fs::create_dir_all(&command_home).unwrap();
+
+        let executable = command_home.join("ck");
+        write_executable(&executable, b"#!/bin/sh\necho 'ck 0.20.72'\n");
+        let daemon = binary_home.join("ck-subc");
+        let gateway = binary_home.join("ck-subc-mcp");
+        write_executable(&daemon, b"#!/bin/sh\necho 'ck-subc 0.17.10'\n");
+        write_executable(&gateway, b"#!/bin/sh\necho 'ck-subc-mcp 0.1.30'\n");
+
+        let installer_archive_digest = "cd".repeat(32);
+        let manifest = data_dir.join("installer-manifest.json");
+        fs::write(
+            &manifest,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "installer": "ck",
+                "platform": "linux-x64",
+                "mutations": [{
+                    "kind": "binary-placement",
+                    "path": executable.to_string_lossy(),
+                    "sha256": components::digest_file(&executable).unwrap(),
+                    "archive_sha256": installer_archive_digest.clone(),
+                }],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut inventory = Inventory::load(&manifest, "linux-x64").unwrap();
+        // The other Core binaries are rows that `ck setup` installed under bin/.
+        inventory.record("managed-binary", &daemon, Map::new());
+        inventory.record("managed-binary", &gateway, Map::new());
+        let platform = RuntimePlatform::current();
+        let mut backend = SetupBackend {
+            executable: executable.clone(),
+            paths: SetupPaths {
+                data_dir: data_dir.clone(),
+                binary_home: binary_home.clone(),
+                config_path: root.join("subc.jsonc"),
+                claustrum_key_path: None,
+                runtime_paths: runtime::runtime_paths(platform, &binary_home, &root),
+            },
+            platform,
+            inventory,
+            runner: Box::new(SystemCommandRunner),
+            artifacts: ReleaseArtifactSource::from_index(
+                super::super::release_index::ReleaseIndex {
+                    schema: 1,
+                    channel: "alpha".to_string(),
+                    generated_at_ms: 0,
+                    components: BTreeMap::new(),
+                },
+                super::super::model::AlphaTarget::LinuxX64,
+            ),
+            runtime_status: RuntimeStatus::default(),
+            uninstall_report: None,
+            component_steps: BTreeMap::new(),
+        };
+
+        backend.adopt_running_ck(&executable).unwrap();
+        assert!(backend.inventory.owns_path("managed-binary", &executable));
+        assert!(!backend.inventory.owns_path("binary-placement", &executable));
+        assert_eq!(
+            backend
+                .inventory
+                .entry_for_path("managed-binary", &executable)
+                .and_then(|entry| entry.get("archive_sha256"))
+                .and_then(Value::as_str),
+            Some(installer_archive_digest.as_str())
+        );
+
+        let targets = super::super::upgrade::discover_managed_upgrade_targets(
+            &backend.inventory,
+            &executable,
+            Some(&DaemonCatalogBuild {
+                pid: 1,
+                version: "0.17.10".to_string(),
+            }),
+        )
+        .unwrap();
+        let ck = targets
+            .iter()
+            .find(|target| target.target.label() == "ck")
+            .expect("the running ck is an upgrade target");
+        assert_eq!(ck.destination, executable);
+
+        let candidate = root.join("verified-ck");
+        write_executable(&candidate, b"#!/bin/sh\necho 'ck 0.20.73'\n");
+        super::super::self_update::replace_verified_candidate(
+            &ck.destination,
+            &candidate,
+            &"ab".repeat(32),
+            "0.20.73",
+            &mut backend.inventory,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(&executable).unwrap(),
+            fs::read(&candidate).unwrap()
+        );
+        assert!(backend.inventory.owns_path("managed-binary", &executable));
+        assert_eq!(
+            backend
+                .inventory
+                .entry_for_path("managed-binary", &executable)
+                .and_then(|entry| entry.get("version"))
+                .and_then(Value::as_str),
+            Some("0.20.73")
+        );
+    }
+
+    #[test]
     fn adoption_copies_bootstrap_archive_digest_when_present() {
-        let root = TestTempDir::new("setup-adopt-archive-digest");
+        let root = ScratchDir::new("setup-adopt-archive-digest");
         let binary_home = root.join("bin");
         fs::create_dir_all(&binary_home).unwrap();
         let placed = binary_home.join("ck");
@@ -1120,7 +1370,7 @@ mod adoption_tests {
             },
             platform,
             inventory,
-            runner: SystemCommandRunner,
+            runner: Box::new(SystemCommandRunner),
             artifacts: ReleaseArtifactSource::from_index(
                 super::super::release_index::ReleaseIndex {
                     schema: 1,

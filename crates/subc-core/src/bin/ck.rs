@@ -8,6 +8,9 @@
 #[path = "../setup/mod.rs"]
 mod setup;
 
+#[path = "activity/mod.rs"]
+mod activity;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     env,
@@ -40,6 +43,10 @@ const AUTH_DEADLINE: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const DASHBOARD_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The daemon's default operator delivery budget includes queueing, the prompt,
+/// and provider recovery. Reserve it even for older daemons and log mode because
+/// the wire does not advertise whether a privileged request will prompt.
+const OPERATOR_RESPONSE_BUDGET: Duration = Duration::from_secs(290);
 /// Time for the daemon to finish post-drain process teardown, publish the
 /// response, and absorb scheduler jitter after the configured drain budget.
 const DRAIN_RESPONSE_MARGIN: Duration = Duration::from_secs(2);
@@ -61,7 +68,8 @@ const FRAME_DROP_ALERT_REQUIRED_NONZERO_MINUTES: u64 = 10;
 
 const TOP_HELP_BASE: &str = "ck — CortexKit operator CLI\n\nusage:\n  ck [--subc <connection-file>] [--json] <domain> [<verb>] [<args>]\n\ndomains:\n  setup     plan and apply the managed CortexKit installation\n  upgrade   plan managed component upgrades\n  module    supervised modules: list, status, stderr, terminals, restart, stop, start, rescan, release\n  catalog   what is registered on the wire (not the supervised roster)
   routes    live consumers for one module or the whole daemon\n  provenance daemon-attested and module-declared build/process facts\n  health    one-line health for every supervised module\n  quota     AI-provider quota and usage windows\n  daemon    daemon version, uptime, connection info, offline triage, and CI lint
-  machine   this machine's id: show it, or adopt a restored one";
+  machine   this machine's id: show it, or adopt a restored one
+  activity  consequential agent and module events";
 
 const TOP_HELP_TAIL: &str = "flags:\n  --subc <file>   use a specific connection file (default: auto-discover)\n  --json          raw JSON output instead of tables\n  --verbose       include diagnostic detail and complete metrics\n\nrun 'ck <domain>' with no verb to see that domain's commands";
 
@@ -147,20 +155,24 @@ fn top_help_with_tail(tail: &str) -> String {
     out
 }
 
-/// Finds the first executable for each `ck-<name>` PATH entry, matching the
-/// executable that dispatch would run when more than one directory has a name.
+/// Finds the first executable for each `ck-<name>`, preferring the managed bin
+/// directory over PATH when both contain a domain with the same name.
 fn external_domain_candidates() -> BTreeMap<String, ExternalDomainCandidate> {
-    let Some(path_var) = env::var_os("PATH") else {
-        return BTreeMap::new();
-    };
-    // A copy of this executable under a `ck-<name>` filename is not a domain
-    // and must never be probed: the probe would run ck, and a ck that
-    // discovered domains on that path would probe the copy again.
+    // Setup and command lookup must agree on the data home where managed binaries live.
+    let mut directories = setup::data_directory()
+        .ok()
+        .map(|data_home| vec![data_home.join("bin")])
+        .unwrap_or_default();
+    if let Some(path_var) = env::var_os("PATH") {
+        directories.extend(env::split_paths(&path_var));
+    }
+    // A renamed copy of this executable is not a domain: probing it would run
+    // ck again, and the new process would discover and probe the same copy.
     let own_executable = env::current_exe()
         .ok()
         .and_then(|exe| fs::canonicalize(exe).ok());
     let mut candidates = BTreeMap::new();
-    for directory in env::split_paths(&path_var) {
+    for directory in directories {
         let Ok(entries) = fs::read_dir(&directory) else {
             continue;
         };
@@ -200,7 +212,7 @@ fn external_domain_candidates() -> BTreeMap<String, ExternalDomainCandidate> {
                 continue;
             }
             // Resolved only to recognise ck itself. The candidate is probed and
-            // run by the name it has on PATH, never by the file a symlink points
+            // run by its discovered path, never by the file a symlink points
             // to: one binary can carry several faces chosen by argv[0]
             // (`ck-projects` and `ck-workspaces` both link to `ck-entorhinal`),
             // and running the link target would hand every face the module's
@@ -500,6 +512,11 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
     if let Command::MachineAdopt { id, force } = &args.command {
         return machine_adopt(args.subc.as_deref(), id, *force, args.json).await;
     }
+    if let Command::Activity(options) = &args.command {
+        return activity::run(options, args.subc.as_deref(), args.json)
+            .await
+            .map_err(|error| decorate_error(error, args.json, args.subc.as_deref()));
+    }
 
     let resolved = discover_connection_file(args.subc.as_deref())
         .map_err(|error| decorate_error(error, args.json, args.subc.as_deref()))?;
@@ -582,6 +599,7 @@ async fn run(argv: impl IntoIterator<Item = OsString>) -> Result<(), CkError> {
         | Command::Upgrade { .. }
         | Command::Help(_)
         | Command::External { .. }
+        | Command::Activity(_)
         | Command::BuildShape => unreachable!("handled before connect"),
     };
     result.map_err(|error| decorate_error(error, args.json, args.subc.as_deref()))
@@ -1021,7 +1039,7 @@ fn dispatch_external(domain: &str, tail: &[OsString]) -> Result<(), CkError> {
     // the BINARY'S AUTHOR delivered through the operator, and it names the exact
     // contract rather than asking them to find it.
     Err(CkError::Message(format!(
-        "'{domain}' is not a ck command, but {} exists on PATH.\n\
+        "'{domain}' is not a ck command, but {} exists.\n\
          It did not complete the domain handshake, so ck will not hand it your arguments.\n\
          To opt in, its author makes `{} --ck-domain` exit 0 with a single headline line\n\
          within 2 seconds. Until then, run it directly by name.",
@@ -1054,6 +1072,7 @@ enum Command {
         dry_run: bool,
     },
     Module(ModuleCommand),
+    Activity(activity::Options),
     Routes {
         module_id: Option<String>,
     },
@@ -1242,6 +1261,7 @@ impl CkClient {
         operation: String,
         verify_command: String,
     ) -> Result<Value, CkError> {
+        let response_timeout = response_timeout.saturating_add(OPERATOR_RESPONSE_BUDGET);
         match self.rpc_value_with_timeout(request, response_timeout).await {
             Err(CkError::ResponseTimeout { timeout }) => Err(CkError::OutcomeUnknown {
                 operation,
@@ -1481,6 +1501,7 @@ struct LogEntry {
     lane: String,
     line: String,
     timestamp: Option<SystemTime>,
+    time_inherited: bool,
     level: Option<ParsedLevel>,
     tag: Option<String>,
     source_order: usize,
@@ -1532,10 +1553,11 @@ async fn module_logs(
     Ok(())
 }
 
-/// Undated lines (capture-file lines written before the daemon stamped them,
-/// whose raw child bytes need not carry a time) sort AFTER every dated line: `Option`'s natural order puts
-/// `None` first, which would render a module's crash stderr above yesterday's
-/// daemon lines. Within the undated tail, source order holds.
+/// Undated lines (including captures from files with no daemon stamps) sort
+/// AFTER every dated line: `Option`'s natural order puts `None` first, which
+/// would render a module's crash stderr above older daemon lines. Within the
+/// undated tail, source order holds. Capture lines from stamped files inherit
+/// an anchor time before reaching this sort.
 fn sort_log_entries(entries: &mut [LogEntry]) {
     entries.sort_by(|left, right| {
         left.timestamp
@@ -1761,13 +1783,38 @@ fn collect_log_text(
     let since = options
         .since
         .and_then(|duration| SystemTime::now().checked_sub(duration));
+    let first_capture_stamp = if source.capture {
+        contents.lines().find_map(capture_stamp_time)
+    } else {
+        None
+    };
+    let mut preceding_capture_stamp = None;
     for line in contents.lines() {
         counts.total += 1;
-        let (timestamp, parsed) = if source.capture {
+        let (mut timestamp, parsed, capture_stamp) = if source.capture {
             capture_line_facts(line)
         } else {
             let parsed = line_facts(line);
-            (parsed.as_ref().map(|parsed| parsed.timestamp), parsed)
+            (parsed.as_ref().map(|parsed| parsed.timestamp), parsed, None)
+        };
+        if let Some(stamp) = capture_stamp {
+            preceding_capture_stamp = Some(stamp);
+        }
+        let time_inherited = if source.capture && timestamp.is_none() {
+            // Capture files are append-only, so file position orders an
+            // unstamped line against the capture's stamped lines. The nearest
+            // preceding stamp (or first following stamp for a legacy head) is
+            // a safe ordering anchor, not a measured time; JSON marks it as
+            // inherited so consumers do not mistake the anchor for the line's
+            // own timestamp.
+            if let Some(stamp) = preceding_capture_stamp.or(first_capture_stamp) {
+                timestamp = Some(stamp);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
         };
         if source.daemon
             && parsed
@@ -1819,6 +1866,7 @@ fn collect_log_text(
             lane: source.lane.clone(),
             line: line.to_string(),
             timestamp,
+            time_inherited,
             level: parsed.as_ref().map(|parsed| parsed.level),
             tag: parsed.and_then(|parsed| parsed.component.map(str::to_string)),
             source_order: *source_order,
@@ -1843,6 +1891,10 @@ struct LineFacts<'a> {
     body: &'a str,
 }
 
+fn capture_stamp_time(line: &str) -> Option<SystemTime> {
+    split_capture_stamp(line).map(|(at_ms, _)| UNIX_EPOCH + Duration::from_millis(at_ms))
+}
+
 /// The time and facts of one line of the daemon's capture file.
 ///
 /// The daemon stamps each capture line with the moment it read it, so a
@@ -1850,11 +1902,18 @@ struct LineFacts<'a> {
 /// the module's own bytes are a fleet log line, its level and component still
 /// drive `--level` and `--tag`. A line written before the daemon stamped
 /// capture lines is read exactly as it was then: dated only if the module's
-/// bytes carry a time of their own, and otherwise left undated.
-fn capture_line_facts(line: &str) -> (Option<SystemTime>, Option<LineFacts<'_>>) {
+/// bytes carry a time of their own, and otherwise returned without a time for
+/// `collect_log_text` to inherit from neighboring capture stamps when available.
+fn capture_line_facts(
+    line: &str,
+) -> (
+    Option<SystemTime>,
+    Option<LineFacts<'_>>,
+    Option<SystemTime>,
+) {
     let Some((at_ms, module_bytes)) = split_capture_stamp(line) else {
         let parsed = line_facts(line);
-        return (parsed.as_ref().map(|parsed| parsed.timestamp), parsed);
+        return (parsed.as_ref().map(|parsed| parsed.timestamp), parsed, None);
     };
     let at = UNIX_EPOCH + Duration::from_millis(at_ms);
     // The whole line is tried second: an old unstamped fleet line starts with
@@ -1867,7 +1926,7 @@ fn capture_line_facts(line: &str) -> (Option<SystemTime>, Option<LineFacts<'_>>)
             timestamp: at,
             ..parsed
         });
-    (Some(at), parsed)
+    (Some(at), parsed, Some(at))
 }
 
 fn line_facts(line: &str) -> Option<LineFacts<'_>> {
@@ -1981,18 +2040,7 @@ fn log_level_rank(level: ParsedLevel) -> u8 {
 
 fn print_log_entries(entries: &[LogEntry], json_output: bool) -> Result<(), CkError> {
     if json_output {
-        let lines = entries
-            .iter()
-            .map(|entry| {
-                json!({
-                    "source": entry.lane,
-                    "line": entry.line,
-                    "timestamp": entry.timestamp.map(format_system_time),
-                    "level": entry.level.map(log_level_name),
-                    "tag": entry.tag,
-                })
-            })
-            .collect::<Vec<_>>();
+        let lines = entries.iter().map(log_entry_json).collect::<Vec<_>>();
         return print_json(&json!({ "lines": lines }));
     }
     let color = ansi_color_enabled();
@@ -2005,6 +2053,17 @@ fn print_log_entries(entries: &[LogEntry], json_output: bool) -> Result<(), CkEr
         }
     }
     Ok(())
+}
+
+fn log_entry_json(entry: &LogEntry) -> Value {
+    json!({
+        "source": entry.lane,
+        "line": entry.line,
+        "timestamp": entry.timestamp.map(format_system_time),
+        "time_inherited": entry.time_inherited,
+        "level": entry.level.map(log_level_name),
+        "tag": entry.tag,
+    })
 }
 
 fn fixed_lane(lane: &str) -> String {
@@ -3036,9 +3095,10 @@ async fn provenance(
                 "  store schema version: {}",
                 provenance_value(build.get("store_schema_version"))
             );
-            // Whether this module read its launch nonce from the daemon's pipe
-            // (`fd`) or from the environment copy (`env`). Owners check it before
-            // the environment copy is withdrawn.
+            // Display the source the module sent in its registration message's
+            // manifest.provenance.launch_nonce_source: fd, pipe or env. Keep the
+            // Windows environment copy until every live module reports pipe;
+            // registration alone can succeed using that copy after a failed read.
             println!(
                 "  launch nonce source: {}",
                 provenance_value(build.get("launch_nonce_source"))
@@ -3049,6 +3109,9 @@ async fn provenance(
 
     println!("Daemon observed");
     let observed = module.get("daemon_observed").unwrap_or(&Value::Null);
+    if let Some(source) = observed.get("launch_nonce_source") {
+        println!("  launch nonce source: {}", provenance_value(Some(source)));
+    }
     println!("  pid: {}", provenance_value(observed.get("pid")));
     println!(
         "  started {}",
@@ -3099,6 +3162,15 @@ fn provenance_image(value: Option<&Value>) -> String {
     match status {
         "match" => "matches the file it was spawned from".to_string(),
         "mismatch" => "differs from the file it was spawned from (running vs disk)".to_string(),
+        "unavailable" if value.get("reason").and_then(Value::as_str) == Some("process_hidden") => {
+            "is not observable (process hidden)".to_string()
+        }
+        "unavailable"
+            if value.get("reason").and_then(Value::as_str)
+                == Some("running_executable_permission_denied") =>
+        {
+            "is not readable (non-dumpable)".to_string()
+        }
         "unavailable" => format!(
             "could not be compared with the file it was spawned from ({})",
             provenance_value(value.get("reason"))
@@ -3229,9 +3301,7 @@ async fn health_detail(
         .map(human_health_status)
         .unwrap_or_else(|| "unknown".to_string());
     println!("{module_id}: {status}");
-    if let Some(detail) = health_operator_detail(&value) {
-        println!("  {detail}");
-    }
+    print_health_detail(&value, 1);
     match value.get("metrics") {
         Some(metrics) if !metrics.is_null() && verbose => print_metrics_tree(metrics, 1),
         Some(metrics) if !metrics.is_null() => print_headline_metrics(metrics, 1),
@@ -3330,7 +3400,10 @@ fn inline_scalar_object(map: &serde_json::Map<String, Value>) -> Option<String> 
 
 fn scalar_text(value: &Value) -> String {
     match value {
-        Value::Null => "none".to_string(),
+        // A null field means the producer could not determine the value, so it
+        // must not read like an empty result: "none" would turn "not measured"
+        // into "measured nothing". Empty strings and arrays stay "none".
+        Value::Null => "unknown".to_string(),
         Value::String(value) if value.is_empty() => "none".to_string(),
         Value::String(value) => value.clone(),
         Value::Bool(true) => "enabled".to_string(),
@@ -3340,25 +3413,9 @@ fn scalar_text(value: &Value) -> String {
 }
 
 fn print_headline_metrics(metrics: &Value, depth: usize) {
-    let Some(map) = metrics.as_object() else {
+    let Some(entries) = headline_metric_entries(metrics) else {
         print_metrics_tree(metrics, depth);
         return;
-    };
-    let marked = map
-        .get("headline")
-        .or_else(|| map.get("_headline"))
-        .and_then(Value::as_array)
-        .map(|keys| keys.iter().filter_map(Value::as_str).collect::<Vec<_>>());
-    let entries = match marked {
-        Some(keys) => keys
-            .into_iter()
-            .filter_map(|key| map.get(key).map(|value| (key, value)))
-            .collect::<Vec<_>>(),
-        None => map
-            .iter()
-            .filter(|(_, value)| !value.is_array() && !value.is_object())
-            .map(|(key, value)| (key.as_str(), value))
-            .collect::<Vec<_>>(),
     };
     if entries.is_empty() {
         println!("{}metrics: none", "  ".repeat(depth));
@@ -3366,6 +3423,52 @@ fn print_headline_metrics(metrics: &Value, depth: usize) {
     }
     for (key, value) in entries {
         print_metrics_entry(key, value, depth);
+    }
+}
+
+fn headline_metric_entries(metrics: &Value) -> Option<Vec<(&str, &Value)>> {
+    let map = metrics.as_object()?;
+    let marked = map
+        .get("headline")
+        .or_else(|| map.get("_headline"))
+        .and_then(Value::as_array)
+        .map(|keys| keys.iter().filter_map(Value::as_str).collect::<Vec<_>>());
+    Some(match marked {
+        Some(keys) => keys
+            .into_iter()
+            .filter_map(|key| map.get(key).map(|value| (key, value)))
+            .collect(),
+        None => map
+            .iter()
+            .filter(|(_, value)| !value.is_array() && !value.is_object())
+            .map(|(key, value)| (key.as_str(), value))
+            .collect(),
+    })
+}
+
+fn metrics_have_non_headline_entries(metrics: &Value) -> bool {
+    let Some(map) = metrics.as_object() else {
+        return false;
+    };
+    let Some(headline) = headline_metric_entries(metrics) else {
+        return false;
+    };
+    let marked = map
+        .get("headline")
+        .or_else(|| map.get("_headline"))
+        .and_then(Value::as_array)
+        .is_some();
+    if marked {
+        map.keys().any(|key| {
+            key != "headline"
+                && key != "_headline"
+                && !headline
+                    .iter()
+                    .any(|(headline_key, _)| *headline_key == key)
+        })
+    } else {
+        map.values()
+            .any(|value| value.is_array() || value.is_object())
     }
 }
 
@@ -5954,11 +6057,14 @@ fn month_abbr(month: u32) -> &'static str {
 }
 
 fn print_module_table(modules: &[Value], verbose: bool) {
+    let show_nonce_source = modules
+        .iter()
+        .any(|module| module.get("launch_nonce_source").is_some());
     if verbose {
         let rows = modules
             .iter()
             .map(|module| {
-                vec![
+                let mut row = vec![
                     terminal_safe_string(&display_field(module, "module_id")),
                     terminal_safe_string(&display_field(module, "state")),
                     enabled_word(module.get("enabled").and_then(Value::as_bool)),
@@ -5967,30 +6073,49 @@ fn print_module_table(modules: &[Value], verbose: bool) {
                     reload_list_marker(module).to_string(),
                     child_memory_cell(module),
                     child_cpu_cell(module),
-                ]
+                ];
+                if show_nonce_source {
+                    row.push(terminal_safe_string(&display_field(
+                        module,
+                        "launch_nonce_source",
+                    )));
+                }
+                row
             })
             .collect::<Vec<_>>();
-        print_table(
-            &[
-                "module", "state", "enabled", "live", "health", "reload", "memory", "cpu",
-            ],
-            rows,
-        );
+        let mut columns = vec![
+            "module", "state", "enabled", "live", "health", "reload", "memory", "cpu",
+        ];
+        if show_nonce_source {
+            columns.push("nonce source");
+        }
+        print_table(&columns, rows);
         return;
     }
 
     let rows = modules
         .iter()
         .map(|module| {
-            vec![
+            let mut row = vec![
                 terminal_safe_string(&display_field(module, "module_id")),
                 terminal_safe_string(&module_status_text(module)),
                 terminal_safe_string(&human_health_status(&display_field(module, "health"))),
                 reload_list_marker(module).to_string(),
-            ]
+            ];
+            if show_nonce_source {
+                row.push(terminal_safe_string(&display_field(
+                    module,
+                    "launch_nonce_source",
+                )));
+            }
+            row
         })
         .collect::<Vec<_>>();
-    print_table(&["module", "status", "health", "reload"], rows);
+    let mut columns = vec!["module", "status", "health", "reload"];
+    if show_nonce_source {
+        columns.push("nonce source");
+    }
+    print_table(&columns, rows);
 }
 
 fn reload_list_marker(module: &Value) -> &'static str {
@@ -6262,6 +6387,12 @@ fn print_status_table(
     if let Some(value) = module.get("launch_nonce_env").and_then(Value::as_bool) {
         println!("  launch_nonce_env: {value}");
     }
+    if let Some(source) = module.get("launch_nonce_source") {
+        println!(
+            "  launch nonce source (daemon): {}",
+            provenance_value(Some(source))
+        );
+    }
     println!("  resources: {}", format_child_resources(module));
     println!("  last exit: {}", format_last_exit(module));
     println!(
@@ -6280,9 +6411,10 @@ fn print_status_table(
         .unwrap_or_else(|| "running image status unknown".to_string());
     println!("  binary: {binary} ({image})");
     print_reload_verdict(module);
-    if health_status != "ok" {
-        if let Some(detail) = health.and_then(health_operator_detail) {
-            println!("  health: {detail}");
+    if let Some(entry) = health {
+        print_health_detail(entry, 1);
+        if let Some(metrics) = entry.get("metrics").filter(|metrics| !metrics.is_null()) {
+            print_headline_metrics(metrics, 1);
         }
     }
 
@@ -6305,20 +6437,27 @@ fn print_status_table(
             enabled_word(module.get("enabled").and_then(Value::as_bool)),
             live_word(module),
         );
-        if health_status == "ok" {
-            if let Some(detail) = health.and_then(health_operator_detail) {
-                println!("  health: {detail}");
-            }
-        }
         if let Some(metrics) = health.and_then(|entry| entry.get("metrics")) {
             println!("  metrics:");
             print_metrics_tree(metrics, 2);
         }
     }
-    println!("metrics: run `ck health {module_id}`");
+    if health
+        .and_then(|entry| entry.get("metrics"))
+        .filter(|metrics| !metrics.is_null())
+        .is_some_and(metrics_have_non_headline_entries)
+    {
+        println!("metrics: run `ck health {module_id}`");
+    }
 }
 
 fn module_status_text(module: &Value) -> String {
+    if let Some(pid) = module
+        .get("waiting_for_previous_pid")
+        .and_then(Value::as_u64)
+    {
+        return format!("waiting: previous instance (pid {pid}) is still running but hidden; it cannot be identified");
+    }
     if module.get("enabled").and_then(Value::as_bool) == Some(false) {
         return "stopped".to_string();
     }
@@ -6413,6 +6552,17 @@ fn running_image_clause(image: &Value) -> String {
     match image.get("status").and_then(Value::as_str) {
         Some("match") => "running image matches".to_string(),
         Some("mismatch") => "running image differs: running vs disk".to_string(),
+        Some("unavailable")
+            if image.get("reason").and_then(Value::as_str) == Some("process_hidden") =>
+        {
+            "running image not observable (process hidden)".to_string()
+        }
+        Some("unavailable")
+            if image.get("reason").and_then(Value::as_str)
+                == Some("running_executable_permission_denied") =>
+        {
+            "running image not readable (non-dumpable)".to_string()
+        }
         Some("unavailable") => format!(
             "running image differs: {}",
             provenance_value(image.get("reason"))
@@ -6541,9 +6691,16 @@ fn format_child_resources(module: &Value) -> String {
                 .unwrap_or_default();
             let user = resources.get("cpu_user_ms").and_then(Value::as_u64);
             let system = resources.get("cpu_system_ms").and_then(Value::as_u64);
+            let kernel_label = if resources.get("memory_kind").and_then(Value::as_str)
+                == Some("windows_working_set")
+            {
+                "kernel"
+            } else {
+                "system"
+            };
             let cpu = match (user, system) {
                 (Some(user), Some(system)) => format!(
-                    "{} (user {}, system {})",
+                    "{} (user {}, {kernel_label} {})",
                     format_cpu_time(user.saturating_add(system)),
                     format_cpu_time(user),
                     format_cpu_time(system)
@@ -6736,6 +6893,12 @@ fn health_operator_detail(entry: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn print_health_detail(entry: &Value, depth: usize) {
+    if let Some(detail) = health_operator_detail(entry) {
+        println!("{}{detail}", "  ".repeat(depth));
+    }
+}
+
 /// Cap a table cell so one module's large opaque metrics blob cannot make the
 /// whole table unreadable; `--json` is the full-fidelity view.
 fn truncate_cell(cell: &str) -> String {
@@ -6908,11 +7071,26 @@ fn format_duration(duration: Duration) -> String {
 }
 
 fn format_age_from_epoch_ms_now(timestamp_ms: u64) -> String {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(timestamp_ms);
+    let now_ms = fixed_test_now_ms().unwrap_or_else(|| {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u64)
+            .unwrap_or(timestamp_ms)
+    });
     format_age_from_epoch_ms(timestamp_ms, now_ms)
+}
+
+/// The exact-output CLI test fixes this clock so slow runners cannot cross a
+/// relative-age boundary while the table's byte layout is asserted. Only
+/// test-support builds read it; release builds always use the real clock.
+#[cfg(feature = "test-support")]
+fn fixed_test_now_ms() -> Option<u64> {
+    env::var_os("CK_TEST_TERMINALS_NOW_MS").and_then(|value| value.to_str()?.parse::<u64>().ok())
+}
+
+#[cfg(not(feature = "test-support"))]
+fn fixed_test_now_ms() -> Option<u64> {
+    None
 }
 
 fn format_age_from_epoch_ms(timestamp_ms: u64, now_ms: u64) -> String {
@@ -7663,6 +7841,7 @@ fn is_builtin_domain(domain: &str) -> bool {
             | "daemon"
             | "machine"
             | "quota"
+            | "activity"
             | "help"
     )
 }
@@ -7684,9 +7863,11 @@ fn parse_command(domain: &str, tail: &[OsString]) -> Result<Command, CkError> {
                 Some("health") => HEALTH_HELP.into(),
                 Some("daemon") => DAEMON_HELP.into(),
                 Some("machine") => MACHINE_HELP.into(),
+                Some("activity") => activity::HELP.into(),
                 _ => top_help(),
             }))
         }
+        "activity" => activity::parse(tail),
         "setup"
             if tail
                 .iter()
@@ -7982,7 +8163,41 @@ fn discover_connection_file(override_path: Option<&Path>) -> Result<ResolvedConn
 
 fn decode_error_body(body: &[u8]) -> String {
     match serde_json::from_slice::<subc_protocol::ErrorBody>(body) {
-        Ok(error) => format!("{} — {}", error.code, error.message),
+        Ok(error) => {
+            let reason = error
+                .detail
+                .as_ref()
+                .and_then(|detail| detail.get("reason"))
+                .and_then(Value::as_str);
+            let message = match error.code.as_str() {
+                subc_protocol::error_codes::OPERATOR_DECLINED
+                | subc_protocol::error_codes::OPERATOR_PRESENCE_UNAVAILABLE
+                    if reason == Some("backoff") =>
+                {
+                    "refused without asking: too many recent declines"
+                }
+                subc_protocol::error_codes::OPERATOR_DECLINED => match reason {
+                    Some("person") => "declined at the operator prompt",
+                    _ => "operator approval cancelled or withdrawn",
+                },
+                subc_protocol::error_codes::OPERATOR_PRESENCE_UNAVAILABLE => match reason {
+                    Some("timeout") => "operator prompt timed out without approval",
+                    Some("queue_wait") => {
+                        "refused without asking: operator prompt queue wait expired"
+                    }
+                    Some("queue_full") => "refused without asking: operator prompt queue is full",
+                    Some("module_limit") => {
+                        "refused without asking: too many pending operator requests"
+                    }
+                    Some("provider_stuck") => {
+                        "no way to ask the operator: confirmation provider is stuck"
+                    }
+                    _ => "no way to ask the operator on this machine",
+                },
+                _ => &error.message,
+            };
+            format!("{} — {message}", error.code)
+        }
         Err(_) => String::from_utf8_lossy(body).into_owned(),
     }
 }
@@ -8182,6 +8397,447 @@ fn a_successful_command_stays_successful_when_old_image_cleanup_fails() {
 
 #[cfg(test)]
 mod tests {
+    mod metric_rendering {
+        use super::super::*;
+
+        #[test]
+        fn an_unmeasured_metric_reads_unknown_never_none() {
+            assert_eq!(format_metric_value("actor_count", &Value::Null), "unknown");
+            assert_eq!(scalar_text(&Value::Null), "unknown");
+            let inline = inline_scalar_object(
+                json!({"actor_count": null, "root_count": 3})
+                    .as_object()
+                    .unwrap(),
+            );
+            assert_eq!(
+                inline.as_deref(),
+                Some("actor_count=unknown · root_count=3")
+            );
+        }
+
+        #[test]
+        fn an_empty_value_still_reads_none() {
+            assert_eq!(scalar_text(&json!("")), "none");
+            assert_eq!(
+                inline_scalar_object(json!({}).as_object().unwrap()).as_deref(),
+                Some("none")
+            );
+        }
+    }
+
+    mod privileged_operator_rpc {
+        use super::super::*;
+        use subc_protocol::{error_codes, ErrorBody, PROTOCOL_VERSION};
+        use subc_transport::{
+            authenticate_server, generate_daemon_id, generate_key, Endpoint, SCHEMA_VERSION,
+        };
+        use tokio::{net::TcpListener, task::JoinHandle};
+
+        fn operator_error(code: &str, reason: Option<&str>) -> CkError {
+            let mut body = ErrorBody::new(code, "operator confirmation refused");
+            if let Some(reason) = reason {
+                body = body.with_detail(json!({"reason": reason}));
+            }
+            CkError::Rejected(decode_error_body(&serde_json::to_vec(&body).unwrap()))
+        }
+
+        #[test]
+        fn operator_refusals_are_one_line_and_nonzero() {
+            for (code, reason, expected) in [
+                (
+                    error_codes::OPERATOR_DECLINED,
+                    Some("person"),
+                    "declined at the operator prompt",
+                ),
+                (
+                    error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
+                    Some("timeout"),
+                    "operator prompt timed out without approval",
+                ),
+                (
+                    error_codes::OPERATOR_DECLINED,
+                    Some("caller_cancelled"),
+                    "operator approval cancelled or withdrawn",
+                ),
+                (
+                    error_codes::OPERATOR_DECLINED,
+                    None,
+                    "operator approval cancelled or withdrawn",
+                ),
+                (
+                    error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
+                    Some("unsupported_platform"),
+                    "no way to ask the operator on this machine",
+                ),
+                (
+                    error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
+                    Some("no_presence"),
+                    "no way to ask the operator on this machine",
+                ),
+                (
+                    error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
+                    Some("queue_wait"),
+                    "refused without asking: operator prompt queue wait expired",
+                ),
+                (
+                    error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
+                    Some("queue_full"),
+                    "refused without asking: operator prompt queue is full",
+                ),
+                (
+                    error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
+                    Some("module_limit"),
+                    "refused without asking: too many pending operator requests",
+                ),
+                (
+                    error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
+                    Some("provider_stuck"),
+                    "no way to ask the operator: confirmation provider is stuck",
+                ),
+            ] {
+                let error = decorate_error(operator_error(code, reason), false, None);
+                assert_eq!(error.to_string(), format!("{code} — {expected}"));
+                assert_eq!(error.to_string().lines().count(), 1);
+                assert_eq!(error.exit_code(), 1);
+            }
+        }
+
+        #[test]
+        fn backoff_refuses_without_claiming_a_prompt_was_shown() {
+            for code in [
+                error_codes::OPERATOR_DECLINED,
+                error_codes::OPERATOR_PRESENCE_UNAVAILABLE,
+            ] {
+                let error = operator_error(code, Some("backoff"));
+                assert_eq!(
+                    error.to_string(),
+                    format!("{code} — refused without asking: too many recent declines")
+                );
+                assert!(!error.to_string().contains("prompt"));
+                assert_eq!(error.exit_code(), 1);
+            }
+        }
+
+        #[test]
+        fn unrelated_error_rendering_is_unchanged() {
+            let body = ErrorBody::new("existing_code", "existing message")
+                .with_detail(json!({"reason": "backoff"}));
+            assert_eq!(
+                decode_error_body(&serde_json::to_vec(&body).unwrap()),
+                "existing_code — existing message"
+            );
+            assert_eq!(decode_error_body(b"not JSON"), "not JSON");
+        }
+
+        async fn connected_pair() -> (CkClient, TcpStream) {
+            let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let info = ConnectionInfo {
+                schema: SCHEMA_VERSION,
+                wire_version: Some(PROTOCOL_VERSION),
+                endpoints: vec![Endpoint {
+                    host: "127.0.0.1".to_string(),
+                    port: listener.local_addr().unwrap().port(),
+                }],
+                key: generate_key().unwrap(),
+                daemon_id: generate_daemon_id().unwrap(),
+                pid: process::id(),
+                daemon_ver: "scripted-test-daemon".to_string(),
+            };
+            let resolved = ResolvedConnection {
+                path: PathBuf::from("scripted-connection.json"),
+                info: info.clone(),
+            };
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                authenticate_server(
+                    &mut stream,
+                    &info.key,
+                    &info.daemon_id,
+                    &info.daemon_ver,
+                    AUTH_DEADLINE,
+                )
+                .await
+                .unwrap();
+                stream
+            });
+            let client = CkClient::connect(resolved).await.unwrap();
+            (client, server.await.unwrap())
+        }
+
+        async fn reply(stream: &mut TcpStream, request: &Frame, ty: FrameType, body: Value) {
+            let frame = Frame::build_with_version(
+                request.header.ver,
+                ty,
+                request.header.flags,
+                0,
+                0,
+                request.header.corr,
+                serde_json::to_vec(&body).unwrap(),
+            )
+            .unwrap();
+            write_frame(stream, &frame).await.unwrap();
+        }
+
+        // Paused Tokio time can otherwise jump to a deadline while loopback IO
+        // waits on the OS. Keep a runnable task until the request is on the wire.
+        fn keep_time_frozen_during_io() -> JoinHandle<()> {
+            tokio::spawn(async {
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            })
+        }
+
+        async fn begin_command(
+            expected: ClientControlRequest,
+            list: Value,
+        ) -> (JoinHandle<Result<(), CkError>>, TcpStream, Frame) {
+            let awake = keep_time_frozen_during_io();
+            let started = time::Instant::now();
+            let (mut client, mut server) = connected_pair().await;
+            let command = expected.clone();
+            let task = tokio::spawn(async move {
+                match command {
+                    ClientControlRequest::SupervisorRestart {
+                        module_id,
+                        drain_timeout_ms,
+                    } => module_restart(&mut client, &module_id, drain_timeout_ms, true).await,
+                    ClientControlRequest::SupervisorSwap {
+                        module_id,
+                        ready_timeout_ms,
+                    } => module_swap(&mut client, &module_id, ready_timeout_ms, true).await,
+                    ClientControlRequest::SupervisorRescan { preview } => {
+                        module_rescan(&mut client, true, preview).await
+                    }
+                    ClientControlRequest::SupervisorReleaseReserved { module_id } => {
+                        module_release_reserved(&mut client, &module_id, true).await
+                    }
+                    ClientControlRequest::SupervisorSetEnabled { module_id, enabled } => {
+                        module_set_enabled(&mut client, &module_id, enabled, true).await
+                    }
+                    ClientControlRequest::SupervisorList {} => {
+                        supervisor_list(&mut client).await.map(|_| ())
+                    }
+                    _ => panic!("unsupported test command"),
+                }
+            });
+            let mut frame = read_frame(&mut server).await.unwrap().unwrap();
+            if matches!(
+                expected,
+                ClientControlRequest::SupervisorSetEnabled { .. }
+                    | ClientControlRequest::SupervisorRescan { preview: false }
+            ) {
+                assert_eq!(
+                    serde_json::from_slice::<ClientControlRequest>(&frame.body).unwrap(),
+                    ClientControlRequest::SupervisorList {}
+                );
+                reply(&mut server, &frame, FrameType::Response, list).await;
+                frame = read_frame(&mut server).await.unwrap().unwrap();
+            }
+            assert_eq!(frame.header.ty, FrameType::Request);
+            assert_eq!(frame.header.channel, 0);
+            assert_eq!(
+                serde_json::from_slice::<ClientControlRequest>(&frame.body).unwrap(),
+                expected
+            );
+            assert_eq!(time::Instant::now(), started);
+            awake.abort();
+            (task, server, frame)
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn restart_never_reply_is_unknown_only_at_300_seconds_without_retry() {
+            let (task, mut server, _) = begin_command(
+                ClientControlRequest::SupervisorRestart {
+                    module_id: "aft".to_string(),
+                    drain_timeout_ms: None,
+                },
+                json!({}),
+            )
+            .await;
+            time::advance(Duration::from_secs(299)).await;
+            tokio::task::yield_now().await;
+            assert!(
+                !task.is_finished(),
+                "restart must still wait at 299 seconds"
+            );
+            time::advance(Duration::from_secs(1)).await;
+            let error = task.await.unwrap().unwrap_err();
+            assert!(matches!(
+                error,
+                CkError::OutcomeUnknown { timeout, .. } if timeout == Duration::from_secs(300)
+            ));
+            assert_eq!(error.exit_code(), 4);
+            assert!(error
+                .to_string()
+                .contains("outcome unknown: `ck module restart aft`"));
+            assert!(
+                read_frame(&mut server).await.unwrap().is_none(),
+                "no retry frame"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn every_privileged_command_adds_290_seconds_to_its_existing_window() {
+            for (request, list, seconds) in [
+                (
+                    ClientControlRequest::SupervisorSwap {
+                        module_id: "aft".to_string(),
+                        ready_timeout_ms: Some(7_000),
+                    },
+                    json!({}),
+                    307,
+                ),
+                (
+                    ClientControlRequest::SupervisorReleaseReserved {
+                        module_id: "aft".to_string(),
+                    },
+                    json!({}),
+                    300,
+                ),
+                (
+                    ClientControlRequest::SupervisorSetEnabled {
+                        module_id: "aft".to_string(),
+                        enabled: false,
+                    },
+                    json!({"modules": [{"module_id": "aft", "drain_timeout_ms": 5_000}]}),
+                    297,
+                ),
+                (
+                    ClientControlRequest::SupervisorSetEnabled {
+                        module_id: "aft".to_string(),
+                        enabled: true,
+                    },
+                    json!({"modules": [{"module_id": "aft"}]}),
+                    322,
+                ),
+                (
+                    ClientControlRequest::SupervisorRescan { preview: false },
+                    json!({"modules": [{"module_id": "aft", "drain_timeout_ms": 5_000}, {"module_id": "other", "drain_timeout_ms": 11_000}]}),
+                    308,
+                ),
+                (
+                    ClientControlRequest::SupervisorRescan { preview: false },
+                    json!({"modules": []}),
+                    300,
+                ),
+            ] {
+                let (task, mut server, _) = begin_command(request, list).await;
+                time::advance(Duration::from_secs(seconds - 1)).await;
+                tokio::task::yield_now().await;
+                assert!(
+                    !task.is_finished(),
+                    "must still wait before {seconds} seconds"
+                );
+                time::advance(Duration::from_secs(1)).await;
+                let error = task.await.unwrap().unwrap_err();
+                assert!(matches!(
+                    error,
+                    CkError::OutcomeUnknown { timeout, .. } if timeout == Duration::from_secs(seconds)
+                ));
+                assert_eq!(error.exit_code(), 4);
+                assert!(
+                    read_frame(&mut server).await.unwrap().is_none(),
+                    "no retry frame"
+                );
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn read_and_rescan_preview_keep_the_ten_second_window() {
+            for request in [
+                ClientControlRequest::SupervisorList {},
+                ClientControlRequest::SupervisorRescan { preview: true },
+            ] {
+                let (task, mut server, _) = begin_command(request, json!({})).await;
+                time::advance(Duration::from_secs(9)).await;
+                tokio::task::yield_now().await;
+                assert!(!task.is_finished());
+                time::advance(Duration::from_secs(1)).await;
+                let error = task.await.unwrap().unwrap_err();
+                assert!(matches!(
+                    error,
+                    CkError::ResponseTimeout { timeout } if timeout == Duration::from_secs(10)
+                ));
+                assert_eq!(error.exit_code(), 1);
+                assert!(read_frame(&mut server).await.unwrap().is_none());
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn restart_handles_approval_reply_after_fifteen_seconds() {
+            let (task, mut server, frame) = begin_command(
+                ClientControlRequest::SupervisorRestart {
+                    module_id: "aft".to_string(),
+                    drain_timeout_ms: None,
+                },
+                json!({}),
+            )
+            .await;
+            time::advance(Duration::from_secs(15)).await;
+            assert!(!task.is_finished());
+            let awake = keep_time_frozen_during_io();
+            reply(
+                &mut server,
+                &frame,
+                FrameType::Response,
+                json!({"applied": true}),
+            )
+            .await;
+            let list = read_frame(&mut server).await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_slice::<ClientControlRequest>(&list.body).unwrap(),
+                ClientControlRequest::SupervisorList {}
+            );
+            reply(
+                &mut server,
+                &list,
+                FrameType::Response,
+                json!({"modules": [{"module_id": "aft", "state": "restarting"}]}),
+            )
+            .await;
+            task.await.unwrap().unwrap();
+            awake.abort();
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn restart_handles_operator_error_replies_without_outcome_unknown() {
+            for (code, reason) in [
+                (error_codes::OPERATOR_DECLINED, "person"),
+                (error_codes::OPERATOR_DECLINED, "backoff"),
+                (error_codes::OPERATOR_PRESENCE_UNAVAILABLE, "no_presence"),
+            ] {
+                let (task, mut server, frame) = begin_command(
+                    ClientControlRequest::SupervisorRestart {
+                        module_id: "aft".to_string(),
+                        drain_timeout_ms: None,
+                    },
+                    json!({}),
+                )
+                .await;
+                let awake = keep_time_frozen_during_io();
+                reply(
+                    &mut server,
+                    &frame,
+                    FrameType::Error,
+                    json!({"code": code, "message": "operator confirmation refused", "detail": {"reason": reason}}),
+                )
+                .await;
+                let error = task.await.unwrap().unwrap_err();
+                awake.abort();
+                assert!(matches!(error, CkError::Rejected(_)));
+                assert_eq!(
+                    error.to_string(),
+                    operator_error(code, Some(reason)).to_string()
+                );
+                assert_eq!(error.exit_code(), 1);
+                assert!(read_frame(&mut server).await.unwrap().is_none());
+            }
+        }
+    }
+
     #[test]
     fn terminal_dispositions_render_as_words() {
         let label = |disposition: &str| {
@@ -8398,11 +9054,12 @@ mod tests {
     }
 
     /// The daemon now stamps every capture line, so the stderr lane merges
-    /// with the daemon's and the module's own lines by time. A capture file
-    /// begun before that holds unstamped lines, which must still be shown and
-    /// must stay undated: the reader has no record of when they were written.
+    /// with the daemon's and the module's own lines by time. The capture file
+    /// is append-only: a legacy line can use the nearest capture stamp in its
+    /// file as an ordering anchor, with a leading line using the first stamp.
+    /// JSON keeps that anchor distinct from a time carried by the line.
     #[test]
-    fn capture_lines_merge_by_their_stamp_and_unstamped_ones_stay_undated() {
+    fn capture_lines_merge_by_stamp_and_legacy_lines_inherit_ordering_times() {
         let capture = LogSource {
             lane: "stderr".to_string(),
             path: PathBuf::from("engram.stderr.log"),
@@ -8431,7 +9088,8 @@ mod tests {
         let mut counts = LogFilterCounts::default();
         let mut entries = Vec::new();
         let mut order = 0;
-        // Capture first, so only the stamps can put the lines in order.
+        // Collect the capture lane first so source order preserves its file
+        // order when legacy lines share a capture stamp.
         collect_log_text(
             "engram",
             &capture,
@@ -8457,10 +9115,10 @@ mod tests {
             lines,
             vec![
                 "2026-09-19T07:04:01.000Z INFO  subc: spawned module_id=engram",
+                "thread 'main' panicked at src/main.rs:1:1: before stamping",
                 "2026-09-19T07:04:02.000Z booting",
                 "2026-09-19T07:04:03.000Z WARN  subc: slow module_id=engram",
                 "2026-09-19T07:04:04.000Z 2026-09-19T07:04:03.999Z WARN  engram.store: own line",
-                "thread 'main' panicked at src/main.rs:1:1: before stamping",
             ]
         );
         let timestamps: Vec<Option<String>> = entries
@@ -8472,18 +9130,20 @@ mod tests {
             vec![
                 Some("1789801441.000Z".to_string()),
                 Some("1789801442.000Z".to_string()),
+                Some("1789801442.000Z".to_string()),
                 Some("1789801443.000Z".to_string()),
                 // The capture stamp, not the module's own claim a millisecond
                 // earlier.
                 Some("1789801444.000Z".to_string()),
-                None,
             ],
-            "a stamped line is dated by its stamp; an unstamped one gets no time"
+            "a leading legacy line inherits the first capture stamp; a line's timestamp is still marked as inherited"
         );
+        assert!(entries[1].time_inherited);
+        assert!(!entries[2].time_inherited);
         // The module's own fleet line after the stamp still carries its level
         // and component for `--level` and `--tag`.
-        assert_eq!(entries[3].level, Some(ParsedLevel::Warn));
-        assert_eq!(entries[3].tag.as_deref(), Some("store"));
+        assert_eq!(entries[4].level, Some(ParsedLevel::Warn));
+        assert_eq!(entries[4].tag.as_deref(), Some("store"));
         assert_eq!(counts.unparsed, 2, "the plain capture lines have no level");
     }
 
@@ -8657,8 +9317,8 @@ mod tests {
     }
 
     use super::*;
+    use cortexkit_test_support::ScratchDir;
     use subc_control::{StderrCaptureState, StderrTail, StderrTailEntry};
-    use subc_test_support::TestTempDir;
 
     #[test]
     fn provenance_value_escapes_terminal_controls() {
@@ -8692,6 +9352,45 @@ mod tests {
             assert!(!rendered.bytes().any(|byte| byte < 0x20));
             assert!(rendered.contains(r"\x1b"), "rendered: {rendered:?}");
         }
+    }
+
+    #[test]
+    fn hidden_running_image_and_previous_instance_wait_are_rendered_distinctly() {
+        let image = serde_json::json!({"status": "unavailable", "reason": "process_hidden"});
+        assert_eq!(
+            running_image_clause(&image),
+            "running image not observable (process hidden)"
+        );
+        assert_eq!(
+            provenance_image(Some(&image)),
+            "is not observable (process hidden)"
+        );
+        let module = serde_json::json!({"state": "starting", "waiting_for_previous_pid": 42});
+        assert_eq!(module_status_text(&module), "waiting: previous instance (pid 42) is still running but hidden; it cannot be identified");
+    }
+
+    #[test]
+    fn non_dumpable_running_image_is_rendered_as_not_readable() {
+        let image = serde_json::json!({
+            "status": "unavailable",
+            "reason": "running_executable_permission_denied"
+        });
+        assert_eq!(
+            running_image_clause(&image),
+            "running image not readable (non-dumpable)"
+        );
+        assert_eq!(
+            provenance_image(Some(&image)),
+            "is not readable (non-dumpable)"
+        );
+        let ordinary = serde_json::json!({
+            "status": "unavailable",
+            "reason": "running_executable_unreadable"
+        });
+        assert_eq!(
+            running_image_clause(&ordinary),
+            "running image differs: running_executable_unreadable"
+        );
     }
 
     #[test]
@@ -8758,6 +9457,20 @@ mod tests {
             format_child_resources(&linux),
             "memory 2.0 MiB resident set, swap 4.0 KiB · cpu 290 ms (user 250 ms, system 40 ms)"
         );
+    }
+
+    #[test]
+    fn child_resources_render_windows_working_set_and_kernel_time() {
+        let module = serde_json::json!({ "resources": {
+            "status": "measured", "memory_bytes": 2_097_152,
+            "memory_kind": "windows_working_set", "cpu_user_ms": 250, "cpu_system_ms": 40,
+        }});
+        assert_eq!(
+            format_child_resources(&module),
+            "memory 2.0 MiB windows working set · cpu 290 ms (user 250 ms, kernel 40 ms)"
+        );
+        assert_eq!(child_memory_cell(&module), "2.0 MiB");
+        assert_eq!(child_cpu_cell(&module), "290 ms");
     }
 
     /// A daemon that predates the field, one that could not read the process,
@@ -9188,7 +9901,7 @@ mod tests {
     fn missing_window_renders_as_not_reported_row() {
         let entry = serde_json::json!({
             "provider": "anthropic",
-            "account": "wwaxpoetic@yahoo.com",
+            "account": "person@example.invalid",
             "usage": { "primary": { "usedPercent": 7.0, "windowMinutes": 300 } }
         });
         // Render against a template set that includes a window this account
@@ -10342,8 +11055,8 @@ mod tests {
         assert!(top_help().contains("upgrade"));
     }
 
-    fn triage_fixture_dir(name: &str) -> TestTempDir {
-        TestTempDir::new(name)
+    fn triage_fixture_dir(name: &str) -> ScratchDir {
+        ScratchDir::new(name)
     }
 
     fn write_triage_connection(path: &Path, pid: u32, key: &str) {
@@ -10570,5 +11283,311 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(command, Command::Help(text) if text.contains("daemon triage")));
+    }
+
+    #[test]
+    fn module_logs_inherits_capture_head_and_preserves_merged_tail_order() {
+        let module_id = "logs-test";
+        let capture = LogSource {
+            lane: "stderr".into(),
+            path: PathBuf::new(),
+            daemon: false,
+            capture: true,
+        };
+        let daemon = LogSource {
+            lane: "daemon".into(),
+            path: PathBuf::new(),
+            daemon: true,
+            capture: false,
+        };
+        let options = ModuleLogsOptions {
+            lines: 3,
+            follow: false,
+            since: None,
+            tag: None,
+            level: None,
+            lane: None,
+        };
+        let mut counts = LogFilterCounts::default();
+        let mut entries = Vec::new();
+        let mut source_order = 0;
+        collect_log_text(
+            module_id,
+            &capture,
+            concat!(
+                "legacy capture head\n",
+                "2026-09-19T07:04:02.000Z first stamped capture\n",
+                "legacy capture middle\n",
+                "2026-09-19T07:04:05.000Z second stamped capture\n",
+                "legacy capture tail\n",
+            ),
+            &options,
+            &mut counts,
+            &mut entries,
+            &mut source_order,
+        );
+        collect_log_text(
+            module_id,
+            &daemon,
+            concat!(
+                "2026-09-19T07:04:03.000Z INFO  subc: middle daemon module_id=logs-test\n",
+                "2026-09-19T07:04:06.000Z INFO  subc: newest daemon module_id=logs-test\n",
+            ),
+            &options,
+            &mut counts,
+            &mut entries,
+            &mut source_order,
+        );
+
+        sort_log_entries(&mut entries);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.line.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "legacy capture head",
+                "2026-09-19T07:04:02.000Z first stamped capture",
+                "legacy capture middle",
+                "2026-09-19T07:04:03.000Z INFO  subc: middle daemon module_id=logs-test",
+                "2026-09-19T07:04:05.000Z second stamped capture",
+                "legacy capture tail",
+                "2026-09-19T07:04:06.000Z INFO  subc: newest daemon module_id=logs-test",
+            ]
+        );
+        let tail = &entries[entries.len() - options.lines..];
+        assert_eq!(
+            tail.iter()
+                .map(|entry| entry.line.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "2026-09-19T07:04:05.000Z second stamped capture",
+                "legacy capture tail",
+                "2026-09-19T07:04:06.000Z INFO  subc: newest daemon module_id=logs-test",
+            ]
+        );
+        assert!(tail.iter().all(|entry| entry.line != "legacy capture head"));
+    }
+
+    #[test]
+    fn module_logs_undated_capture_between_stamps_stays_between_them() {
+        let module_id = "logs-test";
+        let capture = LogSource {
+            lane: "stderr".into(),
+            path: PathBuf::new(),
+            daemon: false,
+            capture: true,
+        };
+        let daemon = LogSource {
+            lane: "daemon".into(),
+            path: PathBuf::new(),
+            daemon: true,
+            capture: false,
+        };
+        let options = ModuleLogsOptions {
+            lines: 20,
+            follow: false,
+            since: None,
+            tag: None,
+            level: None,
+            lane: None,
+        };
+        let mut counts = LogFilterCounts::default();
+        let mut entries = Vec::new();
+        let mut source_order = 0;
+        collect_log_text(
+            module_id,
+            &capture,
+            concat!(
+                "2026-09-19T07:04:02.000Z first capture\n",
+                "legacy capture between stamps\n",
+                "2026-09-19T07:04:05.000Z second capture\n",
+            ),
+            &options,
+            &mut counts,
+            &mut entries,
+            &mut source_order,
+        );
+        collect_log_text(
+            module_id,
+            &daemon,
+            "2026-09-19T07:04:03.000Z INFO  subc: middle daemon module_id=logs-test\n",
+            &options,
+            &mut counts,
+            &mut entries,
+            &mut source_order,
+        );
+
+        sort_log_entries(&mut entries);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.line.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "2026-09-19T07:04:02.000Z first capture",
+                "legacy capture between stamps",
+                "2026-09-19T07:04:03.000Z INFO  subc: middle daemon module_id=logs-test",
+                "2026-09-19T07:04:05.000Z second capture",
+            ]
+        );
+        assert!(entries[1].time_inherited);
+    }
+
+    #[test]
+    fn module_logs_capture_without_stamps_remains_undated_and_bypasses_since() {
+        let capture = LogSource {
+            lane: "stderr".into(),
+            path: PathBuf::new(),
+            daemon: false,
+            capture: true,
+        };
+        let daemon = LogSource {
+            lane: "daemon".into(),
+            path: PathBuf::new(),
+            daemon: true,
+            capture: false,
+        };
+        let options = ModuleLogsOptions {
+            lines: 20,
+            follow: false,
+            since: Some(Duration::from_secs(12 * 60 * 60)),
+            tag: None,
+            level: None,
+            lane: None,
+        };
+        let daemon_time = format_capture_test_time(SystemTime::now());
+        let daemon_text = format!("{daemon_time} INFO  subc: current daemon module_id=logs-test\n");
+        let mut counts = LogFilterCounts::default();
+        let mut entries = Vec::new();
+        let mut source_order = 0;
+        collect_log_text(
+            "logs-test",
+            &capture,
+            "legacy line one\nlegacy line two\n",
+            &options,
+            &mut counts,
+            &mut entries,
+            &mut source_order,
+        );
+        collect_log_text(
+            "logs-test",
+            &daemon,
+            &daemon_text,
+            &options,
+            &mut counts,
+            &mut entries,
+            &mut source_order,
+        );
+
+        sort_log_entries(&mut entries);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].line, daemon_text.trim_end());
+        assert_eq!(entries[1].line, "legacy line one");
+        assert_eq!(entries[2].line, "legacy line two");
+        assert!(entries[1..]
+            .iter()
+            .all(|entry| entry.timestamp.is_none() && !entry.time_inherited));
+        assert_eq!(counts.before_since, 0);
+    }
+
+    #[test]
+    fn module_logs_json_marks_capture_inherited_times() {
+        let capture = LogSource {
+            lane: "stderr".into(),
+            path: PathBuf::new(),
+            daemon: false,
+            capture: true,
+        };
+        let options = ModuleLogsOptions {
+            lines: 20,
+            follow: false,
+            since: None,
+            tag: None,
+            level: None,
+            lane: None,
+        };
+        let mut counts = LogFilterCounts::default();
+        let mut entries = Vec::new();
+        let mut source_order = 0;
+        collect_log_text(
+            "logs-test",
+            &capture,
+            concat!(
+                "legacy head\n",
+                "2026-09-19T07:04:02.000Z stamped capture\n",
+            ),
+            &options,
+            &mut counts,
+            &mut entries,
+            &mut source_order,
+        );
+
+        let inherited = log_entry_json(&entries[0]);
+        let stamped = log_entry_json(&entries[1]);
+        assert_eq!(inherited["time_inherited"], true);
+        assert_eq!(stamped["time_inherited"], false);
+        assert!(inherited["timestamp"].is_string());
+        assert!(stamped["timestamp"].is_string());
+    }
+
+    fn format_capture_test_time(time: SystemTime) -> String {
+        let elapsed = time.duration_since(UNIX_EPOCH).unwrap();
+        let seconds = elapsed.as_secs();
+        let parts = utc_parts_from_epoch_secs(seconds);
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+            parts.year,
+            parts.month,
+            parts.day,
+            parts.hour,
+            parts.minute,
+            seconds % 60,
+            elapsed.subsec_millis(),
+        )
+    }
+
+    #[test]
+    fn module_logs_since_filters_capture_lines_by_inherited_time() {
+        let now = SystemTime::now();
+        let old = format_capture_test_time(now - Duration::from_secs(24 * 60 * 60));
+        let recent = format_capture_test_time(now - Duration::from_secs(60 * 60));
+        let capture = LogSource {
+            lane: "stderr".into(),
+            path: PathBuf::new(),
+            daemon: false,
+            capture: true,
+        };
+        let options = ModuleLogsOptions {
+            lines: 50,
+            follow: false,
+            since: Some(Duration::from_secs(12 * 60 * 60)),
+            tag: None,
+            level: None,
+            lane: None,
+        };
+        let text = format!(
+            "legacy stale head\n{old} stale stamped line\nlegacy stale middle\n{recent} recent stamped line\nlegacy recent tail\n"
+        );
+        let mut counts = LogFilterCounts::default();
+        let mut entries = Vec::new();
+        let mut source_order = 0;
+        collect_log_text(
+            "logs-test",
+            &capture,
+            &text,
+            &options,
+            &mut counts,
+            &mut entries,
+            &mut source_order,
+        );
+
+        assert_eq!(counts.before_since, 3);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].line, format!("{recent} recent stamped line"));
+        assert_eq!(entries[1].line, "legacy recent tail");
+        assert!(entries
+            .iter()
+            .all(|entry| entry.time_inherited || entry.line.contains("recent stamped")));
     }
 }

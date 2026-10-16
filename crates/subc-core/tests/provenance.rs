@@ -2,14 +2,14 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{sync::Arc, time::Duration};
 // The sha256 re-hash apparatus (throwaway binaries in per-test temp dirs) is
-// LINUX-only — macOS proves identity by spawn inode and Windows serves the
-// unavailable arm, neither writes files — so these imports gate with it or
+// LINUX-only — macOS and Windows compare spawn-time file objects without
+// hashing their contents — so these imports gate with it or
 // the other platforms clippy-fail them as unused under -D warnings.
 #[cfg(target_os = "linux")]
 use std::fs;
 
-// Used by the linux AND macos match arms of assert_running_image_matches.
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
+use cortexkit_test_support::ScratchDir;
 use subc_control::RunningImageEvidence;
 #[cfg(target_os = "windows")]
 use subc_control::RunningImageUnavailableReason;
@@ -23,8 +23,6 @@ use subc_daemon::{
 };
 use subc_protocol::manifest::LaunchNonceSource;
 use subc_protocol::{Flags, FrameType, Priority};
-#[cfg(target_os = "linux")]
-use subc_test_support::TestTempDir;
 use tokio::{
     io::AsyncWriteExt,
     time::{sleep, timeout, Instant},
@@ -53,8 +51,11 @@ async fn macos_status_and_provenance_publish_only_a_confirmed_module_pid() {
             handle.clone(),
         )
         .await;
+        // The trampoline runs as `ckdev-subc-under-test`; its running image is
+        // compared with this placed file below.
+        let trampoline = common::ckdev_subc_under_test();
         let supervisor = Supervisor::new(Arc::clone(&daemon.registry), RestartPolicy::default())
-            .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc-under-test"))
+            .with_privacy_trampoline(&trampoline)
             .with_process_liveness(process_liveness)
             .with_handle(handle)
             .with_drain_timeout(Duration::from_millis(25))
@@ -94,9 +95,7 @@ async fn macos_status_and_provenance_publish_only_a_confirmed_module_pid() {
             .unwrap();
         assert_eq!(
             image.executable,
-            subc_os::file_identity(std::path::Path::new(env!(
-                "CARGO_BIN_EXE_ck-subc-under-test"
-            ))),
+            subc_os::file_identity(&trampoline),
             "the test must observe the actual delayed trampoline"
         );
         let pending = module.status().unwrap();
@@ -196,7 +195,7 @@ async fn macos_refused_trampoline_never_publishes_a_module_pid() {
             Arc::clone(&daemon.registry),
             RestartPolicy::new(0, Duration::ZERO),
         )
-        .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc-under-test"))
+        .with_privacy_trampoline(common::ckdev_subc_under_test())
         .with_process_liveness(liveness)
         .with_handle(handle)
         .with_connection_file_path(daemon.connection_file_path.clone());
@@ -265,7 +264,7 @@ async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
     .await;
     let after_start_ms = unix_ms();
     let supervisor = Supervisor::new(Arc::clone(&daemon.registry), RestartPolicy::default())
-        .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
+        .with_privacy_trampoline(common::ckdev_subc())
         .with_process_liveness(process_liveness)
         .with_handle(supervisor_handle)
         .with_drain_timeout(Duration::from_millis(25))
@@ -301,12 +300,20 @@ async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
         observed_daemon.daemon_observed.pid,
         Some(std::process::id())
     );
+    #[cfg(not(windows))]
     assert!(matches!(
         observed_daemon.daemon_observed.running_image,
         RunningImageAgreement::Match { .. }
             | RunningImageAgreement::Unavailable {
                 reason: subc_control::RunningImageUnavailableReason::UnsupportedPlatform
             }
+    ));
+    #[cfg(windows)]
+    assert!(matches!(
+        observed_daemon.daemon_observed.running_image,
+        RunningImageAgreement::Unavailable {
+            reason: RunningImageUnavailableReason::ProcessIdentityUnconfirmed
+        }
     ));
     assert!(
         observed_daemon.daemon_observed.started_at_ms >= Some(before_start_ms)
@@ -340,9 +347,12 @@ async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
     );
     let status = module.status().unwrap();
     assert_eq!(observed.daemon_observed.pid, status.pid);
+    let expected_program = PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub"));
+    #[cfg(windows)]
+    let expected_program = std::fs::canonicalize(expected_program).unwrap();
     assert_eq!(
         observed.daemon_observed.spawned_from,
-        Some(PathBuf::from(env!("CARGO_BIN_EXE_fake-aft-stub")))
+        Some(expected_program)
     );
     assert!(observed.daemon_observed.spawned_at_ms.unwrap_or_default() > 0);
     assert_running_image_matches(&observed.daemon_observed.running_image);
@@ -376,10 +386,10 @@ async fn supervisor_provenance_reports_declared_and_observed_module_facts() {
     module.stop().await.unwrap();
 }
 
-/// A reserved module the supervisor spawns reads its launch nonce from the
-/// descriptor the spawn hands it: it is admitted, which a reserved module is
-/// only with its exact spawn nonce in HELLO, and its declared provenance says
-/// the nonce came from `fd` even though the environment copy is set too.
+/// A reserved module must echo its exact spawn nonce to register. Its cached
+/// provenance must name the inherited Unix descriptor or the Windows pipe,
+/// rather than the environment copy Windows still offers for older modules
+/// whose readers have not adopted the pipe.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn supervisor_provenance_reports_a_reserved_module_reading_its_nonce_from_the_descriptor() {
     let process_liveness = Arc::new(SupervisorProcessLiveness::new());
@@ -391,12 +401,12 @@ async fn supervisor_provenance_reports_a_reserved_module_reading_its_nonce_from_
     )
     .await;
     let supervisor = Supervisor::new(Arc::clone(&daemon.registry), RestartPolicy::default())
-        .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
+        .with_privacy_trampoline(common::ckdev_subc())
         .with_process_liveness(process_liveness)
         .with_handle(supervisor_handle)
         .with_drain_timeout(Duration::from_millis(25))
         .with_connection_file_path(daemon.connection_file_path.clone());
-    let scratch = subc_test_support::TestTempDir::new("provenance-nonce-source");
+    let scratch = cortexkit_test_support::ScratchDir::new("provenance-nonce-source");
     let xdg = |name: &str| (name.to_string(), scratch.join(name).display().to_string());
     let mut spec = stub_spec(
         "provenance-nonce-source",
@@ -420,10 +430,17 @@ async fn supervisor_provenance_reports_a_reserved_module_reading_its_nonce_from_
     };
     let expected = if cfg!(unix) {
         LaunchNonceSource::Fd
+    } else if cfg!(windows) {
+        LaunchNonceSource::Pipe
     } else {
         LaunchNonceSource::Env
     };
     assert_eq!(build.launch_nonce_source, Some(expected));
+    #[cfg(windows)]
+    assert_eq!(
+        modules[0].daemon_observed.launch_nonce_source.as_deref(),
+        Some("pipe")
+    );
     module.stop().await.unwrap();
 }
 
@@ -438,7 +455,7 @@ async fn supervisor_provenance_marks_absent_manifest_block_unverifiable() {
     )
     .await;
     let supervisor = Supervisor::new(Arc::clone(&daemon.registry), RestartPolicy::default())
-        .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
+        .with_privacy_trampoline(common::ckdev_subc())
         .with_process_liveness(process_liveness)
         .with_handle(supervisor_handle)
         .with_drain_timeout(Duration::from_millis(25))
@@ -471,7 +488,7 @@ async fn supervisor_provenance_detects_replaced_executable_image() {
     )
     .await;
     let supervisor = Supervisor::new(Arc::clone(&daemon.registry), RestartPolicy::default())
-        .with_privacy_trampoline(env!("CARGO_BIN_EXE_ck-subc"))
+        .with_privacy_trampoline(common::ckdev_subc())
         .with_process_liveness(process_liveness)
         .with_handle(supervisor_handle)
         .with_drain_timeout(Duration::from_millis(25))
@@ -616,15 +633,15 @@ fn assert_running_image_matches(result: &RunningImageAgreement) {
     #[cfg(target_os = "windows")]
     assert!(matches!(
         result,
-        RunningImageAgreement::Unavailable {
-            reason: RunningImageUnavailableReason::UnsupportedPlatform
+        RunningImageAgreement::Match {
+            evidence: RunningImageEvidence::WindowsSpawnFileId { .. }
         }
     ));
 }
 
 #[cfg(target_os = "linux")]
-fn unique_temp_dir(label: &str) -> TestTempDir {
-    TestTempDir::new(label)
+fn unique_temp_dir(label: &str) -> ScratchDir {
+    ScratchDir::new(label)
 }
 
 fn unix_ms() -> u64 {

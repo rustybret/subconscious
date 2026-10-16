@@ -156,7 +156,7 @@ pub(crate) struct UndeliveredFrame<'a> {
 }
 
 /// How a route's principal appears in logs: `direct`, or `reserved:<module>`.
-fn principal_label(principal: &Principal) -> String {
+pub(crate) fn principal_label(principal: &Principal) -> String {
     match principal {
         Principal::Reserved { module_id } => format!("reserved:{module_id}"),
         Principal::Direct => "direct".to_string(),
@@ -305,6 +305,7 @@ pub(crate) struct EndpointRoute {
 #[derive(Debug, Clone)]
 pub(crate) struct ScopeDrainedRoute {
     pub reason: RouteCloseReason,
+    pub scope: BoundScope,
     pub module_id: String,
     pub client: GoodbyeTarget,
     pub module: GoodbyeTarget,
@@ -442,8 +443,34 @@ struct PendingRouteBindRelayEntry {
     /// compares it with the published tag.
     scope: Option<BoundScope>,
     deadline: Instant,
+    /// Set once `route.open` has finished putting the route.bind on the
+    /// module's egress queue. A path that drops this entry WITHOUT a module
+    /// reply (client teardown, module drain, the open's own abort) sends the
+    /// module a GOODBYE for the bind only when this is set, because only then
+    /// is the GOODBYE guaranteed to queue behind the bind. When it is not set,
+    /// the removal is recorded in `relays_released_before_enqueue` instead and
+    /// `route.open` sends that GOODBYE itself once its send has completed.
+    ///
+    /// A module reply does not consult it: an ack proves the module received
+    /// the bind, so the reply path decides about the GOODBYE on its own.
     relay_enqueued: bool,
     sender: oneshot::Sender<RouteBindRelayOutcome>,
+}
+
+/// What `mark_route_bind_relay_enqueued` found once `route.open` had put the
+/// route.bind on the module's queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteBindRelayMark {
+    /// The relay is still pending; later removals handle their own GOODBYE.
+    Marked,
+    /// The module already answered and the reply path settled the relay:
+    /// it committed the route, or it refused it and sent any GOODBYE the
+    /// module needed. `route.open` must send nothing.
+    SettledByReply,
+    /// The relay was dropped without a module reply while the bind was still
+    /// being queued, so nothing has told the module to drop the binding it
+    /// is about to create. `route.open` must send that GOODBYE.
+    ReleasedWithoutReply,
 }
 
 #[derive(Debug, Clone)]
@@ -472,7 +499,13 @@ struct ModuleConnection {
 
 #[derive(Debug, Default)]
 struct ForwardingInner {
+    operator_confirms: Arc<crate::operator_confirm::OperatorConfirms>,
     daemon_draining: bool,
+    /// Whether forwarding reached quiescence during daemon shutdown, for each
+    /// active endpoint present when shutdown began. A pending wait is false
+    /// because it has not proved quiescence. Endpoint generations prevent a
+    /// result from describing a replacement connection with the same module id.
+    daemon_drain_results: HashMap<ModuleEndpointId, bool>,
     /// The ACTIVE slot: the one endpoint per module id that routing resolves.
     /// Every by-id lookup (relay reservation, drain-by-id, liveness, census,
     /// live roots, module-control RPCs) reads this map and nothing else.
@@ -508,6 +541,11 @@ struct ForwardingInner {
     module_to_client: HashMap<ModuleRouteKey, Arc<RouteBinding>>,
     status: HashMap<(ClientRouteKey, u32), String>,
     pending_relays: HashMap<(ModuleEndpointId, u64), PendingRouteBindRelayEntry>,
+    /// Pending relays removed without a module reply before `route.open`
+    /// marked them enqueued. `route.open` consumes its key when it marks the
+    /// relay (and sends the GOODBYE the removal could not send safely) or when
+    /// it aborts, so an entry lives only while that open is mid-send.
+    relays_released_before_enqueue: HashSet<(ModuleEndpointId, u64)>,
     /// Each scope's current `(scope_epoch, version)`, keyed `(owner, ref)`,
     /// published by a scope sync in the same step that changes the record. A
     /// bind commit reads it here so it never takes the scope table's lock
@@ -545,6 +583,8 @@ pub(crate) type ConnectionCloseReceiver = oneshot::Receiver<CloseReason>;
 #[derive(Debug, Default)]
 pub struct ForwardingTable {
     inner: Arc<RwLock<ForwardingInner>>,
+    #[cfg(feature = "test-support")]
+    route_closing_hold: Mutex<Option<oneshot::Receiver<()>>>,
     close_registry: Mutex<HashMap<ConnectionId, oneshot::Sender<CloseReason>>>,
     counters: DaemonCounters,
     /// Per-target-module bind-relay breaker state. It lives here, beside the
@@ -562,6 +602,74 @@ pub struct ForwardingTable {
 }
 
 impl ForwardingTable {
+    /// Hold the next supervisor drain between enqueueing `module.draining` and
+    /// `route.closing`, so a test can forward a response in that window. Dropping
+    /// the returned sender also releases the hold, including on a test panic.
+    #[cfg(feature = "test-support")]
+    pub fn hold_route_closing_for_test(&self) -> oneshot::Sender<()> {
+        let (release, hold) = oneshot::channel();
+        *self.route_closing_hold.lock().unwrap() = Some(hold);
+        release
+    }
+
+    #[cfg(feature = "test-support")]
+    pub(crate) async fn wait_before_route_closing_for_test(&self) {
+        let hold = self.route_closing_hold.lock().unwrap().take();
+        if let Some(hold) = hold {
+            let _ = hold.await;
+        }
+    }
+
+    pub(crate) fn operator_confirms(&self) -> Arc<crate::operator_confirm::OperatorConfirms> {
+        Arc::clone(
+            &self
+                .inner
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .operator_confirms,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_operator_principal(&self, key: ModuleRouteKey, principal: Principal) {
+        let mut inner = self.write_inner().unwrap();
+        let old = inner.module_to_client.remove(&key).unwrap();
+        let client = ClientRouteKey {
+            connection_id: old.client_connection_id,
+            channel: old.client_channel,
+        };
+        inner.client_to_module.remove(&client);
+        let mut binding = Arc::try_unwrap(old).expect("test binding has no outstanding readers");
+        binding.principal = principal;
+        let binding = Arc::new(binding);
+        inner.client_to_module.insert(client, Arc::clone(&binding));
+        inner.module_to_client.insert(key, binding);
+    }
+
+    /// Keep the binding protected through confirmation admission. Route release
+    /// takes the write lock and then the same confirm-state lock, so it cannot
+    /// miss an admitted request or leave it waiting on a vanished route.
+    pub(crate) fn with_operator_route<T>(
+        &self,
+        connection_id: ConnectionId,
+        channel: u16,
+        epoch: u32,
+        admit: impl FnOnce(Option<&RouteBinding>) -> T,
+    ) -> Result<T, ForwardingError> {
+        let inner = self.read_inner()?;
+        let binding = inner
+            .endpoint_by_connection
+            .get(&connection_id)
+            .and_then(|endpoint| {
+                inner.module_to_client.get(&ModuleRouteKey {
+                    endpoint: *endpoint,
+                    channel,
+                })
+            })
+            .filter(|binding| binding.module_epoch == epoch);
+        Ok(admit(binding.map(Arc::as_ref)))
+    }
+
     pub(crate) fn counters(&self) -> DaemonCounters {
         self.counters.clone()
     }
@@ -1307,17 +1415,32 @@ impl ForwardingTable {
         })
     }
 
+    /// Called by `route.open` right after the route.bind entered the module's
+    /// egress queue.
+    ///
+    /// The module reader runs concurrently with `route.open`, so a fast module
+    /// can receive the bind, ack it, and have the reader commit the route
+    /// before this runs. A missing entry therefore does not mean the bind was
+    /// abandoned: only a removal recorded in `relays_released_before_enqueue`
+    /// does. Telling the two apart is what stops `route.open` from sending a
+    /// GOODBYE for a route that was just committed.
     pub(crate) fn mark_route_bind_relay_enqueued(
         &self,
         endpoint: ModuleEndpointId,
         corr: u64,
-    ) -> Result<bool, ForwardingError> {
+    ) -> Result<RouteBindRelayMark, ForwardingError> {
         let mut inner = self.write_inner()?;
-        let Some(pending) = inner.pending_relays.get_mut(&(endpoint, corr)) else {
-            return Ok(false);
-        };
-        pending.relay_enqueued = true;
-        Ok(true)
+        if let Some(pending) = inner.pending_relays.get_mut(&(endpoint, corr)) {
+            pending.relay_enqueued = true;
+            return Ok(RouteBindRelayMark::Marked);
+        }
+        if inner
+            .relays_released_before_enqueue
+            .remove(&(endpoint, corr))
+        {
+            return Ok(RouteBindRelayMark::ReleasedWithoutReply);
+        }
+        Ok(RouteBindRelayMark::SettledByReply)
     }
 
     pub(crate) fn release_client_route(
@@ -1373,6 +1496,13 @@ impl ForwardingTable {
     ) -> Result<Option<GoodbyeTarget>, ForwardingError> {
         let mut inner = self.write_inner()?;
         let Some(pending) = inner.pending_relays.remove(&(endpoint, corr)) else {
+            // If another path dropped the relay while `route.open` was still
+            // sending the bind, and that open is now giving up without marking
+            // it (its send failed or it was cancelled), forget the record so it
+            // cannot outlive the open.
+            inner
+                .relays_released_before_enqueue
+                .remove(&(endpoint, corr));
             return Ok(None);
         };
         release_reserved_route_locked(
@@ -1534,10 +1664,10 @@ impl ForwardingTable {
                     pending.reservation.client_key,
                     pending.reservation.module_key,
                 );
-                let abandoned = pending
-                    .relay_enqueued
-                    .then(|| abandoned_route_target(&inner, &pending.reservation))
-                    .flatten();
+                // Not gated on `relay_enqueued`: an ack proves the module
+                // received the bind, and `route.open` sends nothing for a
+                // relay a reply already settled, so this is the only GOODBYE.
+                let abandoned = abandoned_route_target(&inner, &pending.reservation);
                 let _ = pending
                     .sender
                     .send(RouteBindRelayOutcome::ModuleGone(reason.to_string()));
@@ -2004,15 +2134,49 @@ impl ForwardingTable {
     }
 
     /// Whether daemon-wide shutdown has begun draining all providers.
-    pub(crate) fn is_daemon_draining(&self) -> Result<bool, ForwardingError> {
-        Ok(self.read_inner()?.daemon_draining)
+    /// `None` means normal operation; during daemon shutdown, return the
+    /// endpoint's measured result, or false if no completed measurement exists.
+    pub(crate) fn daemon_drain_result_for_connection(
+        &self,
+        connection_id: ConnectionId,
+    ) -> Result<Option<bool>, ForwardingError> {
+        let inner = self.read_inner()?;
+        Ok(inner.daemon_draining.then(|| {
+            inner
+                .endpoint_by_connection
+                .get(&connection_id)
+                .and_then(|endpoint| inner.daemon_drain_results.get(endpoint))
+                .copied()
+                .unwrap_or(false)
+        }))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn record_daemon_drain_result(
+        &self,
+        endpoint: ModuleEndpointId,
+        drained: bool,
+    ) -> Result<(), ForwardingError> {
+        let mut inner = self.write_inner()?;
+        // Only update an endpoint captured at the start of daemon shutdown.
+        // Teardown removes its entry, so a late wait cannot recreate the result
+        // or attribute it to a replacement connection.
+        if let Some(result) = inner.daemon_drain_results.get_mut(&endpoint) {
+            *result = drained;
+        }
+        Ok(())
     }
 
     /// Gate every provider atomically, including registrations racing shutdown.
     /// No supervisor lock is held while taking the forwarding lock.
     #[cfg(unix)]
-    pub(crate) fn begin_daemon_drain(&self) -> Result<Vec<String>, ForwardingError> {
+    pub(crate) fn begin_daemon_drain(
+        &self,
+    ) -> Result<Vec<(String, ModuleEndpointId)>, ForwardingError> {
         let mut inner = self.write_inner()?;
+        if inner.daemon_draining {
+            return Ok(Vec::new());
+        }
         inner.daemon_draining = true;
         let modules = inner
             .modules_by_id
@@ -2020,14 +2184,15 @@ impl ForwardingTable {
             .map(|(id, module)| (id.clone(), module.endpoint))
             .collect::<Vec<_>>();
         for (_, endpoint) in &modules {
+            inner.daemon_drain_results.insert(*endpoint, false);
             inner
                 .draining_endpoints
                 .insert(*endpoint, RouteCloseReason::Restart);
         }
         // Swap candidates and superseded incumbents are not routable, but they
         // are live endpoints that could still be sent module-control work, so
-        // the daemon-wide gate covers them too. The returned ids are unchanged:
-        // they name modules for the supervisor to drain, one per id.
+        // the daemon-wide gate covers them too. Only the active endpoints are
+        // returned to the supervisor for measurement, one per module id.
         let off_slot_endpoints = inner
             .candidates_by_id
             .values()
@@ -2039,7 +2204,7 @@ impl ForwardingTable {
                 .draining_endpoints
                 .insert(endpoint, RouteCloseReason::Restart);
         }
-        Ok(modules.into_iter().map(|(id, _)| id).collect())
+        Ok(modules)
     }
 
     /// Begin draining whatever endpoint is ACTIVE for `module_id`.
@@ -2132,6 +2297,11 @@ fn begin_drain_locked(
                 if let Some(target) = abandoned_route_target(inner, &pending.reservation) {
                     abandoned_bindings.push(target);
                 }
+            } else {
+                // The bind may still be on its way into the module's queue;
+                // a GOODBYE sent now could overtake it. `route.open` sends
+                // it once its send completes.
+                inner.relays_released_before_enqueue.insert(key);
             }
             let _ = pending
                 .sender
@@ -2462,6 +2632,11 @@ impl ForwardingTable {
                 if let Some(target) = abandoned_route_target(inner, &pending.reservation) {
                     released.push(target);
                 }
+            } else {
+                // The bind may still be on its way into the module's queue;
+                // a GOODBYE sent now could overtake it. `route.open` sends
+                // it once its send completes.
+                inner.relays_released_before_enqueue.insert(key);
             }
             let _ = pending.sender.send(RouteBindRelayOutcome::ModuleGone(
                 "client connection closed during route.bind relay".to_string(),
@@ -2619,6 +2794,10 @@ impl ForwardingTable {
             if let RouteRelease::Removed(module) = release {
                 drained.push(ScopeDrainedRoute {
                     reason,
+                    scope: route
+                        .scope
+                        .clone()
+                        .expect("selected scope drain has a bound scope"),
                     module_id: route.module_id.clone(),
                     client: GoodbyeTarget {
                         connection_id: route.client_connection_id,
@@ -2890,7 +3069,14 @@ fn release_client_route_locked(
         .remove(&client_key)
         .expect("route checked under the same forwarding lock");
     route.flow.close();
+    if let Some(scope) = &route.scope {
+        scope.release_bind();
+    }
     inner.module_to_client.remove(&ModuleRouteKey {
+        endpoint: route.module_endpoint,
+        channel: route.module_channel,
+    });
+    inner.operator_confirms.route_closed(ModuleRouteKey {
         endpoint: route.module_endpoint,
         channel: route.module_channel,
     });
@@ -2921,7 +3107,11 @@ fn release_module_route_locked(
         .module_to_client
         .remove(&module_key)
         .expect("route checked under the same forwarding lock");
+    inner.operator_confirms.route_closed(module_key);
     route.flow.close();
+    if let Some(scope) = &route.scope {
+        scope.release_bind();
+    }
     let client_key = ClientRouteKey {
         connection_id: route.client_connection_id,
         channel: route.client_channel,
@@ -3000,7 +3190,7 @@ fn commit_route_locked(
         .insert(reservation.client_key, Arc::clone(&binding));
     inner
         .module_to_client
-        .insert(reservation.module_key, binding);
+        .insert(reservation.module_key, Arc::clone(&binding));
     let previous_published = inner
         .last_published_epoch
         .insert(reservation.client_key, reservation.client_epoch);
@@ -3011,10 +3201,10 @@ fn commit_route_locked(
     // actually enters the queue, not when the slot was reserved.
     let client_writer_closed = pending.client_permit.send(pending.route_open_frame);
     if client_writer_closed {
-        let abandoned = pending
-            .relay_enqueued
-            .then(|| abandoned_route_target(inner, &reservation))
-            .flatten();
+        // Not gated on `relay_enqueued`: only a module ack reaches this
+        // commit, which proves the module holds the binding, and `route.open`
+        // sends nothing for a relay a reply already settled.
+        let abandoned = abandoned_route_target(inner, &reservation);
         if let Some(route) = inner.client_to_module.remove(&reservation.client_key) {
             route.flow.close();
         }
@@ -3038,6 +3228,9 @@ fn commit_route_locked(
         return Ok(abandoned);
     }
 
+    if let Some(scope) = &binding.scope {
+        scope.commit_presence();
+    }
     let _ = pending.sender.send(RouteBindRelayOutcome::Accepted);
     Ok(None)
 }
@@ -3106,7 +3299,11 @@ fn remove_module_connection_locked(
     inner: &mut ForwardingInner,
     endpoint: ModuleEndpointId,
 ) -> ConnectionCleanup {
+    // Commit the disconnect before its routes are released, so their teardown
+    // cannot replace module_closed with route_closed.
+    inner.operator_confirms.module_closed(endpoint);
     inner.draining_endpoints.remove(&endpoint);
+    inner.daemon_drain_results.remove(&endpoint);
     let module_id = inner.module_id_by_endpoint.remove(&endpoint);
     if let Some(module_id) = module_id.as_ref() {
         if inner
@@ -3154,10 +3351,21 @@ fn remove_module_connection_locked(
         .collect();
     let pending: Vec<_> = pending_keys
         .into_iter()
-        .filter_map(|key| inner.pending_relays.remove(&key))
+        .filter_map(|key| {
+            inner
+                .pending_relays
+                .remove(&key)
+                .map(|pending| (key, pending))
+        })
         .collect();
     let abandoned_relays = u32::try_from(pending.len()).unwrap_or(u32::MAX);
-    for pending in pending {
+    for (key, pending) in pending {
+        // Recorded like every other removal without a reply, so a `route.open`
+        // still sending the bind learns the relay was released rather than
+        // settled by the module.
+        if !pending.relay_enqueued {
+            inner.relays_released_before_enqueue.insert(key);
+        }
         let module_label = module_id.as_deref().unwrap_or("unknown");
         let _ = pending
             .sender
@@ -3903,7 +4111,10 @@ mod tests {
     #[cfg(unix)]
     fn daemon_drain_gates_current_and_racing_provider_registrations() {
         let (forwarding, _, endpoint, _, sink, _) = route_fixture("provider");
-        assert_eq!(forwarding.begin_daemon_drain().unwrap(), ["provider"]);
+        assert_eq!(
+            forwarding.begin_daemon_drain().unwrap(),
+            [("provider".to_string(), endpoint)]
+        );
         assert!(forwarding.endpoint_is_draining(endpoint).unwrap());
         assert!(matches!(
             forwarding.register_module_connection(
@@ -3915,6 +4126,71 @@ mod tests {
             ),
             Err(ForwardingError::ConnectionClosing { .. })
         ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn daemon_drain_results_are_endpoint_fenced_and_removed_on_cleanup() {
+        let (forwarding, connection, endpoint, _, _, _) = route_fixture("provider");
+        assert_eq!(
+            forwarding
+                .daemon_drain_result_for_connection(connection)
+                .unwrap(),
+            None
+        );
+        forwarding
+            .record_daemon_drain_result(endpoint, true)
+            .unwrap();
+        forwarding.begin_daemon_drain().unwrap();
+        assert_eq!(
+            forwarding
+                .daemon_drain_result_for_connection(connection)
+                .unwrap(),
+            Some(false)
+        );
+        let replacement = ModuleEndpointId {
+            generation: endpoint.generation + 1,
+            ..endpoint
+        };
+        forwarding
+            .record_daemon_drain_result(replacement, true)
+            .unwrap();
+        assert_eq!(
+            forwarding
+                .daemon_drain_result_for_connection(connection)
+                .unwrap(),
+            Some(false)
+        );
+        forwarding
+            .record_daemon_drain_result(endpoint, true)
+            .unwrap();
+        assert_eq!(
+            forwarding
+                .daemon_drain_result_for_connection(connection)
+                .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            forwarding
+                .daemon_drain_result_for_connection(ConnectionId::new(300))
+                .unwrap(),
+            Some(false)
+        );
+        forwarding.cleanup_connection(connection).unwrap();
+        forwarding
+            .record_daemon_drain_result(endpoint, true)
+            .unwrap();
+        assert_eq!(
+            forwarding
+                .daemon_drain_result_for_connection(connection)
+                .unwrap(),
+            Some(false)
+        );
+        assert!(forwarding
+            .read_inner()
+            .unwrap()
+            .daemon_drain_results
+            .is_empty());
     }
 
     #[test]
@@ -5061,9 +5337,12 @@ mod swap_slot_tests {
             .begin_route_bind_relay_for_test(early_client, early_sink, 1, MODULE_ID)
             .unwrap();
         assert_eq!(early.endpoint, fixture.incumbent);
-        assert!(forwarding
-            .mark_route_bind_relay_enqueued(early.endpoint, early.corr)
-            .unwrap());
+        assert_eq!(
+            forwarding
+                .mark_route_bind_relay_enqueued(early.endpoint, early.corr)
+                .unwrap(),
+            RouteBindRelayMark::Marked
+        );
 
         let cutover = forwarding.cutover_candidate(MODULE_ID).unwrap().unwrap();
         assert_eq!(

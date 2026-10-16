@@ -224,6 +224,18 @@ jobs:
           tar -xzf "$tgz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/nats-server-$v-linux-amd64" >> "$GITHUB_PATH"
 
+      - name: Check CortexKit layout
+        if: ${{ matrix.os == 'ubuntu' }}
+        run: bash scripts/check-cortexkit-layout.sh
+
+      - name: Check Markdown links
+        if: ${{ matrix.os == 'ubuntu' }}
+        run: python3 scripts/checks/check-md-links.py
+
+      - name: Check test citations in docs
+        if: ${{ matrix.os == 'ubuntu' }}
+        run: python3 scripts/checks/check-doc-test-citations.py
+
       - name: Format check
         run: cargo fmt --all -- --check
 
@@ -265,7 +277,7 @@ jobs:
       - name: Test
         if: ${{ !cancelled() }}
         timeout-minutes: 40
-        run: cargo test --workspace --all-targets --locked
+        run: cargo test --workspace --all-targets --locked --no-fail-fast
 
       # --all-targets does NOT include doctests, despite the name: it expands to
       # --lib --bins --tests --benches --examples. So a doc example that stops
@@ -364,6 +376,14 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+      # Store depends on the sibling private-files package through its lock
+      # until that package is on npm, and log depends on store. Build
+      # private-files first so a fresh checkout has its JavaScript and
+      # declarations when store is installed, typechecked or packed.
+      - name: Build sibling private-files for store and log
+        if: ${{ matrix.pkg == 'store' || matrix.pkg == 'log' }}
+        working-directory: clients/private-files
+        run: bun install --frozen-lockfile && bun run build
       # Log's locked local dependency exports compiled files. Build them before
       # installing log so a fresh checkout has both JavaScript and declarations.
       - name: Build sibling store for log

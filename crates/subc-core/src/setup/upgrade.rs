@@ -993,7 +993,7 @@ mod tests {
     use crate::setup::test_exec::{copy_executable, write_executable};
     use crate::setup::{components::ReleaseArtifactSource, planner::plan_upgrade};
     #[cfg(unix)]
-    use subc_test_support::TestTempDir;
+    use cortexkit_test_support::ScratchDir;
 
     fn upgrade_target(binary: &str) -> UpgradeTarget {
         upgrade_roster(Component::ALL)
@@ -1005,8 +1005,8 @@ mod tests {
     // Used only by the unix-gated tests below; gate it with them so windows
     // clippy under -D warnings does not read it as dead code.
     #[cfg(unix)]
-    fn fixture_dir(name: &str) -> TestTempDir {
-        TestTempDir::new(name)
+    fn fixture_dir(name: &str) -> ScratchDir {
+        ScratchDir::new(name)
     }
 
     #[cfg(unix)]
@@ -1061,7 +1061,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn train_version_output_is_discovered_and_post_verified() {
-        let root = TestTempDir::new("train-version-output");
+        let root = ScratchDir::new("train-version-output");
         let target = upgrade_target("ck-mc");
         let version = "ck-mc-alpha.22464bf2";
         version_binary(&root.join("ck-mc"), version);
@@ -1074,7 +1074,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn successful_upgrade_completion_removes_its_rollback_copy() {
-        let root = TestTempDir::new("upgrade-completed-rollback");
+        let root = ScratchDir::new("upgrade-completed-rollback");
         let target = upgrade_target("ck-mc");
         version_binary(&root.join("ck-mc"), "0.1.0");
         let mut backend = isolated_backend(&root, target);
@@ -1089,7 +1089,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn post_verification_rejects_a_destination_changed_after_replacement() {
-        let root = TestTempDir::new("changed-post-inode");
+        let root = ScratchDir::new("changed-post-inode");
         let target = upgrade_target("ck-mc");
         let destination = root.join("ck-mc");
         version_binary(&destination, "0.1.0");
@@ -1119,7 +1119,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn train_release_post_verifies_the_binarys_own_version() {
-        let root = TestTempDir::new("train-post-verify");
+        let root = ScratchDir::new("train-post-verify");
         let target = upgrade_target("ck-mc");
         version_binary(&root.join("ck-mc"), "0.1.0");
         let mut backend = isolated_backend(&root, target);
@@ -1132,19 +1132,59 @@ mod tests {
         assert!(backend.post_verify(target).is_ok());
     }
 
+    /// Environment variable that turns [`rollback_stand_in_holds_until_killed`]
+    /// from an instant pass into a process that stays alive.
+    #[cfg(unix)]
+    const ROLLBACK_HOLD_ENV: &str = "CK_ROLLBACK_TEST_HOLD";
+
+    /// Run normally, this passes at once. Run from a copy of this test binary
+    /// with [`ROLLBACK_HOLD_ENV`] set, it keeps that copy running so the
+    /// rollback test below has a live executable to rename over.
+    #[cfg(unix)]
+    #[test]
+    fn rollback_stand_in_holds_until_killed() {
+        if std::env::var_os(ROLLBACK_HOLD_ENV).is_some() {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn rollback_replaces_running_executable_by_rename() {
         let root = fixture_dir("rollback-running-executable");
-        let destination = root.join("ck-aft");
-        let rollback = root.join("ck-aft.rollback");
+        // The managed binary this test models runs as `ckdev-aft`, so the test
+        // process is never listed under a production `ck-` name.
+        let destination = root.join("ckdev-aft");
+        let rollback = root.join("ckdev-aft.rollback");
         let candidate = root.join("candidate");
-        copy_executable(Path::new("/bin/sleep"), &destination);
-        copy_executable(Path::new("/bin/sleep"), &rollback);
-        copy_executable(Path::new("/bin/sleep"), &candidate);
+        // The stand-in is a copy of this test binary, not of a system utility:
+        // macOS kills a copied Apple platform binary run from outside its system
+        // path, and a multicall coreutils refuses to run under another name, so
+        // either way the "running" executable would already be gone.
+        let test_binary = std::env::current_exe().expect("test executable");
+        copy_executable(&test_binary, &destination);
+        copy_executable(&test_binary, &rollback);
+        copy_executable(&test_binary, &candidate);
         fs::rename(&candidate, &destination).unwrap();
         let replaced_inode = destination_inode(&destination).unwrap();
-        let mut child = Command::new(&destination).arg("10").spawn().unwrap();
+        let mut child = Command::new(&destination)
+            .args([
+                "--exact",
+                "setup::upgrade::tests::rollback_stand_in_holds_until_killed",
+                "--test-threads=1",
+            ])
+            .env(ROLLBACK_HOLD_ENV, "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // A stand-in that exited at once would prove nothing about replacing a
+        // running executable, so fail loudly instead.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the stand-in for the running managed binary exited before the rollback"
+        );
         let aft = upgrade_target("ck-aft");
         let mut inventory =
             Inventory::load(root.join("installer-manifest.json"), "linux-x64").unwrap();
@@ -1182,7 +1222,7 @@ mod tests {
         child.wait().unwrap();
         result.expect("rollback onto running executable");
         assert!(
-            !root.join("ck-aft.rollback").exists(),
+            !root.join("ckdev-aft.rollback").exists(),
             "successful rollback cleans its backup"
         );
         assert_ne!(
@@ -1522,7 +1562,7 @@ exit 1
     #[test]
     fn completion_line_follows_the_planned_from_not_the_self_report() {
         let mcp = upgrade_target("ck-subc-mcp");
-        let root = TestTempDir::new("completion-line");
+        let root = ScratchDir::new("completion-line");
         let inventory =
             Inventory::load(root.join("installer-manifest.json"), "linux-x64").expect("inventory");
         let mut backend = SystemUpgradeBackend {

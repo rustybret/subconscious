@@ -30,4 +30,4 @@ unsafe_code = "forbid"
 
 [dev-dependencies]
 subc-daemon = { path = "../subc-daemon" }
-subc-test-support = { path = "../subc-test-support" }
+cortexkit-test-support = "0.1.3"

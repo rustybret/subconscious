@@ -100,6 +100,13 @@ pub enum CgroupPlacementConfig {
 
 #[derive(Debug, Clone)]
 pub struct BootstrapConfig {
+    pub operator_queue_wait: Duration,
+    pub operator_timeout: Duration,
+    pub operator_stuck_grace: Duration,
+    #[cfg(feature = "test-support")]
+    pub operator_script: Option<PathBuf>,
+    #[cfg(feature = "test-support")]
+    pub operator_events: Option<PathBuf>,
     pub connection_file_path: PathBuf,
     pub port: u16,
     pub daemon_ver: String,
@@ -108,6 +115,8 @@ pub struct BootstrapConfig {
     admission_facts: AdmissionFactsConfig,
     /// Module ids whose scopes may carry the attributes that grant authority.
     scope_authority_owners: Vec<String>,
+    privileged_operator_prompt: daemon_config::PrivilegedOperatorPrompt,
+    activity_config: daemon_config::ActivityConfig,
     daemon_config_path: Option<PathBuf>,
     configured_port: Option<u16>,
     /// Daemon-wide route.bind relay budget in milliseconds (the fallback for
@@ -153,12 +162,21 @@ impl BootstrapConfig {
     pub fn new(connection_file_path: impl Into<PathBuf>, port: u16) -> Self {
         Self {
             connection_file_path: connection_file_path.into(),
+            operator_queue_wait: Duration::from_secs(150),
+            operator_timeout: Duration::from_secs(120),
+            operator_stuck_grace: Duration::from_secs(10),
+            #[cfg(feature = "test-support")]
+            operator_script: None,
+            #[cfg(feature = "test-support")]
+            operator_events: None,
             port,
             daemon_ver: DAEMON_VERSION.to_owned(),
             configured_modules: Vec::new(),
             storage_config: None,
             admission_facts: AdmissionFactsConfig::default(),
             scope_authority_owners: daemon_config::default_scope_authority_owners(),
+            privileged_operator_prompt: daemon_config::PrivilegedOperatorPrompt::default(),
+            activity_config: daemon_config::ActivityConfig::default(),
             daemon_config_path: None,
             configured_port: None,
             route_bind_relay_default_ms: None,
@@ -234,19 +252,52 @@ impl BootstrapConfig {
         let run_dir = daemon_config::daemon_run_dir().map_err(BootstrapError::RunDir)?;
         let machine_id_path =
             crate::machine_id::default_machine_id_path().map_err(BootstrapError::MachineId)?;
-        Ok(Self::from_env()?
+        let config = Self::from_env()?
             .with_capture_logs_dir(run_dir.join("logs"))
             .with_terminal_journal_path(run_dir.join("terminals.jsonl"))
             .with_live_children_record(crate::live_children::record_path(&run_dir))
-            .with_machine_id_path(machine_id_path))
+            .with_machine_id_path(machine_id_path);
+        #[cfg(feature = "test-support")]
+        let config = {
+            let mut config = config;
+            config.operator_script =
+                std::env::var_os("SUBC_TEST_OPERATOR_SCRIPT").map(PathBuf::from);
+            config.operator_events =
+                std::env::var_os("SUBC_TEST_OPERATOR_EVENTS").map(PathBuf::from);
+            for (name, value) in [
+                (
+                    "SUBC_TEST_OPERATOR_QUEUE_WAIT_MS",
+                    &mut config.operator_queue_wait,
+                ),
+                (
+                    "SUBC_TEST_OPERATOR_TIMEOUT_MS",
+                    &mut config.operator_timeout,
+                ),
+                (
+                    "SUBC_TEST_OPERATOR_STUCK_MS",
+                    &mut config.operator_stuck_grace,
+                ),
+            ] {
+                if let Ok(ms) = std::env::var(name) {
+                    if let Ok(ms) = ms.parse::<u64>() {
+                        *value = Duration::from_millis(ms);
+                    }
+                }
+            }
+            config
+        };
+        Ok(config)
     }
 
     pub fn from_env_with_daemon_config_path(
         daemon_config_path: impl AsRef<Path>,
     ) -> Result<Self, BootstrapError> {
         let daemon_config_path = daemon_config_path.as_ref().to_path_buf();
-        let daemon_config =
-            daemon_config::load(&daemon_config_path).map_err(BootstrapError::DaemonConfig)?;
+        let (daemon_config, activity_config) =
+            daemon_config::load_with_activity(&daemon_config_path)
+                .map_err(BootstrapError::DaemonConfig)?
+                .map(|(config, activity)| (Some(config), activity))
+                .unwrap_or_default();
         let config_port = daemon_config.as_ref().and_then(|config| config.port);
         let storage_config = daemon_config
             .as_ref()
@@ -261,6 +312,10 @@ impl BootstrapConfig {
             .as_ref()
             .map(|config| config.scope_authority_owners.clone())
             .unwrap_or_else(daemon_config::default_scope_authority_owners);
+        let privileged_operator_prompt = daemon_config
+            .as_ref()
+            .map(|config| config.privileged_operator_prompt)
+            .unwrap_or_default();
         let route_bind_relay_default_ms = daemon_config
             .as_ref()
             .and_then(|config| config.route_bind_relay_timeout_ms);
@@ -300,6 +355,8 @@ impl BootstrapConfig {
             .with_storage_config(storage_config)
             .with_admission_facts_config(admission_facts_carrier_module_id, admission_facts_targets)
             .with_scope_authority_owners(scope_authority_owners)
+            .with_privileged_operator_prompt(privileged_operator_prompt)
+            .with_activity_config(activity_config)
             .with_route_bind_relay_default_ms(route_bind_relay_default_ms)
             .with_reserved_capabilities(reserved_capabilities)
             .with_daemon_config_source(daemon_config_path, config_port)
@@ -311,8 +368,11 @@ impl BootstrapConfig {
         daemon_config_path: impl AsRef<Path>,
     ) -> Result<Self, BootstrapError> {
         let daemon_config_path = daemon_config_path.as_ref().to_path_buf();
-        let daemon_config =
-            daemon_config::load(&daemon_config_path).map_err(BootstrapError::DaemonConfig)?;
+        let (daemon_config, activity_config) =
+            daemon_config::load_with_activity(&daemon_config_path)
+                .map_err(BootstrapError::DaemonConfig)?
+                .map(|(config, activity)| (Some(config), activity))
+                .unwrap_or_default();
         let configured_port = daemon_config.as_ref().and_then(|config| config.port);
         let storage_config = daemon_config
             .as_ref()
@@ -327,6 +387,10 @@ impl BootstrapConfig {
             .as_ref()
             .map(|config| config.scope_authority_owners.clone())
             .unwrap_or_else(daemon_config::default_scope_authority_owners);
+        let privileged_operator_prompt = daemon_config
+            .as_ref()
+            .map(|config| config.privileged_operator_prompt)
+            .unwrap_or_default();
         let route_bind_relay_default_ms = daemon_config
             .as_ref()
             .and_then(|config| config.route_bind_relay_timeout_ms);
@@ -342,6 +406,8 @@ impl BootstrapConfig {
             .with_storage_config(storage_config)
             .with_admission_facts_config(admission_facts_carrier_module_id, admission_facts_targets)
             .with_scope_authority_owners(scope_authority_owners)
+            .with_privileged_operator_prompt(privileged_operator_prompt)
+            .with_activity_config(activity_config)
             .with_route_bind_relay_default_ms(route_bind_relay_default_ms)
             .with_reserved_capabilities(reserved_capabilities)
             .with_daemon_config_source(daemon_config_path, configured_port))
@@ -381,6 +447,20 @@ impl BootstrapConfig {
     /// Absent from a config, this is `daemon_config::default_scope_authority_owners`.
     pub fn with_scope_authority_owners(mut self, owners: Vec<String>) -> Self {
         self.scope_authority_owners = owners;
+        self
+    }
+
+    /// Choose the privileged-operation policy for the daemon's entire lifetime.
+    pub fn with_privileged_operator_prompt(
+        mut self,
+        mode: daemon_config::PrivilegedOperatorPrompt,
+    ) -> Self {
+        self.privileged_operator_prompt = mode;
+        self
+    }
+
+    pub fn with_activity_config(mut self, config: daemon_config::ActivityConfig) -> Self {
+        self.activity_config = config;
         self
     }
 
@@ -536,10 +616,14 @@ pub async fn run() -> Result<(), BootstrapError> {
 /// (they measured 236 daemon lines with the subscriber installed, 0 with the
 /// call commented out) -- otherwise the fix is itself unverified.
 pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapError> {
+    let forwarding = Arc::new(ForwardingTable::default());
+    forwarding.operator_confirms().configure_bootstrap(&config);
     let configured_modules = config.configured_modules.clone();
     let storage_config = config.storage_config.clone();
     let admission_facts = config.admission_facts.clone();
     let scope_authority_owners = config.scope_authority_owners.clone();
+    let privileged_operator_prompt = config.privileged_operator_prompt;
+    let activity_config = config.activity_config;
     let daemon_config_path = config.daemon_config_path.clone();
     let configured_port = config.configured_port;
     let route_bind_relay_default_ms = config.route_bind_relay_default_ms;
@@ -562,10 +646,13 @@ pub async fn run_with_config(config: BootstrapConfig) -> Result<(), BootstrapErr
             let _ = cgroup_placement_config;
             serve_bound_daemon(
                 bound,
+                forwarding,
                 configured_modules,
                 storage_config,
                 admission_facts,
                 scope_authority_owners,
+                privileged_operator_prompt,
+                activity_config,
                 daemon_config_path,
                 configured_port,
                 route_bind_relay_default_ms,
@@ -710,10 +797,13 @@ pub async fn run_with_daemon_config_path(
 #[allow(clippy::too_many_arguments)]
 async fn serve_bound_daemon(
     bound: BoundDaemon,
+    forwarding: Arc<ForwardingTable>,
     configured_modules: Vec<ConfiguredModule>,
     storage_config: Option<daemon_config::StorageConfig>,
     admission_facts: AdmissionFactsConfig,
     scope_authority_owners: Vec<String>,
+    privileged_operator_prompt: daemon_config::PrivilegedOperatorPrompt,
+    activity_config: daemon_config::ActivityConfig,
     daemon_config_path: Option<PathBuf>,
     configured_port: Option<u16>,
     route_bind_relay_default_ms: Option<u64>,
@@ -767,7 +857,6 @@ async fn serve_bound_daemon(
     let process_liveness = Arc::new(SupervisorProcessLiveness::new());
     let supervisor_handle = SupervisorHandle::new();
     let connected_clients = ConnectedClients::new();
-    let forwarding = Arc::new(ForwardingTable::default());
     let daemon_incarnation = format!(
         "{:032x}",
         u128::from_be_bytes(bound.connection_info.daemon_id)
@@ -818,8 +907,15 @@ async fn serve_bound_daemon(
     // The supervisor already treats `None` as no-capture and no-journal, so
     // this only removes invented defaults. The binary keeps capturing and
     // journaling via `BootstrapConfig::from_env_for_daemon_binary`.
+
+    // Keep both ledgers in the explicitly selected run directory. An embedded
+    // daemon without a journal path must not write to the operator's live ledger.
+    let activity_run_dir = terminal_journal_path
+        .as_ref()
+        .and_then(|path| path.parent())
+        .map(Path::to_path_buf);
     let supervisor = match terminal_journal_path {
-        Some(path) => supervisor.with_terminal_journal(path, daemon_incarnation),
+        Some(path) => supervisor.with_terminal_journal(path, daemon_incarnation.clone()),
         None => supervisor,
     };
     let supervisor = match capture_logs_dir {
@@ -854,6 +950,7 @@ async fn serve_bound_daemon(
         .with_machine_id(bound.machine_id.clone())
         .with_admission_facts_config(admission_facts.carrier_module_id, admission_facts.targets)
         .with_scope_authority_owners(scope_authority_owners)
+        .with_privileged_operator_prompt(privileged_operator_prompt)
         .with_route_bind_relay_timeouts(route_bind_relay_timeouts)
         .with_daemon_provenance(
             bound.connection_info.pid,
@@ -869,6 +966,10 @@ async fn serve_bound_daemon(
                 .map(|module| (module.module_id.clone(), module.enabled)),
             reserved_capabilities,
         );
+    if let Some(run_dir) = activity_run_dir {
+        control =
+            control.with_activity_ledger_config(&run_dir, daemon_incarnation, activity_config);
+    }
     if let Some(ms) = route_bind_relay_default_ms {
         // A daemon-wide config value overrides the built-in default; a
         // `None` here leaves the ControlHandler's 12s default in place.
@@ -886,18 +987,62 @@ async fn serve_bound_daemon(
     )
     .with_connected_clients(connected_clients);
 
+    // Discovery must expose every accepted configured module, including disabled
+    // ones. Registration creates status handles but neither starts monitors
+    // nor launches processes: children need the published file for `--subc`.
+    let mut registered_modules = Vec::with_capacity(configured_modules.len());
+    for configured in configured_modules {
+        let enabled = configured.enabled;
+        let health = configured.health.clone();
+        let module_id = configured.module_id.clone();
+        let registered = match supervisor.register_configured_with_health(
+            configured.module_spec(),
+            enabled,
+            health.clone(),
+            configured.drain_timeout_ms,
+            configured.restart,
+        ) {
+            Ok(registered) => registered,
+            Err(err) => {
+                error!(module_id = %module_id, error = %err, "failed to supervise configured module; continuing daemon startup");
+                continue;
+            }
+        };
+        registered_modules.push(registered);
+        // A relaxed threshold can silently outlive the temporary allowance
+        // that required it, so report the extra tolerance on every boot.
+        let default_threshold = HealthConfig::default().failure_threshold;
+        if enabled && health.failure_threshold > default_threshold {
+            warn!(
+                module_id = %module_id,
+                failure_threshold = health.failure_threshold,
+                default_threshold,
+                tolerance_secs = health.cadence.as_secs() * u64::from(health.failure_threshold),
+                "health failure threshold is relaxed above the default; a wedged module stays unflagged for longer"
+            );
+        }
+        info!(module_id = %module_id, enabled, "configured module registered");
+    }
+    control.refresh_capability_requirements();
+
     let mut serve_task =
         AbortOnDrop::new(tokio::spawn(serve_listeners(bound.listeners, router, auth)));
     verify_serving(&bound.connection_info).await?;
     // A published endpoint promises that authentication can complete now.
     // Orphan cleanup and control-plane construction can take longer than an
     // existing-daemon probe's deadline, so finish both before discovery.
-    write_atomic(&bound.connection_file_path, &bound.connection_info).map_err(|source| {
-        BootstrapError::ConnectionFileWrite {
-            path: bound.connection_file_path.clone(),
-            source,
-        }
-    })?;
+    // The write fsyncs, so it runs on tokio's blocking pool (see
+    // `publish_connection_file`). The singleton lock travels with it and comes
+    // back only once the file is in place.
+    let (published, publication_lock) = publish_connection_file(
+        &bound.connection_file_path,
+        &bound.connection_info,
+        publication_lock,
+    )
+    .await;
+    published?;
+    #[cfg(test)]
+    startup_publication_hook::run(&bound.connection_file_path).await;
     drop(publication_lock);
     let _clock_step_task = AbortOnDrop::new(crate::watchdog::spawn_clock_step_monitor());
     // Off the startup path: it runs `systemctl`, and only ever logs.
@@ -914,46 +1059,20 @@ async fn serve_bound_daemon(
         .spawn(),
     );
 
-    for configured in configured_modules {
-        let enabled = configured.enabled;
-        let health = configured.health.clone();
-        let module_id = configured.module_id.clone();
-        match supervisor.supervise_configured_with_health(
-            configured.module_spec(),
-            enabled,
-            health.clone(),
-            configured.drain_timeout_ms,
-            configured.restart,
-        ) {
-            Ok(_) => {
-                // A raised failure threshold is normally a temporary allowance for a
-                // drive that deliberately stops a module, and it widens the window in
-                // which a genuinely wedged module looks fine. It is only ever noticed
-                // when someone thinks to re-read the config, so a relaxation outlives
-                // its reason silently: a rig ran five days at 240s of tolerance against
-                // a 90s default because a comment promising a revert was mistaken for
-                // the revert. Saying so on every boot costs one line and removes the
-                // need for anyone to remember.
-                let default_threshold = HealthConfig::default().failure_threshold;
-                if enabled && health.failure_threshold > default_threshold {
-                    warn!(
-                        module_id = %module_id,
-                        failure_threshold = health.failure_threshold,
-                        default_threshold,
-                        tolerance_secs = health.cadence.as_secs() * u64::from(health.failure_threshold),
-                        "health failure threshold is relaxed above the default; a wedged module stays unflagged for longer"
-                    );
-                }
-                info!(module_id = %module_id, enabled, "configured module supervised");
+    for registered in registered_modules {
+        match supervisor.start_registered_configured(registered, None) {
+            Ok(module) => {
+                info!(module_id = %module.module_id(), "configured module supervised");
             }
             Err(err) => {
-                error!(module_id = %module_id, error = %err, "failed to supervise configured module; continuing daemon startup");
+                error!(error = %err, "failed to start configured module; continuing daemon startup");
             }
         }
     }
 
     control.refresh_capability_requirements();
     Arc::clone(&control).spawn_capability_deadline_loop();
+    Arc::clone(&control).spawn_scope_expiry_loop();
 
     #[cfg(unix)]
     {
@@ -1071,12 +1190,35 @@ async fn ensure_singleton_inner(
     // Established under the start lock, and under the run-directory lock when
     // there is one, and before binding: a corrupt file stops boot before
     // anything is published, and two daemons racing to start cannot both mint.
-    let machine_id = config
-        .machine_id_path
-        .as_deref()
-        .map(crate::machine_id::load_or_mint)
-        .transpose()
-        .map_err(BootstrapError::MachineId)?;
+    //
+    // Minting a new machine id fsyncs its file, so loading or minting runs on
+    // tokio's blocking pool. Both locks travel with that work, so neither is
+    // released while a mint is in flight.
+    let (machine_id, lock, run_dir_lock) = match config.machine_id_path {
+        None => (None, lock, run_dir_lock),
+        Some(machine_id_path) => {
+            let task_path = machine_id_path.clone();
+            match run_blocking_holding((lock, run_dir_lock), move || {
+                crate::machine_id::load_or_mint(&task_path)
+            })
+            .await
+            {
+                Ok((Ok(id), (lock, run_dir_lock))) => (Some(id), lock, run_dir_lock),
+                Ok((Err(error), _locks)) => return Err(BootstrapError::MachineId(error)),
+                Err(join_error) => {
+                    return Err(BootstrapError::MachineId(
+                        crate::machine_id::MachineIdFileError::Write {
+                            path: machine_id_path,
+                            source: io::Error::other(describe_blocking_task_failure(
+                                "loading or minting the machine id",
+                                &join_error,
+                            )),
+                        },
+                    ))
+                }
+            }
+        }
+    };
 
     let (listeners, endpoints) = bind_loopback(config.port).await?;
     let connection_info = ConnectionInfo {
@@ -1092,12 +1234,17 @@ async fn ensure_singleton_inner(
     // The low-level binding API historically publishes for callers that serve
     // these listeners themselves. The daemon entry point defers publication
     // until its own authentication server is running.
-    if publish {
-        if let Err(source) = write_atomic(&path, &connection_info) {
+    let publication_lock = if publish {
+        let (published, lock) = publish_connection_file(&path, &connection_info, lock).await;
+        if let Err(error) = published {
             drop(listeners);
-            return Err(BootstrapError::ConnectionFileWrite { path, source });
+            return Err(error);
         }
-    }
+        drop(lock);
+        None
+    } else {
+        Some(lock)
+    };
 
     Ok(Outcome::Bound(BoundDaemon {
         listeners,
@@ -1106,7 +1253,7 @@ async fn ensure_singleton_inner(
         connection_file_source: config.connection_file_source,
         machine_id,
         run_dir_lock,
-        publication_lock: (!publish).then_some(lock),
+        publication_lock,
     }))
 }
 
@@ -1179,6 +1326,173 @@ async fn verify_serving(info: &ConnectionInfo) -> Result<(), BootstrapError> {
         }
     }
     Err(BootstrapError::StartupNotServing)
+}
+
+/// Run blocking filesystem work (an fsync, a rename) on tokio's blocking-thread
+/// pool rather than on the async worker thread that awaits it. On a slow or
+/// busy disk an fsync can take seconds, and a runtime has few worker threads
+/// (an in-process test daemon may share two with everything else), so doing it
+/// inline stalls unrelated tasks for that long.
+///
+/// `guards` (lock handles) move into the blocking task and are handed back
+/// with the work's result. If the awaiting future is dropped first, the work
+/// still runs to completion on its thread and the guards are released only
+/// after it ends, so a lock is never given up while the work it protects is
+/// still writing.
+///
+/// `Err` means the task panicked, or was cancelled before it started because
+/// the runtime is shutting down; the guards have then been released already.
+async fn run_blocking_holding<G, T>(
+    guards: G,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<(T, G), JoinError>
+where
+    G: Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let output = work();
+        (output, guards)
+    })
+    .await
+}
+
+/// Explain, for a startup error, why blocking work produced no result.
+fn describe_blocking_task_failure(work: &str, join_error: &JoinError) -> String {
+    if join_error.is_panic() {
+        format!("the background thread {work} panicked before finishing: {join_error}")
+    } else {
+        format!(
+            "the background thread {work} was cancelled before finishing, because the async runtime is shutting down: {join_error}"
+        )
+    }
+}
+
+/// Publish the connection file: owner-only permissions, written to a temporary
+/// file, fsynced and renamed over `path` (all done by `write_atomic`). The
+/// write runs on tokio's blocking pool through [`run_blocking_holding`], so the
+/// fsync never holds an async worker thread.
+///
+/// `guard` is the singleton start lock (or whatever the caller must keep held
+/// across publication); it is returned with the result. It comes back `None`
+/// only when the write task panicked or was cancelled, in which case the
+/// result is an error and the file must be treated as not published.
+async fn publish_connection_file<G: Send + 'static>(
+    path: &Path,
+    info: &ConnectionInfo,
+    guard: G,
+) -> (Result<(), BootstrapError>, Option<G>) {
+    let task_path = path.to_path_buf();
+    let task_info = info.clone();
+    let outcome =
+        run_blocking_holding(guard, move || write_connection_file(&task_path, &task_info)).await;
+    match outcome {
+        Ok((Ok(()), guard)) => (Ok(()), Some(guard)),
+        Ok((Err(source), guard)) => (
+            Err(BootstrapError::ConnectionFileWrite {
+                path: path.to_path_buf(),
+                source,
+            }),
+            Some(guard),
+        ),
+        Err(join_error) => (
+            Err(BootstrapError::ConnectionFileWrite {
+                path: path.to_path_buf(),
+                source: ConnectionFileError::Io {
+                    op: "write",
+                    path: path.to_path_buf(),
+                    source: io::Error::other(describe_blocking_task_failure(
+                        "writing the connection file",
+                        &join_error,
+                    )),
+                },
+            }),
+            None,
+        ),
+    }
+}
+
+/// The synchronous connection-file write, including its fsync. Call it only
+/// through [`publish_connection_file`], which keeps it off the async workers.
+fn write_connection_file(path: &Path, info: &ConnectionInfo) -> Result<(), ConnectionFileError> {
+    #[cfg(test)]
+    connection_file_write_hook::run(path);
+    write_atomic(path, info)
+}
+
+/// Lets a test run code inside the connection-file write, on whichever thread
+/// performs it, for example to block there and check what else can still run.
+#[cfg(test)]
+mod connection_file_write_hook {
+    use std::{
+        path::{Path, PathBuf},
+        sync::{Mutex, PoisonError},
+    };
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    /// Keyed by connection-file path, so a hook fires only for the test that
+    /// installed it while other tests publish their own files in parallel.
+    static HOOKS: Mutex<Vec<(PathBuf, Hook)>> = Mutex::new(Vec::new());
+
+    /// Run `hook` once, at the start of the next write of `path`.
+    pub(super) fn install(path: &Path, hook: impl FnOnce() + Send + 'static) {
+        HOOKS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((path.to_path_buf(), Box::new(hook)));
+    }
+
+    pub(super) fn run(path: &Path) {
+        let hook = {
+            let mut hooks = HOOKS.lock().unwrap_or_else(PoisonError::into_inner);
+            hooks
+                .iter()
+                .position(|(hooked, _)| hooked == path)
+                .map(|index| hooks.swap_remove(index).1)
+        };
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+/// A path-scoped barrier after publication and before any configured activation.
+/// The async wait leaves the listeners free to answer discovery-time requests.
+#[cfg(test)]
+mod startup_publication_hook {
+    use std::{
+        path::{Path, PathBuf},
+        sync::{Mutex, PoisonError},
+    };
+    use tokio::sync::oneshot;
+
+    type Barrier = (oneshot::Sender<()>, oneshot::Receiver<()>);
+    static BARRIERS: Mutex<Vec<(PathBuf, Barrier)>> = Mutex::new(Vec::new());
+
+    pub(super) fn install(path: &Path) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        BARRIERS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((path.to_path_buf(), (entered_tx, release_rx)));
+        (entered_rx, release_tx)
+    }
+
+    pub(super) async fn run(path: &Path) {
+        let barrier = {
+            let mut barriers = BARRIERS.lock().unwrap_or_else(PoisonError::into_inner);
+            barriers
+                .iter()
+                .position(|(hooked, _)| hooked == path)
+                .map(|index| barriers.swap_remove(index).1)
+        };
+        if let Some((entered, release)) = barrier {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+    }
 }
 
 fn is_absent_or_stale_connection_file(err: &ConnectionFileError) -> bool {
@@ -1315,9 +1629,19 @@ impl<T> Drop for AbortOnDrop<T> {
 
 #[derive(Debug)]
 struct StartLock {
-    // Keep the locked file handle alive for the duration of bootstrap; closing
-    // it releases the advisory lock while leaving the stable path in place.
+    // Keep the locked file handle alive for the duration of bootstrap.
     _file: fs::File,
+}
+
+impl Drop for StartLock {
+    fn drop(&mut self) {
+        // Closing alone leaves the lock held if a concurrent fork inherited
+        // the open file description and has not exec'd yet. Unlock explicitly
+        // so a restart can reclaim the singleton as soon as bootstrap ends.
+        if let Err(error) = FileExt::unlock(&self._file) {
+            tracing::warn!(%error, "failed to release the singleton start lock");
+        }
+    }
 }
 
 impl StartLock {
@@ -1557,14 +1881,20 @@ impl Error for BootstrapError {
 
 #[cfg(test)]
 mod tests {
+    mod activity {
+        include!("activity_bootstrap_tests.rs");
+    }
+    mod startup_order {
+        include!("startup_order_tests.rs");
+    }
     use super::*;
     use crate::server::ServerAuth;
+    use cortexkit_test_support::ScratchDir;
     #[cfg(target_os = "linux")]
     use std::collections::BTreeSet;
     use std::sync::Mutex;
     #[cfg(target_os = "linux")]
     use subc_control::ModuleProtocol;
-    use subc_test_support::TestTempDir;
     use subc_transport::MIN_KEY_LEN;
     use tokio::io::AsyncReadExt;
     use tokio::task::JoinHandle;
@@ -1743,11 +2073,11 @@ mod tests {
         }
     }
 
-    fn unique_temp_dir(name: &str) -> TestTempDir {
-        TestTempDir::new(name)
+    fn unique_temp_dir(name: &str) -> ScratchDir {
+        ScratchDir::new(name)
     }
 
-    fn temp_connection_file_path(name: &str) -> (TestTempDir, PathBuf) {
+    fn temp_connection_file_path(name: &str) -> (ScratchDir, PathBuf) {
         let dir = unique_temp_dir(name);
         let path = dir.join("conn.json");
         (dir, path)
@@ -2001,6 +2331,116 @@ mod tests {
             "expected a run-directory refusal, got {error}"
         );
         assert!(error.to_string().contains("XDG_DATA_HOME"), "{error}");
+    }
+
+    #[test]
+    fn privileged_operator_prompt_is_loaded_by_both_bootstrap_config_paths() {
+        let _env_lock = ENV_LOCK.lock().unwrap();
+        let _port = EnvGuard::unset(SUBC_PORT_ENV);
+        let (_dir, conn_path) = temp_connection_file_path("privileged-operator-prompt");
+        let config_path = conn_path.with_file_name("subc.jsonc");
+        for (doc, expected) in [
+            (None, daemon_config::PrivilegedOperatorPrompt::Log),
+            (
+                Some(r#"{"version":1}"#),
+                daemon_config::PrivilegedOperatorPrompt::Log,
+            ),
+            (
+                Some(r#"{"version":1,"privileged_operator_prompt":"log"}"#),
+                daemon_config::PrivilegedOperatorPrompt::Log,
+            ),
+            (
+                Some(r#"{"version":1,"privileged_operator_prompt":"enforce"}"#),
+                daemon_config::PrivilegedOperatorPrompt::Enforce,
+            ),
+        ] {
+            if let Some(doc) = doc {
+                fs::write(&config_path, doc).unwrap();
+            }
+            assert_eq!(
+                BootstrapConfig::from_env_with_daemon_config_path(&config_path)
+                    .unwrap()
+                    .privileged_operator_prompt,
+                expected
+            );
+            assert_eq!(
+                BootstrapConfig::new(&conn_path, 0)
+                    .with_daemon_config_path(&config_path)
+                    .unwrap()
+                    .privileged_operator_prompt,
+                expected
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn privileged_operator_prompt_is_snapshotted_by_running_daemon() {
+        let dir = unique_temp_dir("privileged-operator-prompt-bootstrap");
+        let connection_path = dir.join("connection.json");
+        let config_path = dir.join("subc.jsonc");
+        fs::write(
+            &config_path,
+            r#"{"version":1,"privileged_operator_prompt":"enforce"}"#,
+        )
+        .unwrap();
+        let config = BootstrapConfig::new(&connection_path, 0)
+            .with_daemon_config_path(&config_path)
+            .unwrap();
+        let daemon = AbortOnDrop::new(tokio::spawn(run_with_config(config)));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !connection_path.exists() {
+                assert!(
+                    !daemon.handle.is_finished(),
+                    "daemon exited before publishing"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let info = connection_file::read(&connection_path).unwrap();
+        let mut client = connect_from_info(&info).await.unwrap();
+        authenticate_client(&mut client, &info, Duration::from_secs(5))
+            .await
+            .unwrap();
+        for (correlation, mode, expected) in [
+            (1, "enforce", Vec::new()),
+            (2, "log", vec!["privileged_operator_prompt"]),
+            (3, "log", vec!["privileged_operator_prompt"]),
+        ] {
+            fs::write(
+                &config_path,
+                serde_json::json!({"version":1,"privileged_operator_prompt":mode}).to_string(),
+            )
+            .unwrap();
+            let frame = crate::Frame::build(
+                subc_protocol::FrameType::Request,
+                subc_protocol::Flags::new(false, subc_protocol::Priority::Interactive, false),
+                0,
+                0,
+                correlation,
+                serde_json::to_vec(&subc_control::ClientControlRequest::SupervisorRescan {
+                    preview: true,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            crate::write_frame(&mut client, &frame).await.unwrap();
+            let reply =
+                tokio::time::timeout(Duration::from_secs(5), crate::read_frame(&mut client))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(reply.header.ty, subc_protocol::FrameType::Response);
+            assert_eq!(reply.header.corr, correlation);
+            let subc_control::ClientControlResponse::SupervisorRescan { result } =
+                serde_json::from_slice(&reply.body).unwrap()
+            else {
+                panic!("expected a rescan response");
+            };
+            assert_eq!(result.restart_required, expected);
+        }
     }
 
     #[test]
@@ -2267,7 +2707,7 @@ mod tests {
 
     #[tokio::test]
     async fn unpublished_boot_holds_singleton_lock_until_publication() {
-        let dir = TestTempDir::new("unpublished-singleton-lock");
+        let dir = ScratchDir::new("unpublished-singleton-lock");
         let path = dir.join("connection.json");
         let bound = expect_bound(
             ensure_singleton_inner(BootstrapConfig::new(&path, 0), false)
@@ -2285,8 +2725,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_lock_drop_releases_claim_with_a_shared_file_description() {
+        let dir = ScratchDir::new("shared-singleton-lock");
+        let path = dir.join("connection.json");
+        let bound = expect_bound(
+            ensure_singleton_inner(BootstrapConfig::new(&path, 0), false)
+                .await
+                .unwrap(),
+        );
+        // try_clone shares the open file description just as fork does,
+        // without relying on the timing of another test's child spawn.
+        let inherited = bound
+            .publication_lock
+            .as_ref()
+            .unwrap()
+            ._file
+            .try_clone()
+            .unwrap();
+        let contender = open_owner_only_lock(&start_lock_path(&path)).unwrap();
+        assert!(matches!(
+            FileExt::try_lock(&contender),
+            Err(TryLockError::WouldBlock)
+        ));
+        drop(bound);
+        FileExt::try_lock(&contender).expect("dropping bootstrap releases even an inherited lock");
+        drop(inherited);
+    }
+
+    #[tokio::test]
     async fn readiness_probe_requires_an_authenticating_server() {
-        let dir = TestTempDir::new("unserved-readiness");
+        let dir = ScratchDir::new("unserved-readiness");
         let bound = expect_bound(
             ensure_singleton_inner(BootstrapConfig::new(dir.join("connection.json"), 0), false)
                 .await
@@ -2302,7 +2770,7 @@ mod tests {
     #[tokio::test]
     async fn orphan_sweep_finishes_before_connection_file_publication() {
         use crate::live_children::{ExecutableIdentity, LiveChild};
-        let dir = TestTempDir::new("publish-after-sweep");
+        let dir = ScratchDir::new("publish-after-sweep");
         let path = dir.join("connection.json");
         let record = dir.join("live-children.json");
         let ready = dir.join("ready");
@@ -2368,6 +2836,90 @@ mod tests {
         );
     }
 
+    /// Publishing the connection file fsyncs, which can take seconds on a busy
+    /// disk, so the daemon must do it off the async worker thread. The hook
+    /// blocks inside the write until another task on the same single-threaded
+    /// runtime has run. Writing on the worker thread would starve that task: the
+    /// hook then gives up after its deadline and the test fails, as it does if
+    /// startup publishes without going through the hooked write at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connection_file_publication_leaves_the_async_runtime_free() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (_dir, path) = temp_connection_file_path("publish-off-runtime");
+        let write_started = Arc::new(AtomicBool::new(false));
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel::<()>();
+        let (verdict_tx, verdict_rx) = std::sync::mpsc::channel::<bool>();
+        let hook_started = Arc::clone(&write_started);
+        connection_file_write_hook::install(&path, move || {
+            hook_started.store(true, Ordering::SeqCst);
+            let progressed = progress_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+            let _ = verdict_tx.send(progressed);
+        });
+        // Signals only after the write has started, so a message can only come
+        // from this task running while the write is still blocked.
+        let ticker = tokio::spawn(async move {
+            loop {
+                if write_started.load(Ordering::SeqCst) {
+                    let _ = progress_tx.send(());
+                    return;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let daemon = tokio::spawn(run_with_config(BootstrapConfig::new(&path, 0)));
+        let published = timeout(Duration::from_secs(15), async {
+            while !path.exists() && !daemon.is_finished() {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let daemon_exited = daemon.is_finished();
+        daemon.abort();
+        let daemon_result = daemon.await;
+        ticker.abort();
+
+        assert!(
+            published.is_ok() && !daemon_exited,
+            "the daemon must start and publish its connection file: {daemon_result:?}"
+        );
+        match verdict_rx.try_recv() {
+            Ok(true) => {}
+            Ok(false) => panic!(
+                "no other task on the runtime ran while the connection file was being written: the write is blocking the async worker thread"
+            ),
+            Err(_) => panic!("startup published the connection file without the hooked write"),
+        }
+    }
+
+    /// A write that never reports back must stop startup with an error naming
+    /// the connection file, never be taken as published.
+    #[tokio::test]
+    async fn a_panicking_connection_file_write_fails_startup() {
+        let (_dir, path) = temp_connection_file_path("publish-panics");
+        connection_file_write_hook::install(&path, || {
+            panic!("deliberate panic inside the connection-file write")
+        });
+
+        let error = timeout(
+            Duration::from_secs(15),
+            run_with_config(BootstrapConfig::new(&path, 0)),
+        )
+        .await
+        .expect("startup must end once the write task fails")
+        .expect_err("startup must fail when the connection-file write panics");
+
+        assert!(
+            matches!(&error, BootstrapError::ConnectionFileWrite { path: failed, .. } if failed == &path),
+            "expected a connection-file write error, got {error:?}"
+        );
+        let message = error.to_string();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("panicked"), "{message}");
+        assert!(!path.exists(), "no connection file may be published");
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn nofile_raise_worker() {
@@ -2383,7 +2935,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_nofile_raise_clamps_to_kernel_ceiling() {
-        let dir = TestTempDir::new("nofile-ceiling");
+        let dir = ScratchDir::new("nofile-ceiling");
         let result = dir.join("soft");
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "bootstrap::tests::nofile_raise_worker"])

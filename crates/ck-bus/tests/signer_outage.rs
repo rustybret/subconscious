@@ -1,4 +1,4 @@
-//! Ladder row "Signer outage and restart" (slice 11 of `docs/specs/ck-bus-module.md`),
+//! Ladder row "Signer outage and restart" (slice 11 of `docs/ck-bus.md`),
 //! against the acceptance daemon supervising BOTH the `ck-bus` binary and a real
 //! `nats-server` as siblings, as production declares them.
 //!
@@ -86,6 +86,7 @@ use std::{
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use cortexkit_bus_naming::AccountNames;
+use cortexkit_test_support::ScratchDir;
 use futures_util::StreamExt;
 use harness::{
     bus::{self, BusServer, TrustChain, LOOPBACK},
@@ -109,9 +110,8 @@ use subc_client_rs::{
     BindDecision, HandlerOutcome, ModuleHandler, RequestCtx, RouteBindRequest,
 };
 use subc_control::{ClientControlRequest, ClientControlResponse};
-use subc_daemon::bootstrap::{run_with_config, BootstrapConfig};
+use subc_daemon::bootstrap::run_with_config;
 use subc_protocol::{BindIdentity, RouteTarget};
-use subc_test_support::TestTempDir;
 use tokio::task::JoinHandle;
 
 const BOOT_LIMIT: Duration = Duration::from_secs(60);
@@ -351,7 +351,7 @@ impl Drop for ServerGuard {
 /// backoff and the supervised nats-server must be in the config at start; `SignerRun`
 /// renders its config itself and offers no hook for either.
 struct Daemon {
-    root: TestTempDir,
+    root: ScratchDir,
     connection_file: PathBuf,
     operator_dir: Option<PathBuf>,
     operator_before: data_home::TreeFingerprint,
@@ -360,7 +360,7 @@ struct Daemon {
 }
 
 impl Daemon {
-    async fn start<V>(root: TestTempDir, config_file: &Path, vault: V) -> Self
+    async fn start<V>(root: ScratchDir, config_file: &Path, vault: V) -> Self
     where
         V: ModuleHandler + 'static,
     {
@@ -376,7 +376,7 @@ impl Daemon {
         let connection_file = root.join("run/subc-connection.json");
         let machine_id_path = root.join("run/machine-id");
         fs::write(&machine_id_path, format!("{}\n", fresh_machine_id())).unwrap();
-        let bootstrap = BootstrapConfig::new(&connection_file, 0)
+        let bootstrap = harness::daemon::bootstrap_config(&connection_file)
             .with_terminal_journal_path(root.join("run/terminals.jsonl"))
             .with_capture_logs_dir(root.join("run/logs"))
             .with_machine_id_path(machine_id_path)
@@ -516,7 +516,7 @@ fn participant_block() -> Value {
 /// Renders the fixture config with the harness sentinel values and ck-bus's broker
 /// inputs, then applies `edit` to it.
 fn render_config(
-    root: &TestTempDir,
+    root: &ScratchDir,
     ckbus_env: Vec<(String, String)>,
     edit: impl FnOnce(&mut Value),
 ) -> PathBuf {
@@ -1346,7 +1346,7 @@ async fn a_refusing_vault_that_answers_again_is_recovered_from_without_a_restart
         }
     };
     let trust = TrustChain::generate();
-    let root: TestTempDir = SignerRun::tree();
+    let root: ScratchDir = SignerRun::tree();
     let server = BusServer::start(&bin, &root.join("nats"), &trust, LOOPBACK).await;
     let config_file = render_config(&root, server.ckbus_env(), |_| {});
     let answering = Arc::new(AtomicBool::new(false));
@@ -2073,7 +2073,7 @@ async fn a_renewal_across_an_in_flight_pull_acks_nothing_twice_and_loses_nothing
 /// which change whenever any module restarts during a run.
 #[test]
 fn the_operator_data_guard_ignores_live_rewrites_and_catches_anything_else() {
-    let root = TestTempDir::new("ckbus-fingerprint");
+    let root = ScratchDir::new("ckbus-fingerprint");
     let dir = root.path();
     std::fs::write(dir.join("account.json"), b"{\"account\":1}").unwrap();
     std::fs::write(dir.join("spawn_cursor.json"), b"{\"seq\":1}").unwrap();

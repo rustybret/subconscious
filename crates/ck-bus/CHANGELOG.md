@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.4.0
+
+- Upgrade the Rust SDK and protocol dependencies for non-exhaustive scope selectors and per-scope bind proofs. Bus behavior is unchanged.
+
+## 0.3.18
+
+- Raise the daemon test dependency to `subc-daemon` 0.35, whose public config types gained the `privileged_operator_prompt` setting. Bus behaviour is unchanged.
+
+## 0.3.17
+
+- Reinstate the activity-ledger mirror on `ck.<account>.event.subc.activity.v1`, preserving each entry's `(daemon_incarnation, seq)`. Advance `activity_cursor.json` only after broker storage acknowledgement, and back off and resume from it on failure or restart.
+- Start fresh or damaged cursors at query head without backfill. When the daemon refuses a saved cursor or ends a feed that fell behind, replay the entries it still keeps in its ledger file, in sequence order, then follow from its current head. Entries the daemon already deleted under its 30-day or size limit can't be replayed; the mirror logs each such gap with its first and last sequence numbers.
+- Share the vault's supervised launch-identity helper with the mirror preflight. SDK activity reads carry `reserved:ckbus`; missing identity warns once about unverified local reads, and nonce-read errors stop initialization.
+- Test-only: tests wait for the mirror's checkpoint signal instead of reopening the cursor file, which on Windows made the checkpoint's file replacement fail.
+- Scope test mutex guards before asynchronous waits so all-targets strict clippy accepts the mirror tests.
+
+## 0.3.16
+
+- Withdraws 0.3.15, which never shipped: the activity ledger's bus copy returns in a later release, once it passes on Windows. The code is identical to 0.3.14.
+
+## 0.3.14
+
+- Test-only: use paused Tokio time to check that health checks respond while a probe is hung, without measuring elapsed wall-clock time.
+
+## 0.3.13
+
+- Update the internal bus module to `subc-protocol` 0.31 and `subc-client-rs` 0.28, with control, transport and daemon test dependencies upgraded together. Bus consumers need no request changes; this dependency update does not declare `call-modes/v1` or implement provider mode handling.
+
+## 0.3.12
+
+- Expect the shared accessor's named-pipe nonce source in supervised Windows provenance tests; Unix still expects the descriptor source.
+
+## 0.3.11
+
+- Use `cortexkit-lease` for durable replacement of state and install files.
+
+## 0.3.10
+
+- Moves to `subc-protocol` 0.30 and `subc-client-rs` 0.27. No behaviour change.
+
+## 0.3.9
+
+- Test-only: the tests' helpers (temporary directories, process-liveness checks, and copies of test programs under `ckdev-` names) now come from the published `cortexkit-test-support` crate, which other CortexKit repositories also use, instead of a private copy in this repository. No runtime change.
+
+## 0.3.8
+
+- Build time only: the build script watches the workspace `Cargo.lock` only when it exists. Built from a registry or vendored copy there is no workspace lock two levels up, and cargo treats a missing watched path as always changed, so every consumer rebuilt this crate on every build.
+
+## 0.3.7
+
+- Build time only, no runtime change: the build script, which stamps the git commit into the binary, no longer recompiles the crate on every cargo run in a git worktree. It watched `.git/HEAD` and `.git/refs` paths that don't exist when `.git` is a worktree's file, and cargo treats a missing watched path as always changed. It now resolves paths with `git rev-parse --git-path` and watches only the existing HEAD, current branch ref, `packed-refs` and index, so a rebuild happens only when the checked-out commit or the index changes.
+
 ## 0.3.6
 
 - `install-apply --conf-only` takes two new flags, which `ck setup` uses to upgrade an existing install. `--keep-existing` keeps a monitoring listener that is already on another port: it reports `"status": "kept"` and a `health_url` for that port instead of refusing, and it cannot be combined with `--monitor-port`. `--dry-run` writes nothing and reports `"would apply"` where a write would happen. Without these flags, behaviour is unchanged. A non-loopback listener is still refused under every flag.

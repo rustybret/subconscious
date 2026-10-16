@@ -27,7 +27,8 @@ import {
 } from "./envelope.js";
 import {
   isLaunchNonceError,
-  launchNonce as processLaunchNonce,
+  launchNonceAsync as processLaunchNonce,
+  launchNonceOrUndefinedAsync,
   launchNonceOrUndefined,
   type LaunchNonceError,
   type LaunchNonceSource,
@@ -312,6 +313,12 @@ export interface SubcProviderConnectOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Milliseconds to wait before emitting restored after the provider re-registers following a reconnect. */
   restoredDebounceMs?: number;
+  /**
+   * Deadline budget (ms) without progress for reading a frame body after its
+   * header arrives. Each incoming chunk pushes the deadline out again.
+   * Defaults to 30,000 ms.
+   */
+  bodyReadTimeoutMs?: number;
   /** Callback that receives ProviderConnectionState events one at a time and in order. */
   onConnectionState?: (event: ProviderConnectionState) => void | Promise<void>;
   /**
@@ -351,6 +358,7 @@ interface NormalizedSubcProviderConnectOptions {
   reconnectBackoff: ReconnectBackoff;
   sleep: (ms: number) => Promise<void>;
   restoredDebounceMs: number;
+  bodyReadTimeoutMs?: number;
   onConnectionState?: (event: ProviderConnectionState) => void | Promise<void>;
   /** The launch nonce to echo in HELLO, already resolved against the environment. */
   launchNonce?: string;
@@ -673,7 +681,7 @@ export class SubcProvider {
       );
     }
 
-    const normalized = normalizeProviderConnectOptions(opts);
+    const normalized = await normalizeProviderConnectOptions(opts);
     const opened = await SubcProvider.openConnection(normalized);
     return new SubcProvider(opened.sock, opened.conn, normalized, opened.ack);
   }
@@ -718,7 +726,9 @@ export class SubcProvider {
     const control: ControlPushState = { undecodablePushLogged: false, drainingHooks: new Set() };
     try {
       for (;;) {
-        const frame = await sock.readFrame(Number.POSITIVE_INFINITY, { afterHeaderMs: BODY_READ_TIMEOUT_MS });
+        const frame = await sock.readFrame(Number.POSITIVE_INFINITY, {
+          afterHeaderMs: this.opts.bodyReadTimeoutMs ?? BODY_READ_TIMEOUT_MS,
+        });
         const keepGoing = await this.dispatch(frame, sock, generation, control);
         if (!keepGoing) {
           if (this.sock === sock && this.generation === generation) {
@@ -1457,7 +1467,7 @@ function nonEmpty(value: string | undefined): string | undefined {
   return value && value.length > 0 ? value : undefined;
 }
 
-function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions): NormalizedSubcProviderConnectOptions {
+async function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions): Promise<NormalizedSubcProviderConnectOptions> {
   // The environment is read once here. The daemon injects both variables when it
   // spawns a module; together they mark the process as supervised, and the nonce
   // is also what HELLO echoes for a reserved module_id.
@@ -1469,13 +1479,13 @@ function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions): Norm
   let processNonce: string | undefined;
   if (opts.launchNonce === undefined) {
     try {
-      processNonce = processLaunchNonce()?.value;
+      processNonce = (await processLaunchNonce())?.value;
     } catch (error) {
       if (isLaunchNonceError(error)) throw launchNonceUnavailable(error);
       throw error;
     }
   } else {
-    processNonce = launchNonceOrUndefined()?.value;
+    processNonce = (await launchNonceOrUndefinedAsync())?.value;
   }
   const envLaunchNonce = nonEmpty(processNonce);
   const supervised = envModuleId !== undefined && envLaunchNonce !== undefined;
@@ -1493,6 +1503,7 @@ function normalizeProviderConnectOptions(opts: SubcProviderConnectOptions): Norm
     reconnectBackoff: opts.reconnectBackoff ?? DEFAULT_RECONNECT_BACKOFF,
     sleep: opts.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms))),
     restoredDebounceMs: opts.restoredDebounceMs ?? DEFAULT_RESTORED_DEBOUNCE_MS,
+    bodyReadTimeoutMs: opts.bodyReadTimeoutMs,
     onConnectionState: opts.onConnectionState,
     launchNonce: nonEmpty(opts.launchNonce ?? envLaunchNonce),
     reconnectOnDrop: opts.reconnectOnDrop ?? !supervised,

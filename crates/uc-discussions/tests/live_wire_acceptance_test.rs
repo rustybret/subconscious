@@ -21,7 +21,7 @@ use subc_protocol::{
     session::HealthStatus, BindIdentity, Flags, FrameType, ModuleHelloAckBody, Priority,
     RouteTarget, PROTOCOL_VERSION,
 };
-use subc_test_support::TestTempDir;
+use cortexkit_test_support::ScratchDir;
 use subc_transport::{
     authenticate_client, generate_daemon_id, generate_key, write_atomic, ConnectionInfo, Endpoint,
     SCHEMA_VERSION,
@@ -62,7 +62,7 @@ async fn invalid_storage_descriptor_reports_failing_health() {
 struct Harness {
     child: Child,
     daemon: JoinHandle<Result<(), subc_daemon::ServerError>>,
-    _sandbox: TestTempDir,
+    _sandbox: ScratchDir,
 }
 
 impl Drop for Harness {
@@ -135,7 +135,7 @@ async fn call(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_wire_room_lifecycle_is_fenced_and_preserved() {
-    let sandbox = TestTempDir::new("uc-discussions-live-wire");
+    let sandbox = ScratchDir::new("uc-discussions-live-wire");
     let root = sandbox.path().to_path_buf();
     std::fs::create_dir_all(root.join("cortexkit/uc-discussions"))
         .expect("provision managed SQLite directory");

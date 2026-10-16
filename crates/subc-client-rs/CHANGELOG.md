@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.29.2
+
+- Re-export protocol 0.32.2 scope builders for capability-gated idle-only replacement and connection-held presence. `scope_epoch_in_use` is terminal in the shared contract table.
+
+## 0.29.1
+
+- Expose the daemon's HELLO_ACK capability list through `ModuleHandle::daemon_capabilities` and `daemon_supports`. Scope owners should check `scope-bind-proof/v1` before setting `bind_proof_sha256`.
+
+## 0.29.0
+
+- **Breaking dependency upgrade** to subc-protocol 0.32. `ScopeSelector` is now `#[non_exhaustive]`: build it with `ScopeSelector::new(owner, scope_ref, scope_epoch)` and add a bind proof with `.with_bind_proof(Some(proof))`. `CallError::scope_bind_proof_refusal` returns `Required` or `Mismatch` for the two terminal refusals; neither is retried. Route cache keys tell different proofs apart without storing the proof text. A scope registered without a hash ignores the proof.
+
+## 0.28.4
+
+- Add `SubcConsumer::supervisor_list` and typed `SupervisorListResponse` so modules can read every configured module's enabled flag and supervisor state.
+
+## 0.28.3
+
+- Keep the daemon's route.open refusal when the retry deadline expires while a later retry is still waiting for its answer. Before, a refusal such as `module_warming` was dropped in that case, and the caller got only "route.open did not complete (request on channel 0 timed out at its deadline)" with no `route_open_refusal()`. This happened when a busy daemon answered the final retry a few milliseconds after the deadline. The error is now `NotSent` and carries the refusal, as it already did when the deadline expired between attempts.
+
+## 0.28.2
+
+- Let route options add validated consumer-capability declarations alongside reverse-request handler families. The merged, sorted list is forwarded to the provider bind and kept in the route cache identity; declarations such as `content/v1` remain unverified and grant no privilege.
+
+## 0.28.1
+
+- Add `ModuleHandle::record_activity`, checking `activity-ledger/v1` before sending and returning typed `ActivityRefusal` classifications with the daemon's original error body. Recording does not retry after timeout or connection loss because the append may already be durable.
+- Add `SubcConsumer::query_activity` and `subscribe_activity`, preserving query entries, continuation cursor and head. Both fill the supervised consumer identity from the launch environment. `ActivitySubscription` yields durable entries and exposes cursor, lag and other daemon refusal codes through `ActivityStreamError`.
+
+## 0.28.0
+
+- **Breaking.** Requires `subc-protocol` 0.31, `subc-control` 0.30 and `subc-transport` 0.12; upgrade direct dependencies together with the SDK. Replace `ScopeStamp` literals with `ScopeStamp::new` and its `with_*` setters, and account for optional `call_mode` in raw bind constructors and exhaustive patterns. `RouteBindRequest` exposes `call_mode`, and the SDK re-exports `CallMode` and `CALL_MODES_CAPABILITY`. Providers must refuse `CallMode::Unknown` and declare `call-modes/v1` only when they read every bind's mode and handle all three known modes.
+- When an older daemon omits `call_mode`, the SDK derives it from the bind's scope: a run is codemode, a flow is flow, and a plain or absent scope is classic. `with_scope` derives the same mode in provider tests; call `with_call_mode` afterwards to override it.
+- Targets declaring `call-modes/v1` receive the run deadline in `ScopeStamp::expires_at_ms`; `scope_describe` also preserves it. Targets declaring only `agent-run-scopes/v1` or `flow-scopes/v1` still admit the matching non-delegating run or flow binds, but receive neither `call_mode` nor `expires_at_ms` so older readers continue to work.
+
+## 0.27.2
+
+- Use the shared Windows named-pipe accessor and its process cache for HELLO and route-open; Unix remains on the inherited descriptor.
+- Require the corrected Windows pipe reader and add a real supervised-module test asserting both daemon-observed and HELLO-declared `pipe` sources. Environment fallback can keep registration alive without making a broken pipe pass this test.
+
+## 0.27.1
+
+- Expose module-declared bus events via the SDK's re-exported `CatalogEntry`, and verify SDK readback against a real daemon.
+
+## 0.27.0
+
+- Add `ModuleHandle::scope_apply(generation, upsert, end)`, returning `ScopeApplyReply`. It returns `ScopeCallError::NotSupported` without sending anything when the daemon does not advertise `scope.apply`; a daemon that does also accepts `expires_at_ms`.
+- **Breaking.** Requires `subc-protocol` 0.30 and `subc-control` 0.29 (it re-exports `CatalogEntry`).
+
+## 0.26.4
+
+- Test-only: the tests' helpers (temporary directories, process-liveness checks, and copies of test programs under `ckdev-` names) now come from the published `cortexkit-test-support` crate, which other CortexKit repositories also use, instead of a private copy in this repository. No runtime change.
+
+## 0.26.3
+
+- Add the opt-in, tests-only `test-support` feature and `test_support::ModuleHarness`. Module tests can run their real serve handler over an in-memory stand-in daemon connection, bind routes, send requests, inspect replies and channel-0 traffic, and script each `operator.confirm` answer (confirmation, all four refusals with `detail.reason`, unknown operation, or silence). Use this feature only on a dev-dependency. Silence/deadline tests can use Tokio's paused clock without changing the production confirmation timeout.
+- Add `serve_from_env_with_handle(manifest, handler)`, which uses `serve`'s argv, module-id environment and launch-secret handling but returns the live `ModuleHandle` and serve future. `serve` now delegates to it, so modules that need the handle do not have to copy private launch parsing.
+
+## 0.26.2
+
+- Add `ModuleHandle::confirm_operator(summary, caller_route)`, which asks the daemon to confirm with the person at the machine that one in-flight request may proceed (the `operator.confirm` control operation). It returns `Ok(())` only for a `confirmed` reply. Every error, including `Unsupported` from a daemon without the operation, means the module must refuse the write. It waits at most 290 seconds and never retries; dropping its future withdraws the request. Requires subc-protocol 0.29.4.
+
 ## 0.26.1
 
 - A control request the module cannot decode, such as a `route.bind` whose scope stamp carries an attribute this SDK does not know, is refused with `invalid_request` on its own correlation id, and the module keeps serving. Before, the decode error ended the module's serve loop, so one such bind stopped the whole module and every repeat after its restart stopped it again.

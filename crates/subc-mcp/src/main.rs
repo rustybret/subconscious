@@ -112,6 +112,7 @@ const TOOLS_INVOKE_NAME: &str = "tools_invoke";
 const ACK_ONLY_TOOL_RESPONSE_TEXT: &str = "Queued for context compaction.";
 const FACADE_DEFAULT_DISABLED: &[&str] = &["magic-context", "llm-runner"];
 const MANIFEST_MODULE_ID: &str = "ck-subc-mcp";
+const CK_DOMAIN_HEADLINE: &str = "CortexKit MCP gateway";
 
 static NEXT_CONNECTION_TOKEN: AtomicU64 = AtomicU64::new(1);
 static LOGGER_INSTALLED: AtomicBool = AtomicBool::new(false);
@@ -923,6 +924,15 @@ async fn main() {
     // assembly tooling can read a manifest from a machine with no running daemon.
     if env::args_os().nth(1).is_some_and(|arg| arg == "--manifest") {
         print_manifest(supervision_manifest(MANIFEST_MODULE_ID.to_string()));
+        process::exit(0);
+    }
+    // `ck` probes external commands before dispatch, so answer before logging or
+    // launch attestation can add output or require a supervised environment.
+    if env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--ck-domain")
+    {
+        println!("{CK_DOMAIN_HEADLINE}");
         process::exit(0);
     }
     // Side-effect-free provenance probe, evaluated before any runtime arg
@@ -6348,12 +6358,9 @@ mod tests {
     #[test]
     fn one_provider_with_an_illegal_tool_name_does_not_erase_the_others() {
         fn provider(module_id: &str, tool_names: &[&str]) -> CatalogEntry {
-            CatalogEntry {
-                module_id: module_id.to_string(),
-                ready: true,
-                not_ready: None,
-                module_version: None,
-                roles: vec![ProviderRole::ToolProvider {
+            CatalogEntry::new(
+                module_id,
+                vec![ProviderRole::ToolProvider {
                     tools: tool_names
                         .iter()
                         .map(|name| ManifestTool {
@@ -6368,10 +6375,8 @@ mod tests {
                     emits_push: false,
                     sub_supervises: false,
                 }],
-                control_ops: Vec::new(),
-                capabilities: None,
-                self_signals: None,
-            }
+                Vec::new(),
+            )
         }
 
         let modules = vec![
@@ -6433,15 +6438,9 @@ mod tests {
 
     #[test]
     fn combined_tool_names_are_limited_to_64_characters() {
-        let modules = vec![CatalogEntry {
-            module_id: "provider".to_owned(),
-            ready: true,
-            not_ready: None,
-            module_version: None,
-            control_ops: Vec::new(),
-            capabilities: None,
-            self_signals: None,
-            roles: vec![ProviderRole::ToolProvider {
+        let modules = vec![CatalogEntry::new(
+            "provider",
+            vec![ProviderRole::ToolProvider {
                 tools: [55, 56]
                     .into_iter()
                     .map(|length| ManifestTool {
@@ -6456,7 +6455,8 @@ mod tests {
                 emits_push: false,
                 sub_supervises: false,
             }],
-        }];
+            Vec::new(),
+        )];
         let desired =
             desired_session_from_catalog(&GatewayConfig::facade_default(), &modules).unwrap();
         let tools: Vec<_> = desired.providers.iter().flat_map(|p| &p.tools).collect();

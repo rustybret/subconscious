@@ -15,10 +15,12 @@ BeforeAll {
 Describe 'native ck installer' {
     BeforeEach {
         $originalLocalAppData = $env:LOCALAPPDATA
+        $originalPath = $env:Path
         $originalArchitecture = $env:PROCESSOR_ARCHITECTURE
         $originalWowArchitecture = $env:PROCESSOR_ARCHITEW6432
         $originalUserProfile = $env:USERPROFILE
         $env:LOCALAPPDATA = Join-Path $TestDrive 'local-app-data'
+        $env:Path = 'C:\Windows\System32;C:\Fixture\Other'
         $env:USERPROFILE = Join-Path $TestDrive 'profile-home'
         $env:PROCESSOR_ARCHITECTURE = 'AMD64'
         Remove-Item Env:PROCESSOR_ARCHITEW6432 -ErrorAction SilentlyContinue
@@ -95,6 +97,12 @@ Describe 'native ck installer' {
 
     AfterEach {
         $env:LOCALAPPDATA = $originalLocalAppData
+        if ($null -eq $originalPath) {
+            Remove-Item Env:Path -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:Path = $originalPath
+        }
         $env:PROCESSOR_ARCHITECTURE = $originalArchitecture
         if ($null -eq $originalUserProfile) {
             Remove-Item Env:USERPROFILE -ErrorAction SilentlyContinue
@@ -126,7 +134,7 @@ Describe 'native ck installer' {
             $Path -eq 'HKCU:\Environment' -and $Name -eq 'Path'
         }
 
-        $destination = Join-Path $env:LOCALAPPDATA 'cortexkit\bin\ck.exe'
+        $destination = Join-Path $env:LOCALAPPDATA 'cortexkit\cmd\ck.exe'
         $manifest = Join-Path $env:LOCALAPPDATA 'cortexkit\installer-manifest.json'
         Test-Path -LiteralPath $destination | Should -BeTrue
         Test-Path -LiteralPath $manifest | Should -BeTrue
@@ -135,6 +143,7 @@ Describe 'native ck installer' {
         # carried (currency) and the placed binary's bytes (ownership).
         $placement = (Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json).mutations |
             Where-Object { $_.kind -eq 'binary-placement' }
+        $placement.path | Should -Be $destination
         $binaryDigest = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
         $archiveDigest | Should -Not -Be $binaryDigest
         $placement.archive_sha256 | Should -Be $archiveDigest
@@ -168,9 +177,27 @@ Describe 'native ck installer' {
         $registryKey.PathKind = [Microsoft.Win32.RegistryValueKind]::ExpandString
         & $installerPath | Out-Null
         Should -Invoke Set-ItemProperty -Times 1 -ParameterFilter {
-            $Value -eq ('%USERPROFILE%\.dotnet\tools;C:\Other\Bin;' + (Join-Path $env:LOCALAPPDATA 'cortexkit\bin')) -and
+            $Value -eq ('%USERPROFILE%\.dotnet\tools;C:\Other\Bin;' + (Join-Path $env:LOCALAPPDATA 'cortexkit\cmd')) -and
             $Type -eq [Microsoft.Win32.RegistryValueKind]::ExpandString
         }
+    }
+
+    It 'adds the install directory to the current session PATH only once' {
+        $env:CK_RELEASE_INDEX_URL = 'https://release.fixture.example/releases/v1/index.json'
+        $cmdDir = Join-Path $env:LOCALAPPDATA 'cortexkit\cmd'
+        $env:Path = 'C:\Windows\System32;C:\Fixture\Other'
+
+        & $installerPath | Out-Null
+
+        $pathEntries = @($env:Path -split ';')
+        $pathEntries | Should -Contain $cmdDir
+        $pathEntries[0] | Should -Be $cmdDir
+        $firstPath = $env:Path
+
+        & $installerPath | Out-Null
+
+        @($env:Path -split ';' | Where-Object { $_ -ieq $cmdDir }).Count | Should -Be 1
+        $env:Path | Should -Be $firstPath
     }
 
     It 'refuses an architecture the release does not ship before any fetch' {
@@ -187,7 +214,7 @@ Describe 'native ck installer' {
         & $installerPath 2>&1 | Out-Null
         Should -Invoke Invoke-WebRequest -Times 0
         Should -Invoke Expand-Archive -Times 0
-        Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'cortexkit\bin\ck.exe') | Should -BeFalse
+        Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'cortexkit\cmd\ck.exe') | Should -BeFalse
         $env:PROCESSOR_ARCHITECTURE = 'AMD64'
     }
 
@@ -197,7 +224,7 @@ Describe 'native ck installer' {
 
         $output = & $installerPath
 
-        $output | Should -Contain "ck already matches verified download at $(Join-Path $env:LOCALAPPDATA 'cortexkit\bin\ck.exe'); skipping placement."
+        $output | Should -Contain "ck already matches verified download at $(Join-Path $env:LOCALAPPDATA 'cortexkit\cmd\ck.exe'); skipping placement."
         $output | Should -Contain 'Next: ck setup'
         Test-Path -LiteralPath $setupMarker | Should -BeFalse
     }
@@ -218,7 +245,7 @@ Describe 'native ck installer' {
             schema_version = 1
             platform = 'windows-x64'
             mutations = @(
-                [ordered]@{ kind = 'binary-placement'; path = (Join-Path $root 'bin\ck.exe'); sha256 = 'stale-binary'; archive_sha256 = 'stale-archive' },
+                [ordered]@{ kind = 'binary-placement'; path = (Join-Path $root 'cmd\ck.exe'); sha256 = 'stale-binary'; archive_sha256 = 'stale-archive' },
                 [ordered]@{ kind = 'binary-placement'; path = $daemon; sha256 = 'daemon-binary'; archive_sha256 = 'daemon-archive' }
             )
         } | ConvertTo-Json -Depth 5
@@ -233,7 +260,7 @@ Describe 'native ck installer' {
         $rows = (Get-Content -LiteralPath $sidecar -Raw | ConvertFrom-Json).mutations
         $placement = $rows | Where-Object { $_.kind -eq 'binary-placement' }
         @($placement).Count | Should -Be 1
-        $placement.path | Should -Be (Join-Path $root 'bin\ck.exe')
+        $placement.path | Should -Be (Join-Path $root 'cmd\ck.exe')
         $placement.archive_sha256 | Should -Be $archiveDigest
         ($rows | Where-Object { $_.path -eq $daemon }) | Should -BeNullOrEmpty
         ([System.IO.File]::ReadAllBytes($sidecar))[0] | Should -Be 0x7B

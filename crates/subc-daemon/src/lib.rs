@@ -6,7 +6,9 @@
 
 #![forbid(unsafe_code)]
 
+mod activity;
 pub mod bootstrap;
+pub mod caller_identity;
 pub(crate) mod capability_requirements;
 mod child_resources;
 mod child_roster;
@@ -21,6 +23,8 @@ pub mod identity;
 mod live_children;
 pub mod machine_id;
 pub mod observability;
+pub mod operator_confirm;
+pub mod privileged_prompt;
 #[allow(dead_code)]
 mod provenance;
 pub mod registry;

@@ -576,7 +576,10 @@ async fn assert_stub_principal_controls(run: &AcceptanceRun) {
 }
 
 async fn assert_hand_started_copy_refused(run: &AcceptanceRun, binary: &Path, nonce: Option<&str>) {
-    let mut command = Command::new(binary);
+    // The same `ckdev-bus` placement the run's daemon supervises, so the copy
+    // differs from the supervised module only in who started it.
+    let binary = cortexkit_test_support::ckdev_binary(binary);
+    let mut command = Command::from(cortexkit_test_support::dev_command(binary));
     command
         .arg("--subc")
         .arg(&run.connection_file)
@@ -675,12 +678,13 @@ async fn real_ckbus_hello_declares_build_provenance() {
     run.shutdown().await;
 }
 
-/// Where a supervised module gets its launch nonce on this platform: the daemon
-/// hands it over on a pipe on Unix, and only in the environment on Windows,
-/// which has no pipe handover yet.
+/// The source ck-bus must report in its registration message's
+/// `manifest.provenance.launch_nonce_source`: `fd` for the Unix pipe inherited
+/// at spawn, or `pipe` for the Windows named pipe that serves only the process
+/// whose PID the daemon received when it spawned ck-bus.
 fn expected_launch_nonce_source() -> subc_protocol::manifest::LaunchNonceSource {
     if cfg!(windows) {
-        subc_protocol::manifest::LaunchNonceSource::Env
+        subc_protocol::manifest::LaunchNonceSource::Pipe
     } else {
         subc_protocol::manifest::LaunchNonceSource::Fd
     }
