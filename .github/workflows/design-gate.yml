@@ -43,6 +43,14 @@ name: Design gate
 # parsed, which is the intended signal that it is still on the old contract.
 on:
   workflow_call:
+    inputs:
+      # Under `pull_request_target`, the caller workflow is read from the base
+      # branch, so a pull request cannot change its own bot exemptions.
+      owner-bots:
+        description: Whitespace- or comma-separated login:id pairs for the repository's own bots.
+        type: string
+        required: false
+        default: ""
 
 concurrency:
   group: design-gate-${{ github.event.pull_request.number || github.event.issue.number }}
@@ -82,9 +90,10 @@ jobs:
       # be moved to different code. When the design-gate action changes, move
       # its two pins below to the commit that changed it.
       - name: Evaluate the design gate
-        uses: cortexkit/subconscious/.github/actions/design-gate@117932fd88a38f99259dc7353313745ad479b09a
+        uses: cortexkit/subconscious/.github/actions/design-gate@0fad4b7008afa739e49858fe1083f194a6d00bb6
         with:
           mode: pull-request
+          owner-bots: ${{ inputs.owner-bots }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           check-token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -110,7 +119,7 @@ jobs:
       # This arm runs on an `issues` event, where GITHUB_TOKEN can already do
       # everything the gate needs, so both tokens are the same one here.
       - name: Release pull requests waiting on this issue
-        uses: cortexkit/subconscious/.github/actions/design-gate@117932fd88a38f99259dc7353313745ad479b09a
+        uses: cortexkit/subconscious/.github/actions/design-gate@0fad4b7008afa739e49858fe1083f194a6d00bb6
         with:
           mode: issue-labeled
           github-token: ${{ secrets.GITHUB_TOKEN }}
