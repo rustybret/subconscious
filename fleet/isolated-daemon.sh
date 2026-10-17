@@ -65,6 +65,11 @@ if [ "$HOLD" -gt 0 ]; then echo "holding ${HOLD}s for a client run against $CONN
 BAD=0
 for m in "${MODS[@]}"; do name="${m%%=*}"
   grep -q "module registered module_id=$name .*negotiated_ver=2" "$LOG" || { echo "FAIL: $name did not register at protocol v2"; BAD=1; }
+  # Registering is not enough: a module that registers and then exits is a crash loop, not a pass.
+  CR=$(grep -c "supervised module exited abnormally.*module_id=$name" "$LOG" 2>/dev/null)
+  [ "${CR:-0}" -eq 0 ] || { echo "FAIL: $name exited abnormally ${CR}x (crash loop); see $T/data/cortexkit/run/logs/$name.stderr.log (rerun with --keep)"
+    tail -2 "$T/data/cortexkit/run/logs/$name.stderr.log" 2>/dev/null | cut -c1-220; BAD=1; }
+  kill -0 "$(pgrep -f "^$(echo "${m#*=}" | sed 's/[.[\*^$]/\\&/g')" | head -1)" 2>/dev/null || { echo "FAIL: $name process is not running at the end"; BAD=1; }
 done
 [ "${TO:-1}" -eq 0 ] || { echo "FAIL: bind timeouts/breaker trips seen"; BAD=1; }
 [ $BAD -eq 0 ] && echo "RESULT: PASS" || echo "RESULT: FAIL"; exit $BAD
