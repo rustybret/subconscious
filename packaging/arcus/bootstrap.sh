@@ -51,12 +51,20 @@ if [ -z "${INSTALL_ROOT}" ]; then
   esac
 fi
 
-PUBLISHER_DIR="${INSTALL_ROOT}/arcus-publisher"
-RECEIPT="${PUBLISHER_DIR}/.arcus/receipt.json"
-if [ -f "${RECEIPT}" ] && command -v jq >/dev/null 2>&1; then
-  MANAGED_PATH=$(jq -r ".managed_tree_path // empty" "${RECEIPT}")
-  if [ -n "${MANAGED_PATH}" ] && [ -d "${PUBLISHER_DIR}/${MANAGED_PATH}" ]; then
-    PUBLISHER_DIR="${PUBLISHER_DIR}/${MANAGED_PATH}"
+PUBLISHER_ROOT="${INSTALL_ROOT}/arcus-publisher"
+
+# Bind to the stable 'current' pointer, never to a tree_instance_id: managed_tree_path embeds an id that is
+# regenerated on every activation, so a link built from it silently keeps pointing at a stale toolchain.
+PUBLISHER_DIR="${PUBLISHER_ROOT}/.arcus/current"
+if [ ! -d "${PUBLISHER_DIR}" ]; then
+  RECEIPT="${PUBLISHER_ROOT}/.arcus/receipt.json"
+  PUBLISHER_DIR="${PUBLISHER_ROOT}"
+  if [ -f "${RECEIPT}" ] && command -v jq >/dev/null 2>&1; then
+    MANAGED_PATH=$(jq -r ".managed_tree_path // empty" "${RECEIPT}")
+    if [ -n "${MANAGED_PATH}" ] && [ -d "${PUBLISHER_ROOT}/${MANAGED_PATH}" ]; then
+      PUBLISHER_DIR="${PUBLISHER_ROOT}/${MANAGED_PATH}"
+      echo "==> WARNING: no 'current' pointer; linking to ${MANAGED_PATH}. Re-run after each 'arcus install arcus-publisher'."
+    fi
   fi
 fi
 
