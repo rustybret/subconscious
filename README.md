@@ -16,7 +16,7 @@ a fork of it carrying two daemon patches; both were retired in favour of configu
 | `modules/uc-discussions/` | `ck-uc-discussions`: durable rooms, turns, member session bindings, monotonic incarnation fences and council rosters over subc channel 0. Depends only on published crates. |
 | `packaging/arcus/` | Arcus package descriptors and `bootstrap.sh`, which installs the publisher toolchain. |
 | `packaging/scripts/` | Pack, publish, sign and validate scripts for our own modules (lifecycle scripts are symlinks into the toolchain). |
-| `fleet/` | `FLEET.md` (which module comes from where), `orw-probe.sh` (plugin and daemon drift check) with tests, `watch-room.sh`. |
+| `fleet/` | `FLEET.md` (which module comes from where), `orw-probe.sh` (plugin and daemon drift check) with tests, `isolated-daemon.sh` (run the stock ck-subc in a sandbox to gate a module build), `watch-room.sh`. |
 | `docs/` | Design notes, evidence, the plan, references and the `uc-discussions` runbook. |
 
 A new module is a new `modules/<name>/` crate, a descriptor in `packaging/arcus/`, an entry in
