@@ -11,7 +11,7 @@
 ### Invariants & Boundaries
 
 1. **Self-Contained Submission Bundles**: Releasing software via Arcus emits an immutable submission bundle to `dist/<sequence>/<package>/<version>/`.
-2. **Strict Submodule Prohibition**: Consuming projects must **never** vendor the `arcus` repository as a git submodule and must **never** attempt direct git commits or pushes to an Arcus checkout. All publisher tooling is managed through `packages/arcus/bootstrap.sh` which links against the Arcus-managed `arcus-publisher` toolchain (`arcus install arcus-publisher`).
+2. **Strict Submodule Prohibition**: Consuming projects must **never** vendor the `arcus` repository as a git submodule and must **never** attempt direct git commits or pushes to an Arcus checkout. All publisher tooling is managed through `packaging/arcus/bootstrap.sh` which links against the Arcus-managed `arcus-publisher` toolchain (`arcus install arcus-publisher`).
 3. **Gateway Ingestion & Hydration**: Submission to the gateway is performed over authenticated HTTPS using `arcus publish submit <bundle_dir>`.
 4. **Anti-Rollback Sequence Enforcement**: Monotonic sequence numbers strictly increase per package release. Coordinated multi-component suites share a single unified sequence to guarantee release-set atomicity across packages. Note that a shared build sequence confirms coordinated pipeline staging, but is not proof of cross-package atomic catalog promotion on the gateway.
 5. **Distinct Digest Triples & Release Dimensions**: For every target platform payload, `arcus pack` computes and validates distinct SHA-256 hashes across the payload archive (`.tar.zst`), content source (`-content.zip`), and Wharf tree signature (`.pwr`). Release tracking distinguishes crate version, package display version, source revision, sequence, and binary digest.
@@ -80,12 +80,12 @@ $$\text{suite\_seq} = \max_{c \in \text{suite}}(\text{catalog\_seq}(c)) + 1$$
 
 | Intent | Command | Driver Script |
 |---|---|---|
-| **Bootstrap Toolchain** | `bun run bootstrap:arcus` | `packages/arcus/bootstrap.sh` |
-| **Package All Components** | `bun run pack:arcus` | `scripts/pack-all-arcus.sh` |
-| **Package Single Component** | `sh scripts/pack-<component>-arcus.sh` | Individual script |
-| **Validate Release Envelopes** | `bun run validate:arcus` | `scripts/validate-arcus.sh` |
-| **Verify Release Set Completeness** | `node scripts/lib/verify-release-set.mjs --root <dir>` | Quality gate |
-| **Publish Submission Bundles** | `bun run publish:arcus` | `scripts/publish-all-arcus.sh` |
+| **Bootstrap Toolchain** | `bun run bootstrap:arcus` | `packaging/arcus/bootstrap.sh` |
+| **Package All Components** | `bun run pack:arcus` | `packaging/scripts/pack-all-arcus.sh` |
+| **Package Single Component** | `sh packaging/scripts/pack-<component>-arcus.sh` | Individual script |
+| **Validate Release Envelopes** | `bun run validate:arcus` | `packaging/scripts/validate-arcus.sh` |
+| **Verify Release Set Completeness** | `node packaging/scripts/lib/verify-release-set.mjs --root <dir>` | Quality gate |
+| **Publish Submission Bundles** | `bun run publish:arcus` | `packaging/scripts/publish-all-arcus.sh` |
 | **Direct Gateway Submit** | `arcus publish submit <bundle_dir> [--wait]` | Direct CLI |
 | **Inspect Submission Status** | `arcus publish status <submission-id>` | Direct CLI |
 
@@ -94,10 +94,10 @@ $$\text{suite\_seq} = \max_{c \in \text{suite}}(\text{catalog\_seq}(c)) + 1$$
 #### Step 1: Bootstrap the Publisher Toolchain
 ```bash
 bun run bootstrap:arcus
-# or: sh packages/arcus/bootstrap.sh
+# or: sh packaging/arcus/bootstrap.sh
 ```
 - Installs `arcus-publisher` toolchain via `arcus install arcus-publisher`.
-- Symlinks `packages/arcus/toolchain`.
+- Symlinks `packaging/arcus/toolchain`.
  - Does NOT create `.opencode/skills/arcus-publisher` symlinks (Rule #6401: skills are delivered centrally via UC Studio Skill Loom).
 - Symlinks lifecycle scripts (`arcus-pipeline.sh`, `pack-arcus.sh`, `publish-arcus.sh`, `validate-arcus.sh`, `sign-arcus.sh`, `arcus-toolchain.json`, `submission.schema.json`) into `scripts/`.
 - Validates the toolchain headers (`publisher toolchain accepted: 0.4.0`).
@@ -106,7 +106,7 @@ bun run bootstrap:arcus
 ```bash
 bun run pack:arcus
 # or with explicit version and monotonic sequence:
-sh scripts/pack-all-arcus.sh --version <version> --sequence <next_seq>
+sh packaging/scripts/pack-all-arcus.sh --version <version> --sequence <next_seq>
 ```
 - Compiles release binaries with Cargo (`cargo build --release`).
 - Stages binaries and runs `arcus pack` to emit signed envelopes and distinct digest triples.
@@ -115,7 +115,7 @@ sh scripts/pack-all-arcus.sh --version <version> --sequence <next_seq>
 
 #### Step 3: Validate Release Assets
 ```bash
-sh scripts/validate-arcus.sh dist/<sequence>/ck-subc/<version>/releases/ck-subc-<version>-<sequence>.json
+sh packaging/scripts/validate-arcus.sh dist/<sequence>/ck-subc/<version>/releases/ck-subc-<version>-<sequence>.json
 ```
 - Fail-closed verification of Ed25519 signatures, payload targets, and hash manifests.
 
@@ -157,7 +157,7 @@ sh scripts/validate-arcus.sh dist/<sequence>/ck-subc/<version>/releases/ck-subc-
 To keep the repository clean and conform to Arcus v0.4.0 standards, the following practices and scripts are permanently retired:
 
 1. **`scripts/migrate-arcus.sh`**: Deleted / excluded. Legacy v1/v2 schema migration is obsolete.
-2. **`scripts/setup-arcus.sh`**: Replaced by `packages/arcus/bootstrap.sh`.
+2. **`scripts/setup-arcus.sh`**: Replaced by `packaging/arcus/bootstrap.sh`.
 3. **Direct Git Writes**: No script or agent may execute `git commit` or `git push` against the `arcus` repository.
 4. **Direct Catalog Signing**: Consuming projects do not run `arcus manifest sign-index`. Index updates are the sole domain of the Arcus catalog owner upon accepting submission bundles.
 5. **V1/V2 Legacy Flags**: Flags like `--games-dir`, `--v1`, or legacy strategy blocks in update declarations are strictly rejected.

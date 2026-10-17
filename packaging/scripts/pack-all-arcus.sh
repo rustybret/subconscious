@@ -6,10 +6,8 @@
 #   dist/<version>/<sequence>/<component>/
 #
 # Components:
-#   1. ck-subc           (daemon service)
-#   2. ck                (operator CLI)
-#   3. ck-subc-mcp       (MCP stdio gateway)
-#   4. ck-uc-discussions (discussions service daemon)
+#   1. ck-uc-discussions (discussions service daemon)
+#   The stock ck-subc, ck and ck-subc-mcp are CortexKit's published releases, not packaged here.
 #
 # Sequence is SHARED across components so that a given dist/<version>/<sequence>/
 # directory is a self-consistent, atomic release set.
@@ -35,9 +33,9 @@ while [ "$#" -gt 0 ]; do
     -h|--help)
       cat <<EOF
 Usage: $0 [options]
-  --version X.Y.Z      Override suite version (default: from crates/subc-core/Cargo.toml)
+  --version X.Y.Z      Override suite version (default: from modules/uc-discussions/Cargo.toml)
   --sequence N         Shared release sequence for every component (default: auto-allocated)
-  --only COMPONENT     Pack a single component (ck-subc, ck, ck-subc-mcp, ck-uc-discussions)
+  --only COMPONENT     Pack a single component (ck-uc-discussions)
   --skip-build         Reuse existing build outputs instead of rebuilding
   --no-clean           Do not purge the target dist/<version>/<sequence>/ directory first
 EOF
@@ -51,7 +49,7 @@ EOF
 done
 
 if [ -z "$VERSION" ]; then
-  VERSION=$(grep '^version' "${REPO_ROOT}/crates/subc-core/Cargo.toml" | head -1 | sed -E 's/version *= *"([^"]+)"/\1/')
+  VERSION=$(grep '^version' "${REPO_ROOT}/modules/uc-discussions/Cargo.toml" | head -1 | sed -E 's/version *= *"([^"]+)"/\1/')
 fi
 VERSION="${VERSION#v}"
 
@@ -60,7 +58,7 @@ VERSION="${VERSION#v}"
 # suite_seq = MAX(all observed suite sequences on gateway/catalog) + 1, never resetting to 1.
 if [ -z "$SEQUENCE" ]; then
   MAX_SEQ=0
-  for comp in ck-subc ck ck-subc-mcp ck-uc-discussions uc-discussions; do
+  for comp in ck-uc-discussions; do
     s=0
     if command -v arcus >/dev/null 2>&1; then
       observed=$(arcus show "$comp" 2>/dev/null | grep -i "Latest Version:" | sed -E 's/.*\(seq ([0-9]+)\).*/\1/' || true)
@@ -104,8 +102,6 @@ fi
 # --- 1. Pre-pack cargo compilation ------------------------------------------
 if [ "$SKIP_BUILD" -eq 0 ]; then
   printf "\n[Step 1/3] Building release binaries with cargo...\n"
-  (cd "$REPO_ROOT" && cargo build --release -p subc-core --bin ck-subc --bin ck)
-  (cd "$REPO_ROOT" && cargo build --release -p subc-mcp --bin ck-subc-mcp)
   (cd "$REPO_ROOT" && cargo build --release -p uc-discussions --bin ck-uc-discussions)
 fi
 
@@ -122,20 +118,17 @@ pack_component() {
   SKIP_BUILD=1 sh "$script" --version "$VERSION" --sequence "$SEQUENCE"
 }
 
-pack_component "ck-subc" "${REPO_ROOT}/scripts/pack-ck-subc-arcus.sh"
-pack_component "ck" "${REPO_ROOT}/scripts/pack-ck-arcus.sh"
-pack_component "ck-subc-mcp" "${REPO_ROOT}/scripts/pack-ck-subc-mcp-arcus.sh"
-pack_component "ck-uc-discussions" "${REPO_ROOT}/scripts/pack-ck-uc-discussions-arcus.sh"
+pack_component "ck-uc-discussions" "${REPO_ROOT}/packaging/scripts/pack-ck-uc-discussions-arcus.sh"
 
 # --- 3. Release-set completeness gate ----------------------------------------
 printf "\n[Step 3/3] Verifying release-set completeness...\n"
 
 if [ -n "$ONLY_COMPONENT" ]; then
-  node "${REPO_ROOT}/scripts/lib/verify-release-set.mjs" \
+  node "${REPO_ROOT}/packaging/scripts/lib/verify-release-set.mjs" \
     --root "$RELEASE_ROOT" \
     --only "$ONLY_COMPONENT"
 else
-  node "${REPO_ROOT}/scripts/lib/verify-release-set.mjs" --root "$RELEASE_ROOT"
+  node "${REPO_ROOT}/packaging/scripts/lib/verify-release-set.mjs" --root "$RELEASE_ROOT"
 fi
 
 printf "\n=====================================================================\n"

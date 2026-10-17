@@ -1,11 +1,11 @@
 #!/bin/sh
 set -eu
 
-# Resolve project repository root (directory containing packages/arcus)
+# Resolve project repository root (directory containing packaging/arcus)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-if [ -d "${SCRIPT_DIR}/../../packages/arcus" ]; then
+if [ -d "${SCRIPT_DIR}/../../packaging/arcus" ]; then
   REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-elif [ -d "${SCRIPT_DIR}/packages/arcus" ]; then
+elif [ -d "${SCRIPT_DIR}/packaging/arcus" ]; then
   REPO_ROOT="${SCRIPT_DIR}"
 else
   REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -60,31 +60,31 @@ if [ -f "${RECEIPT}" ] && command -v jq >/dev/null 2>&1; then
   fi
 fi
 
-# 4. Create toolchain symlink under packages/arcus
-mkdir -p "${REPO_ROOT}/packages/arcus"
-ln -sfn "${PUBLISHER_DIR}" "${REPO_ROOT}/packages/arcus/toolchain"
+# 4. Create toolchain symlink under packaging/arcus
+mkdir -p "${REPO_ROOT}/packaging/arcus"
+ln -sfn "${PUBLISHER_DIR}" "${REPO_ROOT}/packaging/arcus/toolchain"
 
 # 5. Create skill symlink under .opencode/skills
 mkdir -p "${REPO_ROOT}/.opencode/skills"
-ln -sfn "../../packages/arcus/toolchain/skill" "${REPO_ROOT}/.opencode/skills/arcus-publisher"
+ln -sfn "../../packaging/arcus/toolchain/skill" "${REPO_ROOT}/.opencode/skills/arcus-publisher"
 
-# 6. Create root scripts symlinks for standard arcus workflow
-mkdir -p "${REPO_ROOT}/scripts"
-if [ -d "${REPO_ROOT}/packages/arcus/toolchain/scripts" ]; then
-  for s in arcus-pipeline.sh pack-arcus.sh publish-arcus.sh validate-arcus.sh sign-arcus.sh arcus-toolchain.json submission.schema.json; do
-    if [ -f "${REPO_ROOT}/packages/arcus/toolchain/scripts/${s}" ]; then
-      ln -sfn "../packages/arcus/toolchain/scripts/${s}" "${REPO_ROOT}/scripts/${s}"
+# 6. Create lifecycle script symlinks under packaging/scripts for the standard arcus workflow
+mkdir -p "${REPO_ROOT}/packaging/scripts"
+if [ -d "${REPO_ROOT}/packaging/arcus/toolchain/scripts" ]; then
+  for s in arcus-pipeline.sh pack-arcus.sh publish-arcus.sh validate-arcus.sh sign-arcus.sh arcus-toolchain.json arcus.schema.json submission.schema.json; do
+    if [ -f "${REPO_ROOT}/packaging/arcus/toolchain/scripts/${s}" ]; then
+      ln -sfn "../arcus/toolchain/scripts/${s}" "${REPO_ROOT}/packaging/scripts/${s}"
     fi
   done
 fi
 
 echo "==> Symlinks created:"
-echo "    packages/arcus/toolchain -> ${PUBLISHER_DIR}"
-echo "    .opencode/skills/arcus-publisher -> ../../packages/arcus/toolchain/skill"
+echo "    packaging/arcus/toolchain -> ${PUBLISHER_DIR}"
+echo "    .opencode/skills/arcus-publisher -> ../../packaging/arcus/toolchain/skill"
 
 # 7. Validate installed toolchain if available
-if [ -d "${REPO_ROOT}/packages/arcus/toolchain/scripts" ]; then
-  arcus manifest verify-toolchain --root "${REPO_ROOT}/packages/arcus/toolchain/scripts"
+if [ -d "${REPO_ROOT}/packaging/arcus/toolchain/scripts" ]; then
+  arcus manifest verify-toolchain --root "${REPO_ROOT}/packaging/arcus/toolchain/scripts"
 fi
 
 echo "==> Arcus publisher bootstrap complete."

@@ -3,7 +3,7 @@
 // verify-release-set.mjs — fail-closed audit of dist/<version>/<sequence>/
 //
 // Usage:
-//   node scripts/lib/verify-release-set.mjs --root dist/<version>/<sequence> \
+//   node packaging/scripts/lib/verify-release-set.mjs --root dist/<version>/<sequence> \
 //     [--only <component>]
 // =============================================================================
 

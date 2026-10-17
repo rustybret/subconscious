@@ -6,7 +6,7 @@ REPO_ROOT="$(CDPATH='' cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 ARCUS_BIN="${ARCUS_BIN:-arcus}"
 OUTPUT_DIR=""
-CONFIG_FILE="${REPO_ROOT}/packages/arcus/ck-uc-discussions.json"
+CONFIG_FILE="${REPO_ROOT}/packaging/arcus/ck-uc-discussions.json"
 
 PACKAGE_ID="ck-uc-discussions"
 SOFTWARE_TYPE="service"
@@ -160,12 +160,12 @@ cat <<EOF > "${OUTPUT_DIR}/submission.json"
 }
 EOF
 
-VALIDATOR="${REPO_ROOT}/packages/arcus/toolchain/scripts/validate-arcus.sh"
+VALIDATOR="${REPO_ROOT}/packaging/arcus/toolchain/scripts/validate-arcus.sh"
 if [ "$SKIP_VALIDATE" -eq 0 ] && [ -f "$VALIDATOR" ]; then
   sh "$VALIDATOR" "$ENVELOPE_PATH"
 fi
 
-node "${REPO_ROOT}/scripts/lib/write-pack-report.mjs" \
+node "${REPO_ROOT}/packaging/scripts/lib/write-pack-report.mjs" \
   --output-dir "$OUTPUT_DIR" \
   --package-id "$PACKAGE_ID" \
   --version "$VERSION" \

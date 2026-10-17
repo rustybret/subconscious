@@ -146,7 +146,7 @@ The host environment orchestrating room deliberations must guarantee three core 
 
 ### 6.1 Code Seam & Validation Logic
 
-The daemon-side guard will be located directly in `crates/uc-discussions/src/service/rooms.rs` inside `RoomsService::bind_member`:
+The daemon-side guard will be located directly in `modules/uc-discussions/src/service/rooms.rs` inside `RoomsService::bind_member`:
 
 ```rust
 // Proposed guard in RoomsService::bind_member
@@ -212,7 +212,7 @@ When the implementation increment for `bind_member` is scheduled and authorized,
 
 ### 7.2 Incarnation Regression Invariant
 
-Existing tests verifying incarnation fencing (such as `crates/uc-discussions/tests/auto_wake_acceptance_test.rs`) must continue to test stale incarnation rejection. When fixture agent strings in those tests are updated to conform to `"Council: <name>"`, the assertions proving monotonic incarnation progression must remain identical in behavioral semantics.
+Existing tests verifying incarnation fencing (such as `modules/uc-discussions/tests/auto_wake_acceptance_test.rs`) must continue to test stale incarnation rejection. When fixture agent strings in those tests are updated to conform to `"Council: <name>"`, the assertions proving monotonic incarnation progression must remain identical in behavioral semantics.
 
 ### 7.3 Real-Wire Verification
 

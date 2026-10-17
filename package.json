@@ -3,12 +3,12 @@
   "private": true,
   "packageManager": "bun@1.4.2",
   "scripts": {
-    "bootstrap:arcus": "sh packages/arcus/bootstrap.sh",
-    "pack:arcus": "sh scripts/pack-all-arcus.sh",
-    "pack:ck-uc-discussions": "sh scripts/pack-ck-uc-discussions-arcus.sh",
-    "publish:arcus": "sh scripts/publish-all-arcus.sh",
+    "bootstrap:arcus": "sh packaging/arcus/bootstrap.sh",
+    "pack:arcus": "sh packaging/scripts/pack-all-arcus.sh",
+    "pack:ck-uc-discussions": "sh packaging/scripts/pack-ck-uc-discussions-arcus.sh",
+    "publish:arcus": "sh packaging/scripts/publish-all-arcus.sh",
     "publish:submit": "arcus publish submit",
     "publish:status": "arcus publish status",
-    "validate:arcus": "sh scripts/validate-arcus.sh"
+    "validate:arcus": "sh packaging/scripts/validate-arcus.sh"
   }
 }

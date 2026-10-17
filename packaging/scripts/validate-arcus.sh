@@ -1,0 +1,1 @@
+../arcus/toolchain/scripts/validate-arcus.sh

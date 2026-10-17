@@ -17,14 +17,14 @@ WAIT_SUBMIT="${WAIT_SUBMIT:-1}"
 DRY_RUN="${DRY_RUN:-0}"
 
 if [ -z "$VERSION" ]; then
-  VERSION=$(grep '^version' "${REPO_ROOT}/crates/subc-core/Cargo.toml" | head -1 | sed -E 's/version *= *"([^"]+)"/\1/')
+  VERSION=$(grep '^version' "${REPO_ROOT}/modules/uc-discussions/Cargo.toml" | head -1 | sed -E 's/version *= *"([^"]+)"/\1/')
 fi
 VERSION="${VERSION#v}"
 
 DIST_ROOT="${REPO_ROOT}/dist"
 if [ ! -d "$DIST_ROOT" ]; then
   printf "error: dist directory not found: %s\n" "$DIST_ROOT" >&2
-  printf "hint: run \"sh scripts/pack-all-arcus.sh\" first.\n" >&2
+  printf "hint: run \"sh packaging/scripts/pack-all-arcus.sh\" first.\n" >&2
   exit 1
 fi
 
@@ -47,7 +47,7 @@ printf "Reading packages from: %s\n" "$SEQUENCE_DIR"
 printf "Gateway: %s\n" "$GATEWAY"
 printf "=====================================================================\n"
 
-for comp in ck-subc ck ck-subc-mcp ck-uc-discussions; do
+for comp in ck-uc-discussions; do
   comp_dir="${SEQUENCE_DIR}/${comp}"
   if [ ! -d "$comp_dir" ]; then
     printf "warn: component directory not found: %s, skipping...\n" "$comp_dir"
@@ -108,8 +108,8 @@ EOF
   fi
 
   # Copy toolchain.json if missing
-  if [ ! -f "${bundle_dir}/toolchain.json" ] && [ -f "${REPO_ROOT}/packages/arcus/toolchain/scripts/arcus-toolchain.json" ]; then
-    cp "${REPO_ROOT}/packages/arcus/toolchain/scripts/arcus-toolchain.json" "${bundle_dir}/toolchain.json"
+  if [ ! -f "${bundle_dir}/toolchain.json" ] && [ -f "${REPO_ROOT}/packaging/arcus/toolchain/scripts/arcus-toolchain.json" ]; then
+    cp "${REPO_ROOT}/packaging/arcus/toolchain/scripts/arcus-toolchain.json" "${bundle_dir}/toolchain.json"
   fi
 
   if [ "$DRY_RUN" -eq 1 ]; then

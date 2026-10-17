@@ -18,7 +18,7 @@ To eliminate this burden, we strictly observe the separation between upstream ch
 
 | Component / Project | Upstream Ownership | Custom UltraCreative Features (To Preserve) | Target Release Channel | Strategy & Action Plan |
 |---|---|---|---|---|
-| **`subconscious`** | Central daemon (`ck-subc`), CLI (`ck`), MCP gateway (`ck-subc-mcp`), wire headers | Embedded `crates/uc-discussions` (deliberation rooms, Athena reconciliation). | **Upstream npm / crates.io** (Platform) + **Arcus** (UCS plugin) | Decouple `uc-discussions` into an external standalone plugin. Revert `subconscious` to clean upstream mirror. |
+| **`subconscious`** | Central daemon (`ck-subc`), CLI (`ck`), MCP gateway (`ck-subc-mcp`), wire headers | Embedded `modules/uc-discussions` (deliberation rooms, Athena reconciliation). | **Upstream npm / crates.io** (Platform) + **Arcus** (UCS plugin) | Decouple `uc-discussions` into an external standalone plugin. Revert `subconscious` to clean upstream mirror. |
  | **`aft`** | Agent File Tools daemon (`aft`), AST tools, indexed code search | Custom tool bindings, workspace root indexing hooks, specific editor integrations. | **Arcus-delivered Module & dist snapshot** | Pinned to `subc-protocol =0.29.0`, `subc-transport =0.10.0`, `subc-client-rs =0.26.1`. Live sessions load isolated snapshot dirs (`dist-<version>.<build#>`, e.g. `dist-58.2.0.2`) to prevent in-flight local builds from breaking active sessions. |
  | **`magic-context`** | Upstream published npm package + daemon module | Multi-tier context engine: `@cortexkit/opencode-magic-context@latest` (npm v0.45.0) for host plugin, `ck-mc` for daemon supervisor. Storage operates via Cloudhome ZFS network store (`tank-main/magic-context` same-kernel WAL domain) with single Dreamer on `opencode-ops-nimbus`. | **Official npm (host) + SubC module (daemon)** | Consumed via published upstream npm release (`0.45.0`). Replaces legacy spoke synchronization previously carried by `lore-replicator`. |
 | **`synapse`** | Agent runtime mesh (`ck-synapse`), CLI (`ck-synapse-opctl`), inference engines | Minimal custom delta: Ultra Creative Studio & `art3d-pipeline` integration contracts (semantic deduplication preflight, ComfyUI prompt verification, ephemeral RunPod delivery controller contracts). Core inference engines (Metal MPSGraph, CUDA PTX, ANE CoreML split-prefill, CPU ORT) strictly upstream. | **Arcus v3-delivered Module** (`manifests/v3/`) | Pinned to exact crates.io releases (`=`). Ready to advance atomically to full `0.28.0` block (`subc-protocol`, `subc-transport`, `subc-client-rs`, `subc-daemon`, `subc-os`) to maintain single-protocol lock. Releases native binaries via Arcus for direct SubC IPC wire consumption; no standalone npm/pip packages. |
@@ -76,9 +76,9 @@ Rather than modifying `subconscious` source code to add custom fleet features, a
 ## 4. Migration & Decoupling Roadmap
 
 ### Phase 1: Decouple `uc-discussions` into a Standalone Plugin
-1. Extract `crates/uc-discussions` from `subconscious` into its own repository (`Git/uc-discussions` or under `uc-studio`).
-2. Replace local relative path dependencies in `crates/uc-discussions/Cargo.toml` with crates.io SemVer pins (`subc-protocol = "0.28"`, `subc-client-rs = "0.25"`, `subc-transport = "0.9"`, `subc-control = "0.27"`).
-3. Package and release `ck-uc-discussions` as a dedicated Arcus suite component (`packages/arcus/ck-uc-discussions.json`).
+1. Extract `modules/uc-discussions` from `subconscious` into its own repository (`Git/uc-discussions` or under `uc-studio`).
+2. Replace local relative path dependencies in `modules/uc-discussions/Cargo.toml` with crates.io SemVer pins (`subc-protocol = "0.28"`, `subc-client-rs = "0.25"`, `subc-transport = "0.9"`, `subc-control = "0.27"`).
+3. Package and release `ck-uc-discussions` as a dedicated Arcus suite component (`packaging/arcus/ck-uc-discussions.json`).
 4. Revert `subconscious/Cargo.toml` to pure upstream workspace members.
 
 ### Phase 2: Eliminate Source Forks for Pure Commodity Modules
@@ -90,4 +90,4 @@ Rather than modifying `subconscious` source code to add custom fleet features, a
 2. Package both modules cleanly for Arcus delivery, layering our custom extensions cleanly over upstream primitives.
 
 ### Phase 4: Subconscious as Fleet Wire Testing Coordinator
-As the central router and connection fabric, `subconscious` maintains an end-to-end integration test harness (`crates/subc-core/tests/`) verifying that all active modules (`aft`, `magic-context`, `synapse`, `uc-discussions`) establish transport, complete HMAC authentication, pass HELLO/HELLO_ACK handshakes, and route management frames cleanly across version upgrades.
+As the central router and connection fabric, `subconscious` coordinates end-to-end wire checks against the stock published `ck-subc` (an isolated daemon run with temp XDG directories, as used for the 0.20.83 acceptance test) verifying that all active modules (`aft`, `magic-context`, `synapse`, `uc-discussions`) establish transport, complete HMAC authentication, pass HELLO/HELLO_ACK handshakes, and route management frames cleanly across version upgrades.

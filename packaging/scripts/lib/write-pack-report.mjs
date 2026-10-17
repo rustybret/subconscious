@@ -4,7 +4,7 @@
 // `arcus` binary directly rather than through pack-arcus.sh.
 //
 // Usage:
-//   node scripts/lib/write-pack-report.mjs \
+//   node packaging/scripts/lib/write-pack-report.mjs \
 //     --output-dir DIR --package-id ID --version V --sequence N \
 //     --source-id ID --channel C --target-id T --envelope PATH
 // =============================================================================
@@ -112,7 +112,7 @@ const report = {
     ...spread("tree_signature", treesig),
     target_id: args["target-id"],
     targets: [targetEntry],
-    generated_by: "scripts/lib/write-pack-report.mjs",
+    generated_by: "packaging/scripts/lib/write-pack-report.mjs",
 };
 
 const reportPath = join(outputDir, "pack-report.json");

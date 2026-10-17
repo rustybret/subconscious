@@ -4,7 +4,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/uc-discussions",
+    "modules/uc-discussions",
 ]
 
 [profile.release]

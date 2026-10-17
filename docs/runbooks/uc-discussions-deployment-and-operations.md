@@ -455,7 +455,7 @@ The package envelope must conform to Arcus distribution specifications before pu
 
 ```bash
 ENVELOPE="dist/<sequence>/ck-uc-discussions/<version>/releases/ck-uc-discussions-<version>-<sequence>.json"
-TOOLCHAIN="packages/arcus/toolchain/scripts/validate-arcus.sh"
+TOOLCHAIN="packaging/arcus/toolchain/scripts/validate-arcus.sh"
 
 sh "$TOOLCHAIN" --body-only "$ENVELOPE"
 ```
@@ -472,7 +472,7 @@ The implementation and operational behavior are validated through automated regr
 
 ### Multi-Turn Deliberation Room Test (`acceptance_test.rs`)
 
-Location: `crates/uc-discussions/tests/acceptance_test.rs`
+Location: `modules/uc-discussions/tests/acceptance_test.rs`
 
 This test exercises a complete 10-step multi-turn deliberation:
 1. Coordinator creates a room: `Release Strategy`, goal `Decide 0.1.0 release policy`.
@@ -492,7 +492,7 @@ This test exercises a complete 10-step multi-turn deliberation:
 
 ### Chaos and Restart Persistence Proof (`chaos_recovery_test.rs`)
 
-Location: `crates/uc-discussions/tests/chaos_recovery_test.rs`
+Location: `modules/uc-discussions/tests/chaos_recovery_test.rs`
 
 This test proves zero state loss and zero duplicate prompt injection across abrupt crashes:
 - **Phase 1 (Pre-Crash)**: Instance 1 opens storage, enqueues message 1 and message 2, marks message 1 as `delivered` and `processed`, creates a room, posts a proposal (`seq = 1`), and acquires a short lease (50 ms TTL).
@@ -505,7 +505,7 @@ This test proves zero state loss and zero duplicate prompt injection across abru
 
 ### Zero-Loss Export and Import Snapshot Proof (`migration_snapshot_test.rs`)
 
-Location: `crates/uc-discussions/tests/migration_snapshot_test.rs`
+Location: `modules/uc-discussions/tests/migration_snapshot_test.rs`
 
 This test verifies complete portability and migration safety:
 - Populates database 1 with rows across all 12 tables: leases, peer threads, peer messages in diverse states, rooms, members, posts, objections, revisions, polls, votes, stage grants, council runs, and member states.

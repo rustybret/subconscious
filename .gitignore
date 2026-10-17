@@ -30,7 +30,7 @@ docs/private/
 .wrangler/
 # Arcus release artifacts and toolchain
 /dist/
-packages/arcus/toolchain/
+packaging/arcus/toolchain/
 /.omo/
 /.ucs/
 

@@ -142,7 +142,7 @@ The packaging rules enforce strict invariants:
 
 ## 3. Workstation Drift Tripwire (`orw-probe.sh`)
 
-Workstations must immediately detect when their local configuration lags behind published upstream releases. The tripwire script `scripts/fleet/orw-probe.sh` provides this validation.
+Workstations must immediately detect when their local configuration lags behind published upstream releases. The tripwire script `fleet/orw-probe.sh` provides this validation.
 
 ### Tripwire Execution Contract
 
@@ -190,7 +190,7 @@ This prevents silent failures where an offline network adapter or DNS glitch wou
 
 ### Automated Unit Test Verification
 
-The probe contract is covered by unit tests in `scripts/fleet/tests/test_orw_probe.py`. The suite mocks the `curl` binary and configuration files to verify all three exit states:
+The probe contract is covered by unit tests in `fleet/tests/test_orw_probe.py`. The suite mocks the `curl` binary and configuration files to verify all three exit states:
 
 ```python
 # test_orw_probe.py test coverage:
@@ -203,7 +203,7 @@ The probe contract is covered by unit tests in `scripts/fleet/tests/test_orw_pro
 To run the regression suite:
 
 ```bash
-python3 scripts/fleet/tests/test_orw_probe.py
+python3 fleet/tests/test_orw_probe.py
 ```
 
 ---
@@ -262,8 +262,8 @@ When `orw-probe.sh` returns exit code 1 (`DRIFT_DETECTED`), operators execute th
 2. If `subc-protocol` or `subc-transport` versions advanced:
    - Recompile `aft` against the updated crates.
    - Export `aft` to a new isolated snapshot: `dist-<version>.<build#>`.
-   - Update `subconscious/Cargo.toml`, `synapse/Cargo.toml`, and `lore` crate pins.
-   - Run integration tests in `crates/subc-core/tests/` to confirm channel 0 route negotiations succeed.
+   - Update the `subc-*` pins in `aft`, `synapse` and `magic-context` (lore is deprecated and not updated).
+   - Run the module against the stock published `ck-subc` in an isolated daemon (temp `XDG_*` directories, `SUBC_PORT=0`) to confirm the module registers and route negotiation succeeds.
 3. If wire crate versions did not change, existing `aft` snapshots and Tier 4 modules remain valid.
 
 #### Phase 4: Local Workstation Activation
@@ -281,7 +281,7 @@ When `orw-probe.sh` returns exit code 1 (`DRIFT_DETECTED`), operators execute th
    ```
 3. Run `orw-probe.sh` to confirm drift has resolved:
    ```bash
-   ./scripts/fleet/orw-probe.sh
+   ./fleet/orw-probe.sh
    # Expected output: STATUS: UP_TO_DATE (<version>)
    ```
 

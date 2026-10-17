@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Regression test suite for scripts/fleet/orw-probe.sh.
+Regression test suite for fleet/orw-probe.sh.
 Verifies drift detection contract:
   - Exit 0 when local pin matches latest upstream (UP_TO_DATE)
   - Exit 1 when local pin differs from latest upstream (DRIFT_DETECTED)
@@ -15,8 +15,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-ORW_PROBE_SCRIPT = REPO_ROOT / "scripts" / "fleet" / "orw-probe.sh"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+ORW_PROBE_SCRIPT = REPO_ROOT / "fleet" / "orw-probe.sh"
 
 
 class TestOrwProbe(unittest.TestCase):

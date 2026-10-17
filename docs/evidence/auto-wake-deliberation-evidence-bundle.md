@@ -398,7 +398,7 @@ with bounded backoff.
 The UCS backfill proves end-to-end behavior without moving launcher authority
 or model selection into `uc-discussions`:
 
-- `crates/uc-discussions/tests/auto_wake_acceptance_test.rs` proves durable
+- `modules/uc-discussions/tests/auto_wake_acceptance_test.rs` proves durable
   session binding and rejects a stale pre-wake incarnation against schema 2.
 - `packages/omo-opencode/src/features/discussions/project-room-host.ts` owns
   endpoint recovery, `opencode serve` launch, session creation, agent/model
