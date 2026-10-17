@@ -33,7 +33,13 @@ while [ $# -gt 0 ]; do case "$1" in
 
 T="$(mktemp -d /tmp/subc-iso.XXXXXX)"; mkdir -p "$T"/{run,data,config/cortexkit,home}
 DPID=""
-cleanup() { [ -n "$DPID" ] && kill "$DPID" 2>/dev/null; pkill -f "$T/" 2>/dev/null; sleep 1
+cleanup() {
+  # The daemon drains and RESPAWNS its modules after SIGTERM, so killing modules first leaves a fresh orphan
+  # behind once the daemon exits. Stop the daemon, wait for it, then sweep anything still holding the sandbox.
+  if [ -n "$DPID" ]; then kill "$DPID" 2>/dev/null
+    for _ in $(seq 1 45); do kill -0 "$DPID" 2>/dev/null || break; sleep 1; done
+    kill -9 "$DPID" 2>/dev/null; fi
+  pkill -f "$T/" 2>/dev/null; sleep 1; pkill -9 -f "$T/" 2>/dev/null
   [ "$KEEP" = 1 ] && echo "kept: $T" || rm -rf "$T"; }
 trap cleanup EXIT
 
