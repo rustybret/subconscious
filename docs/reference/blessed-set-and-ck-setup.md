@@ -42,11 +42,11 @@ Do NOT use `ck setup` for these; they come from elsewhere:
 | Component | Version | Why not `ck setup` | Source |
 | --- | --- | --- | --- |
 | `aft` | fork 0.58.2 (seq 18) live; 0.60.0 (seq 20, tag `v0.60.0_seq20`) verified, not yet in the catalog | Upstream `aft` lacks our SubC federation, LSP and GDScript changes. `ck setup aft` would replace the fork. | Arcus package `opencode-aft` |
-| `ck-mc` | upstream tag `v0.49.1` built unmodified | The `mc` entry in the index is a stale alpha (0.1.0). | Built from upstream tag; Cloudhome is the target builder |
-| `ck-claustrum` | upstream `master` merge, reports 0.1.3 | The published 0.1.3 predates the launch-nonce fix and is rejected by the daemon (`reserved_module`). `ck setup claustrum` would install a module that crash-loops. Wait for a fixed upstream release. | Source build until then |
+| `ck-mc` | upstream tag matching the plugin pin (plugin and daemon are a pair; built unmodified) | The `mc` entry in the index is a stale alpha (0.1.0). | Built from upstream tag; Cloudhome is the target builder |
+| `ck-claustrum` | upstream `master` merge, reports 0.1.3 (module version; NOT the `@cortexkit/claustrum-client` npm library, which is 0.9.x/0.10.x and a different artifact) | The published 0.1.3 predates the launch-nonce fix and is rejected by the daemon (`reserved_module`). `ck setup claustrum` would install a module that crash-loops. Wait for a fixed upstream release. | Source build until then |
 | `ck-entorhinal` | 0.1.20 (upstream HEAD, unmodified) | Nothing is published. | Source build |
 | `ck-uc-discussions` | 0.1.0 (Arcus seq 2) | Ours. | Arcus package `uc-discussions` |
-| OpenCode plugin `@cortexkit/opencode-magic-context` | pin an exact version (npm latest is 0.49.10; the workstation is pinned 0.49.1) | Consumed from npm, not `ck setup`. | npm |
+| OpenCode plugin `@cortexkit/opencode-magic-context` | pin an exact version (the workstation is pinned 0.49.10, which is also npm latest) | Consumed from npm, not `ck setup`. | npm |
 
 Exclude: every `lore-*` module. Lore is deprecated. `lore-broca`, `lore-wake` and `lore-mcp-gateway` are
 retired; `lore-thalamus` is still running on the reference workstation but must not be in the blessed set.
