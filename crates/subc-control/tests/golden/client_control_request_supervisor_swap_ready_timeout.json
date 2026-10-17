@@ -1,5 +1,0 @@
-{
-  "module_id": "aft-tools",
-  "op": "supervisor.swap",
-  "ready_timeout_ms": 90000
-}

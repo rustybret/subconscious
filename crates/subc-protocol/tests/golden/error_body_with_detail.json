@@ -1,8 +1,0 @@
-{
-  "code": "spawn_failed",
-  "detail": {
-    "cause": "credential_resolution",
-    "retry_after_ms": 60000
-  },
-  "message": "child could not start"
-}

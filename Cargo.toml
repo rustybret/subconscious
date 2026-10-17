@@ -1,69 +1,14 @@
+# UltraCreative subc modules: our own modules, supervised by the stock published
+# ck-subc next to the CortexKit modules. Everything upstream (subc-* crates, the
+# daemon, the CLI) comes from crates.io or the official installer, never from here.
 [workspace]
 resolver = "2"
 members = [
-    "crates/subc-protocol",
-    "crates/subc-control",
-    "crates/subc-transport",
-    "crates/subc-client-rs",
-    "crates/subc-jsonc",
-    "crates/subc-cgroup",
-    "crates/subc-uptime",
-    "crates/subc-jobobject",
-    "crates/subc-presence",
-    "crates/subc-os",
-    "crates/subc-core",
-    "crates/subc-daemon",
-    "crates/subc-daemon/tests/consumer",
-    "crates/ck-bus",
-    "crates/subc-mcp",
-    "crates/mcp-stdio-adapter",
-    "crates/agent-token-vectors",
     "crates/uc-discussions",
-    "cortexkit-release",
 ]
 
-# subc monorepo.
-# - crates/subc-protocol : the shared module-facing wire contract
-#   (envelope + module/session relay shapes + manifest + shared primitives).
-#   subc-OWNED (it IS subc's wire contract). Depended on by subc-core (this repo)
-#   AND by AFT (sibling repo) via a path dependency:
-#   in aft's Cargo.toml ->  subc-protocol = { path = "../subconscious/crates/subc-protocol" }
-#   (git dependency is the CI / cross-machine upgrade when needed.)
-# - crates/subc-control  : the client-facing control wire contract.
-# - crates/subc-core     : CLI, installer, and daemon executable.
-# - crates/subc-daemon   : publishable in-process daemon library.
-# - crates/ck-bus        : supervised NATS plane owner; bus primitives come from cortexkit/commons.
-#
-# NOTE: cortexkit-paths is NOT here — it's a product-neutral primitive living in
-# the cortexkit/commons monorepo (https://github.com/cortexkit/commons) and is
-# consumed from crates.io (cortexkit-paths = "0.1"), because AFT uses it without
-# subc. subc-protocol and subc-control stay here precisely because they are subc-defining.
-
 [profile.release]
-# This is cargo's default, stated explicitly because the daemon's failure
-# containment depends on it and nothing else records that.
-#
-# Every connection is served in its own task. Under unwind, a panic while
-# handling one request kills that task alone: the accept loop survives, other
-# connections keep being served, and the supervisor sees a healthy process.
-# Under abort, the same panic takes the whole daemon down and every module
-# loses its route with it.
-#
-# So switching this for binary size or startup time would silently convert
-# every reachable panic in the tree from a single dropped request into a
-# fleet-wide outage, and no test would fail. Change it only deliberately.
+# Cargo's default, stated on purpose: every module serves each connection in its own
+# task, so under unwind a panic drops one request, not the module. Switching to abort
+# would turn any reachable panic into a module outage and no test would fail.
 panic = "unwind"
-
-# The daemon's executable-identity probe hashes whole images. In tests the
-# daemon runs in-process, so its own image is the large test executable; fast
-# SHA-256 compression keeps that first provenance request responsive in debug.
-[profile.dev.package.sha2]
-opt-level = 3
-
-# cortexkit-test-support (a dev-dependency) depends on subc-os from crates.io.
-# Without this patch the lockfile holds that copy beside the workspace crate, and
-# `cargo test -p subc-os` becomes ambiguous, which breaks every command that names
-# the package by itself (the mutation catalogue among them). The patch applies
-# only inside this workspace; published crates are unaffected.
-[patch.crates-io]
-subc-os = { path = "crates/subc-os" }

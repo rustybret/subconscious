@@ -2,7 +2,7 @@
 /target
 **/*.rs.bk
 
-# Commit Cargo.lock (this workspace builds the subc-core binary).
+# Cargo.lock is committed: this workspace ships the ck-uc-discussions binary.
 
 .DS_Store
 
@@ -33,3 +33,6 @@ docs/private/
 packages/arcus/toolchain/
 /.omo/
 /.ucs/
+
+# Untracked leftovers from the pre-strip upstream layout (node_modules, build output); safe to delete once approved.
+/clients/

@@ -1,7 +1,0 @@
-{
-  "arguments": {
-    "pattern": "needle"
-  },
-  "name": "grep",
-  "preset": "read_only-2"
-}

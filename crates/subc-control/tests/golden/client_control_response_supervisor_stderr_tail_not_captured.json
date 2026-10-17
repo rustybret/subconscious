@@ -1,9 +1,0 @@
-{
-  "capture": {
-    "reason": "stderr pipe was not available on spawn",
-    "state": "not_captured"
-  },
-  "entries": [],
-  "module_id": "aft-tools",
-  "op": "supervisor.stderr_tail"
-}
