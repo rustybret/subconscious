@@ -9,7 +9,7 @@ file in the same commit that changes a module's source. Verified 2026-10-17.
 | `ck-subc-mcp` | 0.20.83 | CortexKit official release | CortexKit |
 | `ck-insula` | 0.1.1 | CortexKit official release | CortexKit |
 | `ck-synapse` | 0.1.0-alpha.2 | CortexKit official release | CortexKit |
-| `ck-claustrum` | 0.1.3 | Source build of the `claustrum` checkout. The published 0.1.3 is rejected by the daemon (no launch-nonce handshake). Asked `claustrum` for a fixed release. | us, until fixed |
+| `ck-claustrum` | 0.1.3 | Source build of upstream `claustrum` master merged at `a66ff2c` (branch `sync-upstream-registry`, registry deps only, tests 1129 passed). The published 0.1.3 predates the launch-nonce fix and is rejected by the daemon. Deployed 2026-10-17; migrated the vault schema 13 to 16 (backup: `~/.local/state/claustrum-backup-20261017-085601`). | us, until claustrum publishes a fixed release |
 | `ck-mc` | upstream tag `v0.49.1` | Upstream publishes no current binary (its release is a stale alpha). Built unmodified from the upstream tag. | us today; Cloudhome target |
 | `ck-entorhinal` | 0.1.20 | Upstream HEAD, unmodified. Nothing is published. | us |
 | `aft` | 0.58.2 (fork) | UltraCreative fork: SubC federation, LSP and GDScript changes that upstream 0.60.0 lacks | the `aft` project (Arcus) |
