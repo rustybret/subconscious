@@ -542,8 +542,9 @@ async fn real_wire_room_lifecycle_is_fenced_and_preserved() {
     );
     println!("PASS same-store process restart: complete frozen room JSON identical");
 
-    let evidence = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../.omo/evidence/uc-discussions-stabilization");
+    // Cargo's per-target scratch directory keeps this independent of where the crate lives.
+    let evidence = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("uc-discussions-evidence");
     std::fs::create_dir_all(&evidence).expect("retained evidence directory");
     std::fs::write(
         evidence.join("task-7-wire.json"),
