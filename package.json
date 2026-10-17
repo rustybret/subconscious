@@ -5,7 +5,7 @@
   "scripts": {
     "bootstrap:arcus": "sh packaging/arcus/bootstrap.sh",
     "pack:arcus": "sh packaging/scripts/pack-all-arcus.sh",
-    "pack:ck-uc-discussions": "sh packaging/scripts/pack-ck-uc-discussions-arcus.sh",
+    "pack:uc-discussions": "sh packaging/scripts/pack-uc-discussions-arcus.sh",
     "publish:arcus": "sh packaging/scripts/publish-all-arcus.sh",
     "publish:submit": "arcus publish submit",
     "publish:status": "arcus publish status",

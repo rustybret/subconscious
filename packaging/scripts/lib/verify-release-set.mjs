@@ -14,7 +14,7 @@ const COMPONENTS = {
     "ck-subc": { kind: "native" },
     "ck": { kind: "native" },
     "ck-subc-mcp": { kind: "native" },
-    "ck-uc-discussions": { kind: "native" },
+    "uc-discussions": { kind: "native" },
 };
 
 const FORBIDDEN_ENTRIES = ["payload", "node_modules"];

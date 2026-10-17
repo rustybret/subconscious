@@ -78,7 +78,7 @@ Rather than modifying `subconscious` source code to add custom fleet features, a
 ### Phase 1: Decouple `uc-discussions` into a Standalone Plugin
 1. Extract `modules/uc-discussions` from `subconscious` into its own repository (`Git/uc-discussions` or under `uc-studio`).
 2. Replace local relative path dependencies in `modules/uc-discussions/Cargo.toml` with crates.io SemVer pins (`subc-protocol = "0.28"`, `subc-client-rs = "0.25"`, `subc-transport = "0.9"`, `subc-control = "0.27"`).
-3. Package and release `ck-uc-discussions` as a dedicated Arcus suite component (`packaging/arcus/ck-uc-discussions.json`).
+3. Package and release `uc-discussions` as a dedicated Arcus suite component (`packaging/arcus/uc-discussions.json`).
 4. Revert `subconscious/Cargo.toml` to pure upstream workspace members.
 
 ### Phase 2: Eliminate Source Forks for Pure Commodity Modules

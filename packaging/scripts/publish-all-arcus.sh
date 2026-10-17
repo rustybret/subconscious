@@ -47,7 +47,7 @@ printf "Reading packages from: %s\n" "$SEQUENCE_DIR"
 printf "Gateway: %s\n" "$GATEWAY"
 printf "=====================================================================\n"
 
-for comp in ck-uc-discussions; do
+for comp in uc-discussions; do
   comp_dir="${SEQUENCE_DIR}/${comp}"
   if [ ! -d "$comp_dir" ]; then
     printf "warn: component directory not found: %s, skipping...\n" "$comp_dir"

@@ -42,7 +42,7 @@ dist/
     ├── ck-subc-mcp/
     │   └── <version>/
     │       └── ...
-    └── ck-uc-discussions/
+    └── uc-discussions/
         └── <version>/
             └── ...
 ```
@@ -58,7 +58,7 @@ dist/
 | `ck-subc` | `service` | `start` | `ck-subc` | `executable` | Core subc routing and supervision daemon |
 | `ck` | `cli` | `open` | `ck` | `executable` | Unified operator CLI |
 | `ck-subc-mcp` | `cli` | `open` | `ck-subc-mcp` | `executable` | MCP stdio gateway bridging tools to subc mesh |
-| `ck-uc-discussions` | `service` | `start` | `ck-uc-discussions` | `executable` | Multi-project discussions and deliberation daemon |
+| `uc-discussions` | `service` | `start` | `ck-uc-discussions` | `executable` | Multi-project discussions and deliberation daemon |
 
 ---
 

@@ -454,7 +454,7 @@ sqlite3 "$DB" "SELECT council_id, member_name, status, error_text FROM council_m
 The package envelope must conform to Arcus distribution specifications before publication. Run the release validator script:
 
 ```bash
-ENVELOPE="dist/<sequence>/ck-uc-discussions/<version>/releases/ck-uc-discussions-<version>-<sequence>.json"
+ENVELOPE="dist/<sequence>/uc-discussions/<version>/releases/uc-discussions-<version>.json"
 TOOLCHAIN="packaging/arcus/toolchain/scripts/validate-arcus.sh"
 
 sh "$TOOLCHAIN" --body-only "$ENVELOPE"
