@@ -36,3 +36,4 @@ packaging/arcus/toolchain/
 
 # Untracked leftovers from the pre-strip upstream layout (node_modules, build output); safe to delete once approved.
 /clients/
+/dist-arcus/
