@@ -13,7 +13,7 @@ file in the same commit that changes a module's source. Verified 2026-10-17.
 | `ck-mc` | upstream tag matching the plugin pin (plugin pinned 0.49.10; installed daemon is still the v0.49.1 build, a7cd854dd, so drift is flagged) | Upstream publishes no current binary (its release is a stale alpha). Built unmodified from the upstream tag. | us today; Cloudhome target |
 | `ck-entorhinal` | 0.1.20 | Upstream HEAD, unmodified. Nothing is published. | us |
 | `aft` | 0.58.2 (fork) | UltraCreative fork: SubC federation, LSP and GDScript changes that upstream 0.60.0 lacks | the `aft` project (Arcus) |
-| `ck-uc-discussions` | 0.1.0 | `modules/uc-discussions/` | us |
+| `ck-uc-discussions` | 0.1.1 (Arcus package `uc-discussions` seq 3, published 2026-10-18; binary byte-identical to the GitHub release asset and the installed one) | `modules/uc-discussions/` | us |
 | `lore-thalamus` | n/a | Lore, **deprecated**; left running, never updated (session identity for non-OpenCode harnesses; no published equivalent) | n/a |
 | `lore-broca`, `lore-wake`, `lore-mcp-gateway` | n/a | **Retired 2026-10-17** (operator-approved): broca unused with `transform_mode: ts`, wake replaced by `project_room` + `ck-uc-discussions`, mcp-gateway had no clients. Binaries archived in `~/.local/state/lore-retired-20261017-073526/` | n/a |
 

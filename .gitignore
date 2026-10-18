@@ -37,3 +37,6 @@ packaging/arcus/toolchain/
 # Untracked leftovers from the pre-strip upstream layout (node_modules, build output); safe to delete once approved.
 /clients/
 /dist-arcus/
+
+# Nested checkout of the claustrum fork (its own git repo, registered as its own project); never part of this repo
+/claustrum/
