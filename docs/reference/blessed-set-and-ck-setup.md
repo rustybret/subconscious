@@ -42,7 +42,7 @@ Do NOT use `ck setup` for these; they come from elsewhere:
 | Component | Version | Why not `ck setup` | Source |
 | --- | --- | --- | --- |
 | `aft` | fork 0.58.2 (seq 18) live; 0.60.0 (seq 20, tag `v0.60.0_seq20`) verified, not yet in the catalog | Upstream `aft` lacks our SubC federation, LSP and GDScript changes. `ck setup aft` would replace the fork. | Arcus package `opencode-aft` |
-| `ck-mc` | upstream tag matching the plugin pin (plugin and daemon are a pair; built unmodified) | The `mc` entry in the index is a stale alpha (0.1.0). | Built from upstream tag; Cloudhome is the target builder |
+| `ck-mc` | 0.49.10 from upstream tag `v0.49.10` (plugin and daemon are a pair; built unmodified); Arcus package `ck-mc` seq 11, four targets | The `mc` entry in the index is a stale alpha (0.1.0). | Built from upstream tag; Cloudhome is the target builder |
 | `ck-claustrum` | upstream `master` merge, reports 0.1.3 (module version; NOT the `@cortexkit/claustrum-client` npm library, which is 0.9.x/0.10.x and a different artifact). Arcus package `ck-claustrum` 0.1.3-ucs.1 seq 1 is published (darwin-arm64) | The published 0.1.3 predates the launch-nonce fix and is rejected by the daemon (`reserved_module`). `ck setup claustrum` would install a module that crash-loops. Wait for a fixed upstream release. | Source build until then |
 | `ck-entorhinal` | 0.1.20 (upstream HEAD, unmodified) | Nothing is published. | Source build |
 | `ck-uc-discussions` | 0.1.1 (Arcus package `uc-discussions`, seq 3, published) | Ours. | Arcus package `uc-discussions` |
