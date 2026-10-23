@@ -14,6 +14,7 @@ use subc_protocol::{
     ModuleHelloAckBody,
 };
 
+use crate::service::inbox::InboxService;
 use crate::{
     protocol::{
         council::{
@@ -60,6 +61,10 @@ pub fn manifest() -> ModuleManifest {
                 mutate("council.evaluate"),
                 mutate("council.reconcile"),
                 query("council.get"),
+                mutate("inbox.post"),
+                mutate("inbox.withdraw"),
+                query("inbox.list"),
+                query("inbox.read"),
             ],
             config_schema: json!({
                 "type": "object",
@@ -93,6 +98,7 @@ struct HandlerState {
     peer: PeerService,
     rooms: RoomsService,
     council: CouncilService,
+    inbox: InboxService,
 }
 
 impl HandlerState {
@@ -101,6 +107,7 @@ impl HandlerState {
             peer: PeerService::new(storage.clone()),
             rooms: RoomsService::new(storage.clone()),
             council: CouncilService::new(storage.clone()),
+            inbox: InboxService::new(storage.clone()),
             storage,
         }
     }
@@ -212,6 +219,18 @@ impl DiscussionsHandler {
             }),
             "council.get" => dispatch_typed(params, |request: GetCouncilRequest| {
                 state.council.get(request)
+            }),
+            "inbox.post" => dispatch_typed(params, |request: cortexkit_role_agent_inbox::post::PostRequest| {
+                state.inbox.post(request)
+            }),
+            "inbox.withdraw" => dispatch_typed(params, |request: cortexkit_role_agent_inbox::withdraw::WithdrawRequest| {
+                state.inbox.withdraw(request)
+            }),
+            "inbox.list" => dispatch_typed(params, |request: cortexkit_role_agent_inbox::read::ListRequest| {
+                state.inbox.list(request)
+            }),
+            "inbox.read" => dispatch_typed(params, |request: cortexkit_role_agent_inbox::read::ReadRequest| {
+                state.inbox.read(request)
             }),
             _ => handler_error(
                 "unknown_operation",

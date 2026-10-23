@@ -6,7 +6,7 @@ use rusqlite::OptionalExtension;
 
 use super::StorageError;
 
-const LATEST_SCHEMA_VERSION: i64 = 2;
+const LATEST_SCHEMA_VERSION: i64 = 3;
 
 const MIGRATION_001: &str = r#"
 CREATE TABLE leases (
@@ -147,6 +147,31 @@ ALTER TABLE room_members ADD COLUMN delivery_mode TEXT;
 ALTER TABLE room_members ADD COLUMN incarnation INTEGER;
 "#;
 
+const MIGRATION_003: &str = r#"
+CREATE TABLE agent_inbox_items (
+    item_id TEXT PRIMARY KEY,
+    idempotency_key TEXT NOT NULL,
+    replace_key TEXT,
+    scope_ref TEXT,
+    scope_epoch INTEGER,
+    flow_id TEXT,
+    target_agent TEXT NOT NULL,
+    attention TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending',
+    body TEXT NOT NULL,
+    data_json TEXT,
+    deliver_after_ms INTEGER,
+    expires_at_ms INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(target_agent, idempotency_key)
+);
+CREATE INDEX idx_inbox_replace
+    ON agent_inbox_items(target_agent, replace_key) WHERE replace_key IS NOT NULL;
+CREATE INDEX idx_inbox_target_state
+    ON agent_inbox_items(target_agent, state);
+"#;
+
 pub(super) fn run(connection: &mut Connection) -> Result<(), StorageError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
@@ -182,6 +207,14 @@ pub(super) fn run(connection: &mut Connection) -> Result<(), StorageError> {
         transaction.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
             params![2, Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)],
+        )?;
+    }
+
+    if current_version < 3 {
+        transaction.execute_batch(MIGRATION_003)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            params![3, Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)],
         )?;
     }
 

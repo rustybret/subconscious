@@ -70,6 +70,10 @@ fn manifest_declares_all_management_surface_operations() {
             "council.evaluate",
             "council.reconcile",
             "council.get",
+            "inbox.post",
+            "inbox.withdraw",
+            "inbox.list",
+            "inbox.read",
         ]
     );
 }
@@ -250,4 +254,41 @@ fn unknown_operation_returns_clear_error() {
         }
         other => panic!("expected unknown-operation error, got {other:?}"),
     }
+}
+
+#[test]
+fn inbox_dispatch_posts_and_reads_item() {
+    let handler = DiscussionsHandler::default();
+    let post_req = serde_json::json!({
+        "op": "inbox.post",
+        "params": {
+            "scope": {
+                "scope_ref": "test-scope",
+                "epoch": 1
+            },
+            "notice": {
+                "idempotency_key": "dispatch-test-1",
+                "content": {
+                    "text": "Hello via SubC Dispatch"
+                },
+                "attention": "silent"
+            }
+        }
+    });
+
+    let outcome = dispatch(&handler, post_req);
+    let post_reply: serde_json::Value = response(outcome);
+    assert_eq!(post_reply["state"], "accepted");
+    let item_id = post_reply["item_id"].as_str().expect("item_id");
+
+    let read_req = serde_json::json!({
+        "op": "inbox.read",
+        "params": {
+            "item_id": item_id
+        }
+    });
+    let read_reply: serde_json::Value = response(dispatch(&handler, read_req));
+    let item = read_reply["item"].as_object().expect("item object");
+    assert_eq!(item["item_id"], item_id);
+    assert!(item["body"].as_str().unwrap().contains("Hello via SubC Dispatch"));
 }

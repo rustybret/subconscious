@@ -248,6 +248,7 @@ mod tests {
         let storage = Storage::open_in_memory().expect("open storage");
         let mut connection = storage.lock_connection().expect("lock connection");
         let expected_tables = [
+            "agent_inbox_items",
             "council_member_states",
             "council_runs",
             "leases",
@@ -266,7 +267,7 @@ mod tests {
 
         assert_eq!(
             migrations::applied_version(&connection).expect("read migration version"),
-            Some(2)
+            Some(3)
         );
         let mut statement = connection
             .prepare(
@@ -296,7 +297,7 @@ mod tests {
                 row.get(0)
             })
             .expect("count migrations after rerun");
-        assert_eq!(before, 2);
+        assert_eq!(before, 3);
         assert_eq!(after, before);
     }
 

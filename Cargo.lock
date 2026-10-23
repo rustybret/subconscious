@@ -158,6 +158,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57e7ea934b88f1cd195c79fdeb56bda1a4595252a444eba543689fda561ea7a4"
 
 [[package]]
+name = "cortexkit-role-agent-inbox"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b421c0a5a0891087071f4edaccedde18a592506c5a79057b114619b8664b21d8"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cortexkit-store-types"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1061,6 +1071,7 @@ name = "uc-discussions"
 version = "0.1.1"
 dependencies = [
  "chrono",
+ "cortexkit-role-agent-inbox",
  "cortexkit-store-types",
  "cortexkit-test-support",
  "rusqlite",

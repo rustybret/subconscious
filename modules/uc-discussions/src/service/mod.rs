@@ -5,6 +5,7 @@ use thiserror::Error;
 use crate::StorageError;
 
 pub mod council;
+pub mod inbox;
 pub mod peer;
 pub mod rooms;
 

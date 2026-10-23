@@ -40,3 +40,4 @@ packaging/arcus/toolchain/
 
 # Nested checkout of the claustrum fork (its own git repo, registered as its own project); never part of this repo
 /claustrum/
+/.tmp/

@@ -1,0 +1,12 @@
+[submodule "submodules/entorhinal"]
+	path = submodules/entorhinal
+	url = https://github.com/cortexkit/entorhinal.git
+[submodule "submodules/claustrum"]
+	path = submodules/claustrum
+	url = https://github.com/cortexkit/claustrum.git
+[submodule "submodules/fusiform"]
+	path = submodules/fusiform
+	url = https://github.com/cortexkit/fusiform.git
+[submodule "submodules/astrocyte"]
+	path = submodules/astrocyte
+	url = https://github.com/cortexkit/astrocyte.git

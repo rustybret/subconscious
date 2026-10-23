@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod cli;
 pub mod module;
 pub mod protocol;
 pub mod service;
