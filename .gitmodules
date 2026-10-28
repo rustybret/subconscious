@@ -10,3 +10,6 @@
 [submodule "submodules/astrocyte"]
 	path = submodules/astrocyte
 	url = https://github.com/cortexkit/astrocyte.git
+[submodule "submodules/insula"]
+	path = submodules/insula
+	url = https://github.com/cortexkit/insula.git
