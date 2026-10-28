@@ -1,20 +1,25 @@
 #![forbid(unsafe_code)]
 
-use std::sync::{RwLock, TryLockError};
+use std::{
+    collections::HashMap,
+    sync::{RwLock, TryLockError},
+};
 
 use cortexkit_store_types::StorageDescriptor;
 use serde::{de::DeserializeOwned, Serialize};
 use serde_json::{json, Value};
-use subc_client_rs::{async_trait, HandlerOutcome, ModuleHandler, RequestCtx};
+use subc_client_rs::{async_trait, BindDecision, HandlerOutcome, ModuleHandler, RequestCtx, RouteBindRequest, RouteHandle};
 use subc_protocol::{
     manifest::{
-        Concurrency, ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole,
+        CapabilityDeclarations, Concurrency, ManagementOperation, ManagementOperationKind,
+        ModuleManifest, ProviderRole,
     },
     session::{HealthReport, HealthStatus},
-    ModuleHelloAckBody,
+    ModuleHelloAckBody, Principal,
 };
 
-use crate::service::inbox::InboxService;
+use crate::protocol::host::{HostFeedLivenessRequest, HostRegisterSessionRequest};
+use crate::service::{host::HostService, inbox::InboxService};
 use crate::{
     protocol::{
         council::{
@@ -38,6 +43,11 @@ const MODULE_ID: &str = "uc-discussions";
 
 pub fn manifest() -> ModuleManifest {
     ModuleManifest::builder(MODULE_ID, env!("CARGO_PKG_VERSION"))
+        .capabilities(Some(CapabilityDeclarations {
+            provides: vec!["agent-host/v1".to_owned()],
+            requires: Vec::new(),
+            must_never_reach: Vec::new(),
+        }))
         .provides(vec![ProviderRole::ManagementSurface {
             operations: vec![
                 mutate("peer.enqueue_message"),
@@ -65,6 +75,8 @@ pub fn manifest() -> ModuleManifest {
                 mutate("inbox.withdraw"),
                 query("inbox.list"),
                 query("inbox.read"),
+                mutate("host.register_session"),
+                mutate("host.feed_liveness"),
             ],
             config_schema: json!({
                 "type": "object",
@@ -99,6 +111,7 @@ struct HandlerState {
     rooms: RoomsService,
     council: CouncilService,
     inbox: InboxService,
+    host: HostService,
 }
 
 impl HandlerState {
@@ -108,6 +121,7 @@ impl HandlerState {
             rooms: RoomsService::new(storage.clone()),
             council: CouncilService::new(storage.clone()),
             inbox: InboxService::new(storage.clone()),
+            host: HostService::with_default_forwarder(storage.clone()),
             storage,
         }
     }
@@ -116,6 +130,7 @@ impl HandlerState {
 pub struct DiscussionsHandler {
     state: RwLock<HandlerState>,
     storage_error: RwLock<Option<String>>,
+    route_principals: RwLock<HashMap<RouteHandle, Principal>>,
 }
 
 impl DiscussionsHandler {
@@ -123,6 +138,7 @@ impl DiscussionsHandler {
         Self {
             state: RwLock::new(HandlerState::new(storage)),
             storage_error: RwLock::new(None),
+            route_principals: RwLock::new(HashMap::new()),
         }
     }
 
@@ -138,6 +154,10 @@ impl DiscussionsHandler {
     }
 
     pub fn dispatch(&self, body: &[u8]) -> HandlerOutcome {
+        self.dispatch_with_caller(body, None)
+    }
+
+    pub fn dispatch_with_caller(&self, body: &[u8], caller: Option<&Principal>) -> HandlerOutcome {
         if let Some(message) = self.current_storage_error() {
             return handler_error("storage_initialization_failed", message);
         }
@@ -232,6 +252,12 @@ impl DiscussionsHandler {
             "inbox.read" => dispatch_typed(params, |request: cortexkit_role_agent_inbox::read::ReadRequest| {
                 state.inbox.read(request)
             }),
+            "host.register_session" => dispatch_typed(params, |request: HostRegisterSessionRequest| {
+                state.host.register_session(caller, request)
+            }),
+            "host.feed_liveness" => dispatch_typed(params, |request: HostFeedLivenessRequest| {
+                state.host.feed_liveness(caller, request)
+            }),
             _ => handler_error(
                 "unknown_operation",
                 format!("unknown operation '{operation}'"),
@@ -278,8 +304,22 @@ impl Default for DiscussionsHandler {
 
 #[async_trait]
 impl ModuleHandler for DiscussionsHandler {
-    async fn handle(&self, _ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
-        self.dispatch(&body)
+    async fn on_bind(&self, request: &RouteBindRequest) -> BindDecision {
+        if let Some(principal) = &request.principal {
+            if let Ok(mut map) = self.route_principals.write() {
+                map.insert(request.handle, principal.clone());
+            }
+        }
+        BindDecision::accept()
+    }
+
+    async fn handle(&self, ctx: RequestCtx, body: Vec<u8>) -> HandlerOutcome {
+        let principal = self
+            .route_principals
+            .read()
+            .ok()
+            .and_then(|map| map.get(&ctx.route_handle()).cloned());
+        self.dispatch_with_caller(&body, principal.as_ref())
     }
 
     async fn on_hello_ack(&self, ack: &ModuleHelloAckBody) {
@@ -390,6 +430,7 @@ fn service_error(error: ServiceError) -> HandlerOutcome {
         ServiceError::NotFound(message) => handler_error("not_found", message),
         ServiceError::InvalidRequest(message) => handler_error("invalid_request", message),
         ServiceError::Conflict(message) => handler_error("conflict", message),
+        ServiceError::CallerForbidden(message) => handler_error("caller_forbidden", message),
         ServiceError::NotRoomMember { room_id, member_id } => handler_error(
             "not_room_member",
             format!("member {member_id} is not in room {room_id}"),

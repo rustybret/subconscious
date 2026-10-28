@@ -7,6 +7,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use rusqlite::{params, OptionalExtension};
 use serde_json::json;
 
 use crate::{
@@ -34,6 +35,7 @@ options:
   --store <path>            sqlite store path (default: ~/.local/share/cortexkit/uc-discussions/store.db)
   --author <name>           author for post (default: operator)
   --type <type>             post type (default: position)
+  --incarnation <n>         member incarnation fence (auto-resolved if bound)
   --json                    print raw JSON response
   -V, --version             print version
   -h, --help                print help
@@ -47,6 +49,7 @@ struct ParsedArgs {
     _subc_path: Option<PathBuf>,
     author: Option<String>,
     post_type: Option<String>,
+    incarnation: Option<i64>,
     json: bool,
     ck_domain: bool,
     version: bool,
@@ -81,6 +84,11 @@ fn parse_cli_args<I: IntoIterator<Item = String>>(args: I) -> ParsedArgs {
             "--type" => {
                 if let Some(val) = iter.next() {
                     parsed.post_type = Some(val);
+                }
+            }
+            "--incarnation" => {
+                if let Some(val) = iter.next() {
+                    parsed.incarnation = val.parse::<i64>().ok();
                 }
             }
             cmd if !cmd.starts_with('-') && parsed.command.is_none() => {
@@ -146,7 +154,7 @@ pub fn run_cli<I: IntoIterator<Item = String>>(args: I) -> Result<bool, Box<dyn 
             let content = parsed.subcommand_args.get(1).ok_or("post command requires <content>")?;
             let author = parsed.author.as_deref().unwrap_or("operator");
             let post_type = parsed.post_type.as_deref().unwrap_or("position");
-            cmd_post(&store_path, room_id, author, post_type, content, parsed.json)?;
+            cmd_post(&store_path, room_id, author, post_type, content, parsed.incarnation, parsed.json)?;
         }
         "help" => {
             print!("{USAGE}");
@@ -349,16 +357,30 @@ fn cmd_post(
     author: &str,
     post_type: &str,
     content: &str,
+    incarnation: Option<i64>,
     json_output: bool,
 ) -> Result<(), Box<dyn Error>> {
     let storage = open_storage_checked(path)?;
+    let effective_incarnation = match incarnation {
+        Some(inc) => Some(inc),
+        None => {
+            let conn = storage.lock_connection()?;
+            conn.query_row(
+                "SELECT incarnation FROM room_members WHERE room_id = ?1 AND member_id = ?2",
+                params![room_id, author],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten()
+        }
+    };
     let service = RoomsService::new(storage);
     let resp = service.post(PostRoomRequest {
         room_id: room_id.to_owned(),
         author: author.to_owned(),
         post_type: post_type.to_owned(),
         content: content.to_owned(),
-        incarnation: None,
+        incarnation: effective_incarnation,
         reply_to_post_id: None,
     })?;
 
@@ -368,4 +390,91 @@ fn cmd_post(
         println!("Turn posted: seq={} post_id={}", resp.seq, resp.post.post_id);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::rooms::{BindRoomMemberRequest, CreateRoomRequest, JoinRoomRequest};
+    use uuid::Uuid;
+
+    #[test]
+    fn parse_cli_args_parses_incarnation() {
+        let args = vec![
+            "ck-discussions".to_owned(),
+            "post".to_owned(),
+            "room-1".to_owned(),
+            "hello".to_owned(),
+            "--incarnation".to_owned(),
+            "42".to_owned(),
+        ];
+        let parsed = parse_cli_args(args);
+        assert_eq!(parsed.incarnation, Some(42));
+
+        let args_invalid = vec![
+            "ck-discussions".to_owned(),
+            "post".to_owned(),
+            "--incarnation".to_owned(),
+            "not-a-number".to_owned(),
+        ];
+        let parsed_invalid = parse_cli_args(args_invalid);
+        assert_eq!(parsed_invalid.incarnation, None);
+
+        let args_omitted = vec!["ck-discussions".to_owned(), "post".to_owned()];
+        let parsed_omitted = parse_cli_args(args_omitted);
+        assert_eq!(parsed_omitted.incarnation, None);
+    }
+
+    #[test]
+    fn cmd_post_auto_resolves_bound_incarnation_and_respects_explicit_override() {
+        let db_path = std::env::temp_dir().join(format!("test-ck-disc-cli-{}.db", Uuid::new_v4()));
+        let storage = Storage::open_path(&db_path).expect("open temp storage");
+        let service = RoomsService::new(storage);
+
+        let room = service
+            .create_room(CreateRoomRequest {
+                topic: "Test CLI post incarnation".to_owned(),
+                goal: "Verify auto-resolved and explicit incarnation".to_owned(),
+                stage: "discussion".to_owned(),
+                creator: "operator".to_owned(),
+            })
+            .expect("create room");
+
+        service
+            .join_room(JoinRoomRequest {
+                room_id: room.room_id.clone(),
+                member_id: "agent-a".to_owned(),
+                role: "colleague".to_owned(),
+            })
+            .expect("join room");
+
+        service
+            .bind_member(BindRoomMemberRequest {
+                room_id: room.room_id.clone(),
+                member_id: "agent-a".to_owned(),
+                project_id: "pj-a".to_owned(),
+                session_id: "ses-a-1".to_owned(),
+                agent: "athena".to_owned(),
+                model: "model-1".to_owned(),
+                delivery_mode: "direct".to_owned(),
+                incarnation: 5,
+            })
+            .expect("bind member");
+
+        // 1. None passed: cmd_post auto-resolves incarnation = 5 and succeeds
+        let res_auto = cmd_post(&db_path, &room.room_id, "agent-a", "position", "turn 1", None, true);
+        assert!(res_auto.is_ok(), "auto-resolved incarnation should succeed: {:?}", res_auto);
+
+        // 2. Explicit incorrect incarnation passed (1 != 5): fails with StaleIncarnation
+        let res_stale = cmd_post(&db_path, &room.room_id, "agent-a", "position", "turn 2", Some(1), true);
+        assert!(res_stale.is_err(), "stale explicit incarnation must be rejected");
+
+        // 3. Explicit matching incarnation passed (5 == 5): succeeds
+        let res_exact = cmd_post(&db_path, &room.room_id, "agent-a", "position", "turn 3", Some(5), true);
+        assert!(res_exact.is_ok(), "matching explicit incarnation must succeed: {:?}", res_exact);
+
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_file(format!("{}-wal", db_path.display()));
+        let _ = fs::remove_file(format!("{}-shm", db_path.display()));
+    }
 }

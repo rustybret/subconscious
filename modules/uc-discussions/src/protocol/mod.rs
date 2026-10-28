@@ -2,6 +2,7 @@
 
 pub mod council;
 pub mod peer;
+pub mod host;
 pub mod rooms;
 
 #[cfg(test)]

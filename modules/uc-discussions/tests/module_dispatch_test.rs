@@ -4,10 +4,12 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use subc_client_rs::HandlerOutcome;
 use subc_protocol::manifest::{Concurrency, ProviderRole};
+use subc_protocol::Principal;
 use uc_discussions::{
     manifest,
     protocol::{
         council::{EvaluateCouncilResponse, ReconcileCouncilResponse, StageCouncilResponse},
+        host::{HostFeedLivenessResponse, HostRegisterSessionResponse},
         peer::{EnqueueMessageResponse, PollInboxResponse},
         rooms::{CreateRoomResponse, PostRoomResponse},
     },
@@ -74,7 +76,13 @@ fn manifest_declares_all_management_surface_operations() {
             "inbox.withdraw",
             "inbox.list",
             "inbox.read",
+            "host.register_session",
+            "host.feed_liveness",
         ]
+    );
+    assert_eq!(
+        manifest.capabilities.unwrap().provides,
+        vec!["agent-host/v1".to_owned()]
     );
 }
 
@@ -292,3 +300,65 @@ fn inbox_dispatch_posts_and_reads_item() {
     assert_eq!(item["item_id"], item_id);
     assert!(item["body"].as_str().unwrap().contains("Hello via SubC Dispatch"));
 }
+
+#[test]
+fn host_relay_dispatch_checks_authorization_and_forwards() {
+    use subc_protocol::Principal;
+
+    let handler = DiscussionsHandler::default();
+    let register_req = json!({
+        "op": "host.register_session",
+        "params": {
+            "agent_id": "athena-junior",
+            "ref_kind": "opencode-session",
+            "ref": "subconscious:athena",
+            "harness": "opencode",
+            "session_id": "ses_12345",
+            "project_root": "/workspace/subconscious"
+        }
+    });
+    let req_bytes = serde_json::to_vec(&register_req).unwrap();
+
+    // 1. Unauthenticated caller is rejected with caller_forbidden
+    let unauth_outcome = handler.dispatch_with_caller(&req_bytes, None);
+    match unauth_outcome {
+        HandlerOutcome::Error { code, message } => {
+            assert_eq!(code, "caller_forbidden");
+            assert!(message.contains("unauthenticated caller"));
+        }
+        other => panic!("expected caller_forbidden error, got {other:?}"),
+    }
+
+    // 2. Direct caller is authorized
+    let direct_caller = Principal::Direct;
+    let auth_outcome = handler.dispatch_with_caller(&req_bytes, Some(&direct_caller));
+    let reg_reply: Value = response(auth_outcome);
+    assert_eq!(reg_reply["ok"], true);
+    assert_eq!(reg_reply["registered"], true);
+    assert_eq!(reg_reply["session_id"], "ses_12345");
+
+    // 3. Liveness feed snapshot with direct caller
+    let feed_req = json!({
+        "op": "host.feed_liveness",
+        "params": {
+            "seq": 1,
+            "snapshot": true,
+            "sessions": [
+                {
+                    "harness": "opencode",
+                    "sessionId": "ses_12345",
+                    "canonicalRoot": "/workspace/subconscious",
+                    "state": "active",
+                    "lastActivityMs": 1793140000000_i64
+                }
+            ]
+        }
+    });
+    let feed_bytes = serde_json::to_vec(&feed_req).unwrap();
+    let feed_outcome = handler.dispatch_with_caller(&feed_bytes, Some(&direct_caller));
+    let feed_reply: Value = response(feed_outcome);
+    assert_eq!(feed_reply["accepted"], true);
+    assert_eq!(feed_reply["snapshotRequested"], false);
+    assert_eq!(feed_reply["tracked"], 1);
+}
+

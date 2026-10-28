@@ -7,6 +7,7 @@ use crate::StorageError;
 pub mod council;
 pub mod inbox;
 pub mod peer;
+pub mod host;
 pub mod rooms;
 
 #[derive(Debug, Error)]
@@ -19,6 +20,8 @@ pub enum ServiceError {
     InvalidRequest(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    #[error("caller forbidden: {0}")]
+    CallerForbidden(String),
     #[error("member {member_id} is not in room {room_id}")]
     NotRoomMember { room_id: String, member_id: String },
     #[error(

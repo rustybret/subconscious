@@ -4,6 +4,14 @@ Arcus package `uc-discussions` (binary `ck-uc-discussions`). Versions are displa
 
 ## 0.1.2 (unreleased)
 
+- Agent Host Relay: implemented `agent-host/v1` provider capability relay in `ck-uc-discussions`:
+  - ManagementSurface operations `host.register_session` and `host.feed_liveness` for relaying OpenCode host session bindings and liveness batches into Entorhinal.
+  - Inbound route caller authorization: checks route principal, restricting host mutations to direct local callers or admitted host principals and rejecting unauthenticated/untrusted routes with `caller_forbidden`.
+  - OpenCode 1 parameter validation: strictly requires `harness: "opencode"` and valid session references.
+  - Volatile mirror feed tracker: validates monotonic sequence numbers and latches `snapshot_requested: true` on sequence gaps or initial startup.
+  - Manifest declares `capabilities.provides = ["agent-host/v1"]`.
+- CLI Incarnation Auto-Resolution: `ck discussions post` now automatically inspects `room_members` to resolve the expected incarnation for bound members when omitted, eliminating `StaleIncarnation` rejections on CLI turn posts, and adds an explicit `--incarnation <N>` override flag with unit test coverage.
+
 - Agent Inbox: native implementation of the `agent-inbox/v1` wire specification (`cortexkit-role-agent-inbox` 0.1.0) alongside `peer.*`:
   - `inbox.post` with envelope neutralization (`neutralize`, U+2039 swap), 16 KiB size cap enforcement, `(target_agent, idempotency_key)` deduplication replay, and `replace_key` supersession.
   - `inbox.withdraw` for retiring pending notices.
