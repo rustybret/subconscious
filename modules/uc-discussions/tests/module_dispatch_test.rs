@@ -9,7 +9,6 @@ use uc_discussions::{
     manifest,
     protocol::{
         council::{EvaluateCouncilResponse, ReconcileCouncilResponse, StageCouncilResponse},
-        host::{HostFeedLivenessResponse, HostRegisterSessionResponse},
         peer::{EnqueueMessageResponse, PollInboxResponse},
         rooms::{CreateRoomResponse, PostRoomResponse},
     },
@@ -303,8 +302,7 @@ fn inbox_dispatch_posts_and_reads_item() {
 
 #[test]
 fn host_relay_dispatch_checks_authorization_and_forwards() {
-    use subc_protocol::Principal;
-
+    
     let handler = DiscussionsHandler::default();
     let register_req = json!({
         "op": "host.register_session",
