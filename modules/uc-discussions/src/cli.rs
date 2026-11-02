@@ -229,7 +229,7 @@ fn cmd_list(path: &Path, json_output: bool) -> Result<(), Box<dyn Error>> {
     let connection = storage.lock_connection()?;
 
     let mut stmt = connection.prepare(
-        "SELECT room_id, topic, goal, stage, status, created_at FROM rooms ORDER BY created_at DESC LIMIT 50"
+        "SELECT room_id, topic, goal, stage, status, created_at, closed_reason, closed_by FROM rooms ORDER BY created_at DESC LIMIT 50"
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(json!({
@@ -239,6 +239,8 @@ fn cmd_list(path: &Path, json_output: bool) -> Result<(), Box<dyn Error>> {
             "stage": row.get::<_, String>(3)?,
             "status": row.get::<_, String>(4)?,
             "created_at": row.get::<_, String>(5)?,
+            "closed_reason": row.get::<_, Option<String>>(6)?,
+            "closed_by": row.get::<_, Option<String>>(7)?,
         }))
     })?.collect::<Result<Vec<_>, _>>()?;
 
@@ -252,14 +254,15 @@ fn cmd_list(path: &Path, json_output: bool) -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    println!("{:<38} {:<10} {:<12} {}", "ROOM ID", "STATUS", "STAGE", "TOPIC");
-    println!("{}", "-".repeat(80));
+    println!("{:<38} {:<10} {:<12} {:<16} {}", "ROOM ID", "STATUS", "STAGE", "REASON", "TOPIC");
+    println!("{}", "-".repeat(95));
     for r in rows {
         let room_id = r["room_id"].as_str().unwrap_or("-");
         let status = r["status"].as_str().unwrap_or("-");
         let stage = r["stage"].as_str().unwrap_or("-");
+        let reason = r["closed_reason"].as_str().unwrap_or("-");
         let topic = r["topic"].as_str().unwrap_or("-");
-        println!("{:<38} {:<10} {:<12} {}", room_id, status, stage, topic);
+        println!("{:<38} {:<10} {:<12} {:<16} {}", room_id, status, stage, reason, topic);
     }
     Ok(())
 }
@@ -283,6 +286,12 @@ fn cmd_room(path: &Path, room_id: &str, json_output: bool) -> Result<(), Box<dyn
     println!("Created:     {}", resp.created_at);
     if let Some(closed) = resp.closed_at {
         println!("Closed:      {}", closed);
+    }
+    if let Some(reason) = resp.closed_reason {
+        println!("Reason:      {}", reason);
+    }
+    if let Some(closed_by) = resp.closed_by {
+        println!("Closed by:   {}", closed_by);
     }
 
     if !resp.decisions.is_empty() {

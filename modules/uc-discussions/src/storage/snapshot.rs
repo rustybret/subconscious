@@ -36,6 +36,10 @@ pub struct RoomRecord {
     pub created_at: String,
     pub closed_at: Option<String>,
     pub outcome_json: Option<String>,
+    #[serde(default)]
+    pub closed_reason: Option<String>,
+    #[serde(default)]
+    pub closed_by: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,7 +205,7 @@ impl Storage {
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut rooms_stmt = connection.prepare(
-            "SELECT room_id, topic, goal, stage, active_grantee, status, created_at, closed_at, outcome_json
+            "SELECT room_id, topic, goal, stage, active_grantee, status, created_at, closed_at, outcome_json, closed_reason, closed_by
              FROM rooms ORDER BY room_id ASC",
         )?;
         let rooms = rooms_stmt
@@ -216,6 +220,8 @@ impl Storage {
                     created_at: row.get(6)?,
                     closed_at: row.get(7)?,
                     outcome_json: row.get(8)?,
+                    closed_reason: row.get(9)?,
+                    closed_by: row.get(10)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -441,8 +447,8 @@ impl Storage {
         {
             let mut stmt = transaction.prepare(
                 "INSERT OR REPLACE INTO rooms (
-                    room_id, topic, goal, stage, active_grantee, status, created_at, closed_at, outcome_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    room_id, topic, goal, stage, active_grantee, status, created_at, closed_at, outcome_json, closed_reason, closed_by
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?;
             for r in &snapshot.rooms {
                 stmt.execute(params![
@@ -454,7 +460,9 @@ impl Storage {
                     r.status,
                     r.created_at,
                     r.closed_at,
-                    r.outcome_json
+                    r.outcome_json,
+                    r.closed_reason,
+                    r.closed_by
                 ])?;
             }
         }

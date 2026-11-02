@@ -271,11 +271,15 @@ mod tests {
             decisions: vec!["Ship after verification".into()],
             dissent: vec!["Prefer another review".into()],
             outstanding_actions: vec!["Run release checks".into()],
+            reason: Some("agreed".into()),
+            closed_by: Some("uc-studio-8ce41322".into()),
         });
         assert_round_trip(CloseRoomResponse {
             room_id: "room-1".into(),
             status: "closed".into(),
             closed_at: "2026-09-19T00:05:00Z".into(),
+            closed_reason: Some("agreed".into()),
+            closed_by: Some("uc-studio-8ce41322".into()),
         });
         assert_round_trip(GetRoomRequest {
             room_id: "room-1".into(),
@@ -289,6 +293,8 @@ mod tests {
             status: "closed".into(),
             created_at: "2026-09-19T00:00:00Z".into(),
             closed_at: Some("2026-09-19T00:05:00Z".into()),
+            closed_reason: Some("agreed".into()),
+            closed_by: Some("uc-studio-8ce41322".into()),
             decisions: vec!["Ship after verification".into()],
             dissent: vec!["Prefer another review".into()],
             outstanding_actions: vec!["Run release checks".into()],

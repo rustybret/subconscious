@@ -4,6 +4,13 @@ Arcus package `uc-discussions` (binary `ck-uc-discussions`). Versions are displa
 
 ## 0.1.2 (unreleased)
 
+- Room Closure Provenance & Metadata:
+  - Persists `closed_reason` (free-form string) and `closed_by` (closing principal/project ID) on the room record at close.
+  - `CloseRoomRequest` accepts `reason` (with `closed_reason` alias) and `closed_by` (with `closedBy` alias), maintaining backward-compatible zero-downtime support for existing callers.
+  - `CloseRoomResponse` and `GetRoomResponse` expose `closed_reason` and `closed_by`.
+  - Schema migration 004 adds `closed_reason` and `closed_by` columns to the `rooms` table.
+  - Snapshot export and import preserve schema v4 closure metadata.
+  - Operator CLI (`ck discussions list` and `ck discussions room <id>`) displays closure reason and closer identity.
 - Agent Host Relay: implemented `agent-host/v1` provider capability relay in `ck-uc-discussions`:
   - ManagementSurface operations `host.register_session` and `host.feed_liveness` for relaying OpenCode host session bindings and liveness batches into Entorhinal.
   - Inbound route caller authorization: checks route principal, restricting host mutations to direct local callers or admitted host principals and rejecting unauthenticated/untrusted routes with `caller_forbidden`.

@@ -451,9 +451,9 @@ impl RoomsService {
         require_active_room(&transaction, &req.room_id)?;
         transaction.execute(
             "UPDATE rooms
-             SET status = 'closed', closed_at = ?1, outcome_json = ?2
-             WHERE room_id = ?3",
-            params![closed_at, outcome_json, req.room_id],
+             SET status = 'closed', closed_at = ?1, outcome_json = ?2, closed_reason = ?3, closed_by = ?4
+             WHERE room_id = ?5",
+            params![closed_at, outcome_json, req.reason, req.closed_by, req.room_id],
         )?;
         transaction.commit()?;
 
@@ -461,6 +461,8 @@ impl RoomsService {
             room_id: req.room_id,
             status: "closed".to_owned(),
             closed_at,
+            closed_reason: req.reason,
+            closed_by: req.closed_by,
         })
     }
 
@@ -470,7 +472,7 @@ impl RoomsService {
         let room = connection
             .query_row(
                 "SELECT room_id, topic, goal, stage, active_grantee, status, created_at,
-                        closed_at, outcome_json
+                        closed_at, outcome_json, closed_reason, closed_by
                  FROM rooms WHERE room_id = ?1",
                 params![req.room_id],
                 |row| {
@@ -484,6 +486,8 @@ impl RoomsService {
                         created_at: row.get(6)?,
                         closed_at: row.get(7)?,
                         outcome_json: row.get(8)?,
+                        closed_reason: row.get(9)?,
+                        closed_by: row.get(10)?,
                     })
                 },
             )
@@ -510,6 +514,8 @@ impl RoomsService {
             status: room.status,
             created_at: room.created_at,
             closed_at: room.closed_at,
+            closed_reason: room.closed_reason,
+            closed_by: room.closed_by,
             decisions: outcome.decisions,
             dissent: outcome.dissent,
             outstanding_actions: outcome.outstanding_actions,
@@ -542,6 +548,8 @@ struct RoomRecord {
     created_at: String,
     closed_at: Option<String>,
     outcome_json: Option<String>,
+    closed_reason: Option<String>,
+    closed_by: Option<String>,
 }
 
 fn require_room(connection: &Connection, room_id: &str) -> Result<String, ServiceError> {
@@ -1095,6 +1103,8 @@ mod tests {
                 decisions: decisions.clone(),
                 dissent: dissent.clone(),
                 outstanding_actions: actions.clone(),
+                reason: None,
+                closed_by: None,
             })
             .expect("close room");
         assert_eq!(closed.status, "closed");
@@ -1236,6 +1246,8 @@ mod tests {
                 decisions: vec!["replace original decision".to_owned()],
                 dissent: vec!["replace original dissent".to_owned()],
                 outstanding_actions: vec!["replace original action".to_owned()],
+                reason: None,
+                closed_by: None,
             })
         });
     }
@@ -1270,6 +1282,8 @@ mod tests {
                 decisions: Vec::new(),
                 dissent: Vec::new(),
                 outstanding_actions: Vec::new(),
+                reason: None,
+                closed_by: None,
             })
             .expect("close room");
 

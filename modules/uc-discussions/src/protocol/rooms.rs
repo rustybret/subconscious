@@ -209,6 +209,10 @@ pub struct CloseRoomRequest {
     pub decisions: Vec<String>,
     pub dissent: Vec<String>,
     pub outstanding_actions: Vec<String>,
+    #[serde(default, alias = "closed_reason")]
+    pub reason: Option<String>,
+    #[serde(default, alias = "closedBy")]
+    pub closed_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -216,6 +220,10 @@ pub struct CloseRoomResponse {
     pub room_id: String,
     pub status: String,
     pub closed_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -233,6 +241,10 @@ pub struct GetRoomResponse {
     pub status: String,
     pub created_at: String,
     pub closed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_by: Option<String>,
     pub decisions: Vec<String>,
     pub dissent: Vec<String>,
     pub outstanding_actions: Vec<String>,

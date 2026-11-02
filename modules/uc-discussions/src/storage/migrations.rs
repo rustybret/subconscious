@@ -6,7 +6,7 @@ use rusqlite::OptionalExtension;
 
 use super::StorageError;
 
-const LATEST_SCHEMA_VERSION: i64 = 3;
+const LATEST_SCHEMA_VERSION: i64 = 4;
 
 const MIGRATION_001: &str = r#"
 CREATE TABLE leases (
@@ -172,6 +172,11 @@ CREATE INDEX idx_inbox_target_state
     ON agent_inbox_items(target_agent, state);
 "#;
 
+const MIGRATION_004: &str = r#"
+ALTER TABLE rooms ADD COLUMN closed_reason TEXT;
+ALTER TABLE rooms ADD COLUMN closed_by TEXT;
+"#;
+
 pub(super) fn run(connection: &mut Connection) -> Result<(), StorageError> {
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     transaction.execute_batch(
@@ -217,6 +222,14 @@ pub(super) fn run(connection: &mut Connection) -> Result<(), StorageError> {
             params![3, Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)],
         )?;
     }
+    if current_version < 4 {
+        transaction.execute_batch(MIGRATION_004)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            params![4, Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)],
+        )?;
+    }
+
 
     transaction.commit()?;
     Ok(())

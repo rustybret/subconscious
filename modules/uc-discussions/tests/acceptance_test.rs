@@ -355,3 +355,155 @@ fn end_to_end_deliberation_and_closure_with_attributable_decisions_and_dissent()
     // Active grantee verification
     assert_eq!(room.active_grantee.as_deref(), Some("agent-a"));
 }
+
+#[test]
+fn room_close_persists_reason_and_closer_and_returns_them_from_get() {
+    let handler = DiscussionsHandler::default();
+
+    // 1. Create a room and verify get_room returns None for closed_reason and closed_by while active
+    let create_resp: CreateRoomResponse = response(dispatch(
+        &handler,
+        json!({
+            "op": "rooms.create",
+            "params": {
+                "topic": "Reason Persistence Test",
+                "goal": "Verify closed_reason and closed_by",
+                "stage": "discussion",
+                "creator": "coordinator"
+            }
+        }),
+    ));
+    let room_id = create_resp.room_id;
+
+    let active_room: GetRoomResponse = response(dispatch(
+        &handler,
+        json!({
+            "op": "rooms.get",
+            "params": {
+                "room_id": &room_id
+            }
+        }),
+    ));
+    assert_eq!(active_room.status, "active");
+    assert_eq!(active_room.closed_reason, None);
+    assert_eq!(active_room.closed_by, None);
+
+    // 2. Close room with "reason" and "closed_by"
+    let close_resp: CloseRoomResponse = response(dispatch(
+        &handler,
+        json!({
+            "op": "rooms.close",
+            "params": {
+                "room_id": &room_id,
+                "decisions": ["Agreed to finalize"],
+                "dissent": [],
+                "outstanding_actions": [],
+                "reason": "agreed",
+                "closed_by": "uc-studio-8ce41322"
+            }
+        }),
+    ));
+    assert_eq!(close_resp.room_id, room_id);
+    assert_eq!(close_resp.status, "closed");
+    assert_eq!(close_resp.closed_reason.as_deref(), Some("agreed"));
+    assert_eq!(close_resp.closed_by.as_deref(), Some("uc-studio-8ce41322"));
+
+    // 3. Verify rooms.get returns the persisted closed_reason and closed_by
+    let closed_room: GetRoomResponse = response(dispatch(
+        &handler,
+        json!({
+            "op": "rooms.get",
+            "params": {
+                "room_id": &room_id
+            }
+        }),
+    ));
+    assert_eq!(closed_room.status, "closed");
+    assert_eq!(closed_room.closed_reason.as_deref(), Some("agreed"));
+    assert_eq!(closed_room.closed_by.as_deref(), Some("uc-studio-8ce41322"));
+
+    // 4. Test alias "closed_reason" as key and legacy omission on another room
+    let create_resp2: CreateRoomResponse = response(dispatch(
+        &handler,
+        json!({
+            "op": "rooms.create",
+            "params": {
+                "topic": "Alias and legacy test",
+                "goal": "Verify closed_reason alias and legacy close without reason",
+                "stage": "discussion",
+                "creator": "coordinator"
+            }
+        }),
+    ));
+    let room_id2 = create_resp2.room_id;
+
+    let close_resp2: CloseRoomResponse = response(dispatch(
+        &handler,
+        json!({
+            "op": "rooms.close",
+            "params": {
+                "room_id": &room_id2,
+                "decisions": [],
+                "dissent": [],
+                "outstanding_actions": [],
+                "closed_reason": "turn-cap",
+                "closed_by": "subconscious-770c36a2"
+            }
+        }),
+    ));
+    assert_eq!(close_resp2.closed_reason.as_deref(), Some("turn-cap"));
+    assert_eq!(close_resp2.closed_by.as_deref(), Some("subconscious-770c36a2"));
+
+    let closed_room2: GetRoomResponse = response(dispatch(
+        &handler,
+        json!({
+            "op": "rooms.get",
+            "params": {
+                "room_id": &room_id2
+            }
+        }),
+    ));
+    assert_eq!(closed_room2.closed_reason.as_deref(), Some("turn-cap"));
+    assert_eq!(closed_room2.closed_by.as_deref(), Some("subconscious-770c36a2"));
+
+    // 5. Test legacy client closing with neither field
+    let create_resp3: CreateRoomResponse = response(dispatch(
+        &handler,
+        json!({
+            "op": "rooms.create",
+            "params": {
+                "topic": "Legacy Close",
+                "goal": "Verify no-reason close",
+                "stage": "discussion",
+                "creator": "coordinator"
+            }
+        }),
+    ));
+    let room_id3 = create_resp3.room_id;
+    let close_resp3: CloseRoomResponse = response(dispatch(
+        &handler,
+        json!({
+            "op": "rooms.close",
+            "params": {
+                "room_id": &room_id3,
+                "decisions": [],
+                "dissent": [],
+                "outstanding_actions": []
+            }
+        }),
+    ));
+    assert_eq!(close_resp3.closed_reason, None);
+    assert_eq!(close_resp3.closed_by, None);
+
+    let closed_room3: GetRoomResponse = response(dispatch(
+        &handler,
+        json!({
+            "op": "rooms.get",
+            "params": {
+                "room_id": &room_id3
+            }
+        }),
+    ));
+    assert_eq!(closed_room3.closed_reason, None);
+    assert_eq!(closed_room3.closed_by, None);
+}

@@ -54,6 +54,8 @@ fn close(room_id: &str) -> CloseRoomRequest {
         decisions: Vec::new(),
         dissent: Vec::new(),
         outstanding_actions: Vec::new(),
+        reason: None,
+        closed_by: None,
     }
 }
 
