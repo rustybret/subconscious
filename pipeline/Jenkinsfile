@@ -1,0 +1,222 @@
+// pipeline/Jenkinsfile — Multi-Platform Build & Packaging Pipeline for ck-uc-discussions
+// Integrates with Cloudhome Jenkins Kubernetes agent cloud on altos-worker-01
+
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    role: rust-multiplatform-builder
+spec:
+  containers:
+  - name: rust-builder
+    image: rust:1.82-bookworm
+    command: ['cat']
+    tty: true
+    resources:
+      requests:
+        cpu: "4"
+        memory: "8Gi"
+      limits:
+        cpu: "16"
+        memory: "32Gi"
+    volumeMounts:
+    - mountPath: /root/.cargo/registry
+      name: cargo-registry
+    - mountPath: /root/.cargo/git
+      name: cargo-git
+    - mountPath: /mnt/sccache
+      name: shared-sccache
+  volumes:
+  - name: cargo-registry
+    persistentVolumeClaim:
+      claimName: jenkins-cargo-registry-pvc
+  - name: cargo-git
+    persistentVolumeClaim:
+      claimName: jenkins-cargo-git-pvc
+  - name: shared-sccache
+    persistentVolumeClaim:
+      claimName: jenkins-sccache-pvc
+'''
+        }
+    }
+
+    parameters {
+        string(name: 'PACKAGE_VERSION', defaultValue: '0.1.2', description: 'Version to package and tag')
+        string(name: 'ARCUS_SEQUENCE', defaultValue: '4', description: 'Monotonic sequence allocated from Arcus catalog')
+        booleanParam(name: 'BUILD_OCI', defaultValue: true, description: 'Publish multi-arch OCI container images')
+        booleanParam(name: 'SUBMIT_ARCUS', defaultValue: false, description: 'Submit verified bundle to Arcus gateway')
+    }
+
+    environment {
+        CARGO_TERM_COLOR = 'always'
+        RUSTFLAGS = '-D warnings'
+        SCCACHE_DIR = '/mnt/sccache'
+        RUSTC_WRAPPER = 'sccache'
+        DIST_DIR = "${WORKSPACE}/dist/${params.ARCUS_SEQUENCE}/uc-discussions/${params.PACKAGE_VERSION}"
+    }
+
+    stages {
+        stage('Initialize & Toolchain Setup') {
+            steps {
+                container('rust-builder') {
+                    sh '''
+                        echo "==> Configuring Cross-Compilation Toolchains..."
+                        rustup target add x86_64-unknown-linux-gnu \
+                                          x86_64-unknown-linux-musl \
+                                          aarch64-unknown-linux-gnu \
+                                          aarch64-unknown-linux-musl \
+                                          x86_64-pc-windows-gnu
+
+                        cargo --version
+                        rustc --version
+                        sccache --version || true
+
+                        mkdir -p "${DIST_DIR}"
+                        mkdir -p artifacts/{bin,packages,archives}
+                    '''
+                }
+            }
+        }
+
+        stage('Multi-Platform Parallel Compilation') {
+            parallel {
+                stage('Linux x86_64 (glibc & musl)') {
+                    steps {
+                        container('rust-builder') {
+                            sh '''
+                                echo "==> 1. Compiling Linux x86_64 Static (musl)..."
+                                cargo build --release --locked -p uc-discussions --target x86_64-unknown-linux-musl
+                                cp target/x86_64-unknown-linux-musl/release/ck-uc-discussions artifacts/bin/ck-uc-discussions-x86_64-musl
+
+                                echo "==> 2. Compiling Linux x86_64 Dynamic (glibc 2.31 LTS baseline)..."
+                                cargo build --release --locked -p uc-discussions --target x86_64-unknown-linux-gnu
+                                cp target/x86_64-unknown-linux-gnu/release/ck-uc-discussions artifacts/bin/ck-uc-discussions-x86_64-linux
+
+                                echo "==> 3. Generating Linux x86_64 Packages (.deb & .rpm)..."
+                                if command -v cargo-deb >/dev/null 2>&1; then
+                                    cargo deb -p uc-discussions --target x86_64-unknown-linux-gnu -o artifacts/packages/
+                                fi
+                                if command -v cargo-generate-rpm >/dev/null 2>&1; then
+                                    cargo generate-rpm -p uc-discussions --target x86_64-unknown-linux-gnu -o artifacts/packages/
+                                fi
+
+                                echo "==> 4. Packaging x86_64 Portable Tarballs (.tar.zst / .tar.gz)..."
+                                tar -C target/x86_64-unknown-linux-musl/release -czvf artifacts/archives/ck-uc-discussions-${params.PACKAGE_VERSION}-linux-x86_64-musl.tar.gz ck-uc-discussions
+                                tar -C target/x86_64-unknown-linux-gnu/release -czvf artifacts/archives/ck-uc-discussions-${params.PACKAGE_VERSION}-linux-x86_64-gnu.tar.gz ck-uc-discussions
+                            '''
+                        }
+                    }
+                }
+
+                stage('Linux aarch64 (glibc & musl)') {
+                    steps {
+                        container('rust-builder') {
+                            sh '''
+                                echo "==> 1. Compiling Linux aarch64 Static (musl)..."
+                                cargo build --release --locked -p uc-discussions --target aarch64-unknown-linux-musl
+                                cp target/aarch64-unknown-linux-musl/release/ck-uc-discussions artifacts/bin/ck-uc-discussions-aarch64-musl
+
+                                echo "==> 2. Compiling Linux aarch64 Dynamic (glibc)..."
+                                cargo build --release --locked -p uc-discussions --target aarch64-unknown-linux-gnu
+                                cp target/aarch64-unknown-linux-gnu/release/ck-uc-discussions artifacts/bin/ck-uc-discussions-aarch64-linux
+
+                                echo "==> 3. Generating Linux aarch64 Packages..."
+                                if command -v cargo-deb >/dev/null 2>&1; then
+                                    cargo deb -p uc-discussions --target aarch64-unknown-linux-gnu -o artifacts/packages/
+                                fi
+
+                                echo "==> 4. Packaging aarch64 Portable Tarballs..."
+                                tar -C target/aarch64-unknown-linux-musl/release -czvf artifacts/archives/ck-uc-discussions-${params.PACKAGE_VERSION}-linux-aarch64-musl.tar.gz ck-uc-discussions
+                            '''
+                        }
+                    }
+                }
+
+                stage('macOS / Darwin (arm64 & x86_64)') {
+                    steps {
+                        container('rust-builder') {
+                            sh '''
+                                echo "==> Staging Darwin Targets from Host / Ingestion..."
+                                # Darwin targets are built on Apple Silicon Mac workstations or macOS runners,
+                                # stamped with Hardened Runtime codesign, and ingested into the pipeline release set.
+                                if [ -f "dist-darwin/ck-uc-discussions-darwin-arm64" ]; then
+                                    cp dist-darwin/ck-uc-discussions-darwin-arm64 artifacts/bin/
+                                    tar -C dist-darwin -czvf artifacts/archives/ck-uc-discussions-${params.PACKAGE_VERSION}-darwin-arm64.tar.gz ck-uc-discussions-darwin-arm64
+                                fi
+                                if [ -f "dist-darwin/ck-uc-discussions-darwin-x64" ]; then
+                                    cp dist-darwin/ck-uc-discussions-darwin-x64 artifacts/bin/
+                                    tar -C dist-darwin -czvf artifacts/archives/ck-uc-discussions-${params.PACKAGE_VERSION}-darwin-x64.tar.gz ck-uc-discussions-darwin-x64
+                                fi
+                            '''
+                        }
+                    }
+                }
+
+                stage('Windows x86_64') {
+                    steps {
+                        container('rust-builder') {
+                            sh '''
+                                echo "==> Compiling Windows x86_64 Binary..."
+                                cargo build --release --locked -p uc-discussions --target x86_64-pc-windows-gnu
+                                cp target/x86_64-pc-windows-gnu/release/ck-uc-discussions.exe artifacts/bin/
+                                zip -j artifacts/archives/ck-uc-discussions-${params.PACKAGE_VERSION}-windows-x64.zip target/x86_64-pc-windows-gnu/release/ck-uc-discussions.exe
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Multi-Arch OCI Container Build') {
+            when {
+                expression { return params.BUILD_OCI }
+            }
+            steps {
+                container('rust-builder') {
+                    sh '''
+                        echo "==> Building Multi-Arch OCI Image with BuildKit..."
+                        # Uses the statically compiled musl binaries for zero-dependency container execution
+                        # docker buildx build --platform linux/amd64,linux/arm64 \
+                        #   -t registry.cloudhome.internal/cortexkit/ck-uc-discussions:${params.PACKAGE_VERSION} \
+                        #   -f packaging/docker/Dockerfile .
+                    '''
+                }
+            }
+        }
+
+        stage('Arcus Envelope Assembly') {
+            steps {
+                container('rust-builder') {
+                    sh '''
+                        echo "==> Assembling Arcus Sequence-First Distribution Tree..."
+                        mkdir -p "${DIST_DIR}"
+
+                        # Generate SHA256 manifest
+                        cd artifacts/archives
+                        sha256sum * > "${DIST_DIR}/assets.sha256"
+                        cp * "${DIST_DIR}/"
+
+                        echo "==> Output staged at ${DIST_DIR}:"
+                        ls -lh "${DIST_DIR}"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'artifacts/**/*', fingerprint: true, allowEmptyArchive: true
+        }
+        success {
+            echo "Pipeline complete. Release artifacts assembled for sequence ${params.ARCUS_SEQUENCE}."
+        }
+        failure {
+            echo "Pipeline failed. Check build logs for target failures."
+        }
+    }
+}
