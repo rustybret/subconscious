@@ -1,18 +1,18 @@
 # Fleet module sources
 
 What runs under the local `ck-subc`, where each binary comes from, and who builds it. Update this
-file in the same commit that changes a module's source. Verified 2026-10-25.
+file in the same commit that changes a module's source. Verified 2026-11-02.
 
 | Module | Version | Source | Built by |
 | --- | --- | --- | --- |
-| `ck-subc`, `ck` | 0.20.124 | CortexKit official release (`subc-core-v0.20.124`), signed | CortexKit |
+| `ck-subc`, `ck` | 0.20.155 | CortexKit official release (`subc-core-v0.20.124`), signed | CortexKit |
 | `ck-subc-mcp` | 0.1.42 (`subc-core-v0.20.124`) | CortexKit official release | CortexKit |
 | `ck-insula` | 0.1.1 (upstream main `5aa93fae8`, unreleased) | `submodules/insula`, built unmodified. Official v0.1.1 release predates the published-crate migration and crash-looped on stock `ck-subc` 0.20.124 (`invalid envelope header: reserved flag bits set`). Deployed 2026-10-28: 1568 tests pass, isolated sandbox PASS, live healthy (`buildCommit 5aa93fae8083`). Backup: `~/.local/state/insula-backup-20261028-144154`. Return to official release once upstream publishes past v0.1.1. | us |
 | `ck-synapse` | 0.1.0-alpha.2 | CortexKit official release | CortexKit |
 | `ck-claustrum` | 0.2.0 (official release `v0.2.0`, published 2026-10-22) | CortexKit official release (`v0.2.0`, `ck-claustrum` and `ck-auth`), consumer enrollment, scoped grants, schema 18 forward migration. Deployed 2026-10-25; vault schema 18 active, credentials preserved (backup: `~/.local/state/claustrum-backup-20261025-0.2.0-pre`). Running binary matches official CortexKit release. | CortexKit |
-| `ck-mc` | 0.49.28 (upstream tag `v0.49.28`, `dd931f1b1`) | Upstream publishes no current binary. Built unmodified from tag on this Mac (MC_BUILD_SHA=dd931f1b18cb6729a23457632601f8ef393df468, adhoc codesign hardened-runtime). Placed 2026-10-28 with `place-ck-mc.sh --require-epochs-unchanged` (context 95/95, store 63/63, all four epochs unchanged); `orw-probe.sh` `UP_TO_DATE`. Plugin pin `@cortexkit/opencode-magic-context@0.49.28` (takes effect on OpenCode server restart). Not yet packaged for Arcus (last sequence 15 = 0.49.20). Rollback binaries in `~/.local/share/cortexkit/bin/staging/`. | us (Darwin build/placement), Cloudhome (Arcus multi-arch packaging) |
+| `ck-mc` | 0.49.35 (upstream tag `v0.49.35`, `ba17c98db`) | Upstream publishes no current binary. Built unmodified from tag on this Mac (MC_BUILD_SHA=ba17c98db4a6c9aefc35c22f7f29a8f38c017828, adhoc codesign hardened-runtime). Placed 2026-11-02 with `place-ck-mc.sh --require-epochs-unchanged` (context 95/95, store 63/63, all four epochs unchanged); `orw-probe.sh` `UP_TO_DATE`. Plugin pin `@cortexkit/opencode-magic-context@latest` (0.49.35). Rollback binaries in `~/.local/share/cortexkit/bin/staging/`. | us (Darwin build/placement), Cloudhome (Arcus multi-arch packaging) |
 | `ck-entorhinal` | 0.1.46 (submodule commit `84677e1`) | Upstream `origin/main` (`submodules/entorhinal`), unmodified. Built & deployed 2026-10-25; verified `ck-entorhinal 0.1.46` serving `project-identity/v1` and `agent-identity/v1` under `ck-subc` (backup: `~/.local/state/cortexkit-backup-20261025-entorhinal-0.1.20/`). | us |
-| `aft` | 0.62.0 (official CortexKit release, signed) | CortexKit official release (`ck-aft 0.62.0`), running at `~/.local/share/cortexkit/bin/ck-aft` supervised by `ck-subc` 0.20.124 (PID 1753, SHA256 `02a486175a4d…`). Plugin is published `@cortexkit/aft-opencode@0.62.0`. Fork retired in favor of upstream config equivalency. | CortexKit |
+| `aft` | 0.62.0 (official CortexKit release, signed) | CortexKit official release (`ck-aft 0.62.0`), running at `~/.local/share/cortexkit/bin/ck-aft` supervised by `ck-subc` 0.20.124 (PID 1753, SHA256 `02a486175a4d…`). Plugin is published `@cortexkit/aft-opencode@0.63.5`. Fork retired in favor of upstream config equivalency. | CortexKit |
 | `ck-uc-discussions` | 0.1.2 (room closure provenance, schema v4, inbox; Arcus package `uc-discussions` seq 3) | `modules/uc-discussions/` (running at `~/.local/bin/ck-uc-discussions` under stock `ck-subc 0.20.124`) | us |
 | `ck-fusiform`, `ck-models` | 0.1.0 (`fusiform-protocol` 0.30.0 on crates.io; catalog version 1792525097774) | `submodules/fusiform` (`ck models` CLI) | us |
 | `ck-astrocyte` | 0.1.0 | `submodules/astrocyte` (AI usage & spend ledger) | us |
