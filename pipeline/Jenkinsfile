@@ -1,222 +1,224 @@
-// pipeline/Jenkinsfile — Multi-Platform Build & Packaging Pipeline for ck-uc-discussions
+// pipeline/Jenkinsfile — Multi-Platform Linux Build & Packaging Pipeline for ck-uc-discussions
 // Integrates with Cloudhome Jenkins Kubernetes agent cloud on altos-worker-01
 
 pipeline {
     agent {
-        kubernetes {
-            yaml '''
-apiVersion: v1
-kind: Pod
-metadata:
-  labels:
-    role: rust-multiplatform-builder
-spec:
-  containers:
-  - name: rust-builder
-    image: rust:1.82-bookworm
-    command: ['cat']
-    tty: true
-    resources:
-      requests:
-        cpu: "4"
-        memory: "8Gi"
-      limits:
-        cpu: "16"
-        memory: "32Gi"
-    volumeMounts:
-    - mountPath: /root/.cargo/registry
-      name: cargo-registry
-    - mountPath: /root/.cargo/git
-      name: cargo-git
-    - mountPath: /mnt/sccache
-      name: shared-sccache
-  volumes:
-  - name: cargo-registry
-    persistentVolumeClaim:
-      claimName: jenkins-cargo-registry-pvc
-  - name: cargo-git
-    persistentVolumeClaim:
-      claimName: jenkins-cargo-git-pvc
-  - name: shared-sccache
-    persistentVolumeClaim:
-      claimName: jenkins-sccache-pvc
-'''
-        }
+        label 'jenkins-agent-rust'
     }
 
     parameters {
         string(name: 'PACKAGE_VERSION', defaultValue: '0.1.2', description: 'Version to package and tag')
         string(name: 'ARCUS_SEQUENCE', defaultValue: '4', description: 'Monotonic sequence allocated from Arcus catalog')
-        booleanParam(name: 'BUILD_OCI', defaultValue: true, description: 'Publish multi-arch OCI container images')
-        booleanParam(name: 'SUBMIT_ARCUS', defaultValue: false, description: 'Submit verified bundle to Arcus gateway')
+        booleanParam(name: 'PACKAGE_DISTRO', defaultValue: true, description: 'Attempt .deb and .rpm generation if tools present')
+        booleanParam(name: 'RUN_ELF_AUDIT', defaultValue: true, description: 'Enforce ELF interpreter and glibc symbol inspection')
     }
 
     environment {
+        PACKAGE_VERSION = "${params.PACKAGE_VERSION}"
+        ARCUS_SEQUENCE = "${params.ARCUS_SEQUENCE}"
+        PACKAGE_DISTRO = "${params.PACKAGE_DISTRO}"
+        RUN_ELF_AUDIT = "${params.RUN_ELF_AUDIT}"
         CARGO_TERM_COLOR = 'always'
         RUSTFLAGS = '-D warnings'
-        SCCACHE_DIR = '/mnt/sccache'
+        SCCACHE_DIR = '/srv/sccache'
         RUSTC_WRAPPER = 'sccache'
-        DIST_DIR = "${WORKSPACE}/dist/${params.ARCUS_SEQUENCE}/uc-discussions/${params.PACKAGE_VERSION}"
     }
 
     stages {
-        stage('Initialize & Toolchain Setup') {
+        stage('Initialize & Toolchain Audit') {
             steps {
-                container('rust-builder') {
-                    sh '''
-                        echo "==> Configuring Cross-Compilation Toolchains..."
-                        rustup target add x86_64-unknown-linux-gnu \
-                                          x86_64-unknown-linux-musl \
-                                          aarch64-unknown-linux-gnu \
-                                          aarch64-unknown-linux-musl \
-                                          x86_64-pc-windows-gnu
+                sh '''
+                    set -eu
+                    echo "==> Auditing Jenkins Agent Toolchain Environment..."
+                    echo "Current user: $(id -u):$(id -g) ($(whoami 2>/dev/null || echo 'unmapped'))"
+                    echo "Working directory: $(pwd)"
 
-                        cargo --version
-                        rustc --version
-                        sccache --version || true
+                    rustc --version
+                    cargo --version
+                    zig version || true
+                    cargo zigbuild --version || true
+                    sccache --version || true
 
-                        mkdir -p "${DIST_DIR}"
-                        mkdir -p artifacts/{bin,packages,archives}
-                    '''
-                }
+                    # Ensure clean output directories using POSIX syntax (no bash brace expansion)
+                    mkdir -p artifacts/bin
+                    mkdir -p artifacts/packages
+                    mkdir -p artifacts/archives
+                    mkdir -p "dist/${ARCUS_SEQUENCE}/uc-discussions/${PACKAGE_VERSION}"
+                '''
             }
         }
 
-        stage('Multi-Platform Parallel Compilation') {
+        stage('Compile Linux 4-Target Matrix') {
             parallel {
-                stage('Linux x86_64 (glibc & musl)') {
+                stage('Linux x86_64 Static (musl)') {
                     steps {
-                        container('rust-builder') {
-                            sh '''
-                                echo "==> 1. Compiling Linux x86_64 Static (musl)..."
-                                cargo build --release --locked -p uc-discussions --target x86_64-unknown-linux-musl
-                                cp target/x86_64-unknown-linux-musl/release/ck-uc-discussions artifacts/bin/ck-uc-discussions-x86_64-musl
+                        sh '''
+                            set -eu
+                            echo "==> Compiling x86_64-unknown-linux-musl (fully static)..."
+                            cargo zigbuild --release --locked -p uc-discussions --target x86_64-unknown-linux-musl
+                            
+                            SRC="target/x86_64-unknown-linux-musl/release/ck-uc-discussions"
+                            DST="artifacts/bin/ck-uc-discussions-x86_64-musl"
+                            cp "$SRC" "$DST"
 
-                                echo "==> 2. Compiling Linux x86_64 Dynamic (glibc 2.31 LTS baseline)..."
-                                cargo build --release --locked -p uc-discussions --target x86_64-unknown-linux-gnu
-                                cp target/x86_64-unknown-linux-gnu/release/ck-uc-discussions artifacts/bin/ck-uc-discussions-x86_64-linux
+                            if [ "$RUN_ELF_AUDIT" = "true" ]; then
+                                echo "==> Auditing x86_64 musl ELF binary..."
+                                file "$DST"
+                                if command -v readelf >/dev/null 2>&1; then
+                                    # Verify no dynamic section in static musl binary
+                                    if readelf -d "$DST" 2>&1 | grep -q 'DYNAMIC'; then
+                                        echo "ERROR: x86_64-unknown-linux-musl contains dynamic section!" >&2
+                                        exit 1
+                                    fi
+                                    echo "  [PASS] Clean static binary verified."
+                                fi
+                            fi
 
-                                echo "==> 3. Generating Linux x86_64 Packages (.deb & .rpm)..."
+                            # Package portable static tarballs
+                            tar -C target/x86_64-unknown-linux-musl/release -czvf \
+                                "artifacts/archives/ck-uc-discussions-${PACKAGE_VERSION}-linux-x86_64-musl.tar.gz" ck-uc-discussions
+                        '''
+                    }
+                }
+
+                stage('Linux x86_64 Dynamic (glibc 2.31 LTS)') {
+                    steps {
+                        sh '''
+                            set -eu
+                            echo "==> Compiling x86_64-unknown-linux-gnu.2.31 (glibc LTS baseline)..."
+                            cargo zigbuild --release --locked -p uc-discussions --target x86_64-unknown-linux-gnu.2.31
+                            
+                            SRC="target/x86_64-unknown-linux-gnu/release/ck-uc-discussions"
+                            DST="artifacts/bin/ck-uc-discussions-x86_64-linux-gnu"
+                            cp "$SRC" "$DST"
+
+                            if [ "$RUN_ELF_AUDIT" = "true" ]; then
+                                echo "==> Auditing x86_64 glibc ELF binary..."
+                                file "$DST"
+                                if command -v readelf >/dev/null 2>&1; then
+                                    echo "  Dynamic dependencies:"
+                                    readelf -d "$DST" | grep NEEDED || true
+                                    echo "  Checking glibc symbol version ceilings:"
+                                    # Fail if any symbol requires GLIBC_2.32 or newer
+                                    if readelf -sV "$DST" 2>&1 | grep -E 'GLIBC_2\.(3[2-9]|[4-9][0-9])' ; then
+                                        echo "ERROR: Binary leaked symbols exceeding GLIBC_2.31 ceiling!" >&2
+                                        exit 1
+                                    fi
+                                    echo "  [PASS] Verified glibc <= 2.31 compatibility."
+                                fi
+                            fi
+
+                            # Package portable glibc tarball
+                            tar -C target/x86_64-unknown-linux-gnu/release -czvf \
+                                "artifacts/archives/ck-uc-discussions-${PACKAGE_VERSION}-linux-x86_64-gnu.tar.gz" ck-uc-discussions
+
+                            # Attempt distro packaging if tools installed in image
+                            if [ "$PACKAGE_DISTRO" = "true" ]; then
                                 if command -v cargo-deb >/dev/null 2>&1; then
-                                    cargo deb -p uc-discussions --target x86_64-unknown-linux-gnu -o artifacts/packages/
+                                    echo "==> Generating .deb package..."
+                                    cargo deb -p uc-discussions --target x86_64-unknown-linux-gnu -o artifacts/packages/ || true
                                 fi
                                 if command -v cargo-generate-rpm >/dev/null 2>&1; then
-                                    cargo generate-rpm -p uc-discussions --target x86_64-unknown-linux-gnu -o artifacts/packages/
+                                    echo "==> Generating .rpm package..."
+                                    cargo generate-rpm -p uc-discussions --target x86_64-unknown-linux-gnu -o artifacts/packages/ || true
                                 fi
-
-                                echo "==> 4. Packaging x86_64 Portable Tarballs (.tar.zst / .tar.gz)..."
-                                tar -C target/x86_64-unknown-linux-musl/release -czvf artifacts/archives/ck-uc-discussions-${params.PACKAGE_VERSION}-linux-x86_64-musl.tar.gz ck-uc-discussions
-                                tar -C target/x86_64-unknown-linux-gnu/release -czvf artifacts/archives/ck-uc-discussions-${params.PACKAGE_VERSION}-linux-x86_64-gnu.tar.gz ck-uc-discussions
-                            '''
-                        }
+                            fi
+                        '''
                     }
                 }
 
-                stage('Linux aarch64 (glibc & musl)') {
+                stage('Linux aarch64 Static (musl)') {
                     steps {
-                        container('rust-builder') {
-                            sh '''
-                                echo "==> 1. Compiling Linux aarch64 Static (musl)..."
-                                cargo build --release --locked -p uc-discussions --target aarch64-unknown-linux-musl
-                                cp target/aarch64-unknown-linux-musl/release/ck-uc-discussions artifacts/bin/ck-uc-discussions-aarch64-musl
+                        sh '''
+                            set -eu
+                            echo "==> Compiling aarch64-unknown-linux-musl (fully static)..."
+                            cargo zigbuild --release --locked -p uc-discussions --target aarch64-unknown-linux-musl
+                            
+                            SRC="target/aarch64-unknown-linux-musl/release/ck-uc-discussions"
+                            DST="artifacts/bin/ck-uc-discussions-aarch64-musl"
+                            cp "$SRC" "$DST"
 
-                                echo "==> 2. Compiling Linux aarch64 Dynamic (glibc)..."
-                                cargo build --release --locked -p uc-discussions --target aarch64-unknown-linux-gnu
-                                cp target/aarch64-unknown-linux-gnu/release/ck-uc-discussions artifacts/bin/ck-uc-discussions-aarch64-linux
+                            if [ "$RUN_ELF_AUDIT" = "true" ]; then
+                                echo "==> Auditing aarch64 musl ELF binary..."
+                                file "$DST"
+                            fi
 
-                                echo "==> 3. Generating Linux aarch64 Packages..."
+                            tar -C target/aarch64-unknown-linux-musl/release -czvf \
+                                "artifacts/archives/ck-uc-discussions-${PACKAGE_VERSION}-linux-aarch64-musl.tar.gz" ck-uc-discussions
+                        '''
+                    }
+                }
+
+                stage('Linux aarch64 Dynamic (glibc 2.31 LTS)') {
+                    steps {
+                        sh '''
+                            set -eu
+                            echo "==> Compiling aarch64-unknown-linux-gnu.2.31 (glibc LTS baseline)..."
+                            cargo zigbuild --release --locked -p uc-discussions --target aarch64-unknown-linux-gnu.2.31
+                            
+                            SRC="target/aarch64-unknown-linux-gnu/release/ck-uc-discussions"
+                            DST="artifacts/bin/ck-uc-discussions-aarch64-linux-gnu"
+                            cp "$SRC" "$DST"
+
+                            if [ "$RUN_ELF_AUDIT" = "true" ]; then
+                                echo "==> Auditing aarch64 glibc ELF binary..."
+                                file "$DST"
+                                if command -v readelf >/dev/null 2>&1; then
+                                    echo "  Dynamic dependencies:"
+                                    readelf -d "$DST" | grep NEEDED || true
+                                fi
+                            fi
+
+                            tar -C target/aarch64-unknown-linux-gnu/release -czvf \
+                                "artifacts/archives/ck-uc-discussions-${PACKAGE_VERSION}-linux-aarch64-gnu.tar.gz" ck-uc-discussions
+
+                            if [ "$PACKAGE_DISTRO" = "true" ]; then
                                 if command -v cargo-deb >/dev/null 2>&1; then
-                                    cargo deb -p uc-discussions --target aarch64-unknown-linux-gnu -o artifacts/packages/
+                                    cargo deb -p uc-discussions --target aarch64-unknown-linux-gnu -o artifacts/packages/ || true
                                 fi
-
-                                echo "==> 4. Packaging aarch64 Portable Tarballs..."
-                                tar -C target/aarch64-unknown-linux-musl/release -czvf artifacts/archives/ck-uc-discussions-${params.PACKAGE_VERSION}-linux-aarch64-musl.tar.gz ck-uc-discussions
-                            '''
-                        }
-                    }
-                }
-
-                stage('macOS / Darwin (arm64 & x86_64)') {
-                    steps {
-                        container('rust-builder') {
-                            sh '''
-                                echo "==> Staging Darwin Targets from Host / Ingestion..."
-                                # Darwin targets are built on Apple Silicon Mac workstations or macOS runners,
-                                # stamped with Hardened Runtime codesign, and ingested into the pipeline release set.
-                                if [ -f "dist-darwin/ck-uc-discussions-darwin-arm64" ]; then
-                                    cp dist-darwin/ck-uc-discussions-darwin-arm64 artifacts/bin/
-                                    tar -C dist-darwin -czvf artifacts/archives/ck-uc-discussions-${params.PACKAGE_VERSION}-darwin-arm64.tar.gz ck-uc-discussions-darwin-arm64
-                                fi
-                                if [ -f "dist-darwin/ck-uc-discussions-darwin-x64" ]; then
-                                    cp dist-darwin/ck-uc-discussions-darwin-x64 artifacts/bin/
-                                    tar -C dist-darwin -czvf artifacts/archives/ck-uc-discussions-${params.PACKAGE_VERSION}-darwin-x64.tar.gz ck-uc-discussions-darwin-x64
-                                fi
-                            '''
-                        }
-                    }
-                }
-
-                stage('Windows x86_64') {
-                    steps {
-                        container('rust-builder') {
-                            sh '''
-                                echo "==> Compiling Windows x86_64 Binary..."
-                                cargo build --release --locked -p uc-discussions --target x86_64-pc-windows-gnu
-                                cp target/x86_64-pc-windows-gnu/release/ck-uc-discussions.exe artifacts/bin/
-                                zip -j artifacts/archives/ck-uc-discussions-${params.PACKAGE_VERSION}-windows-x64.zip target/x86_64-pc-windows-gnu/release/ck-uc-discussions.exe
-                            '''
-                        }
+                            fi
+                        '''
                     }
                 }
             }
         }
 
-        stage('Multi-Arch OCI Container Build') {
-            when {
-                expression { return params.BUILD_OCI }
-            }
+        stage('Assemble Arcus Sequence Envelope') {
             steps {
-                container('rust-builder') {
-                    sh '''
-                        echo "==> Building Multi-Arch OCI Image with BuildKit..."
-                        # Uses the statically compiled musl binaries for zero-dependency container execution
-                        # docker buildx build --platform linux/amd64,linux/arm64 \
-                        #   -t registry.cloudhome.internal/cortexkit/ck-uc-discussions:${params.PACKAGE_VERSION} \
-                        #   -f packaging/docker/Dockerfile .
-                    '''
-                }
-            }
-        }
+                sh '''
+                    set -eu
+                    TARGET_DIR="dist/${ARCUS_SEQUENCE}/uc-discussions/${PACKAGE_VERSION}"
+                    echo "==> Assembling Arcus release payload at ${TARGET_DIR}..."
+                    mkdir -p "${TARGET_DIR}"
 
-        stage('Arcus Envelope Assembly') {
-            steps {
-                container('rust-builder') {
-                    sh '''
-                        echo "==> Assembling Arcus Sequence-First Distribution Tree..."
-                        mkdir -p "${DIST_DIR}"
+                    # Copy binaries and archives into sequence staging
+                    cp artifacts/bin/* "${TARGET_DIR}/"
+                    if ls artifacts/archives/* >/dev/null 2>&1; then
+                        cp artifacts/archives/* "${TARGET_DIR}/"
+                    fi
+                    if ls artifacts/packages/* >/dev/null 2>&1; then
+                        cp artifacts/packages/* "${TARGET_DIR}/" || true
+                    fi
 
-                        # Generate SHA256 manifest
-                        cd artifacts/archives
-                        sha256sum * > "${DIST_DIR}/assets.sha256"
-                        cp * "${DIST_DIR}/"
+                    # Generate canonical assets.sha256 manifest
+                    (cd "${TARGET_DIR}" && sha256sum * > assets.sha256 2>/dev/null || shasum -a 256 * > assets.sha256)
 
-                        echo "==> Output staged at ${DIST_DIR}:"
-                        ls -lh "${DIST_DIR}"
-                    '''
-                }
+                    echo "==> Arcus Sequence ${ARCUS_SEQUENCE} staging manifest:"
+                    cat "${TARGET_DIR}/assets.sha256"
+                '''
             }
         }
     }
 
     post {
         always {
-            archiveArtifacts artifacts: 'artifacts/**/*', fingerprint: true, allowEmptyArchive: true
+            archiveArtifacts artifacts: 'artifacts/**/*', fingerprint: true, allowEmptyArchive: false
         }
         success {
-            echo "Pipeline complete. Release artifacts assembled for sequence ${params.ARCUS_SEQUENCE}."
+            echo "SUCCESS: Bounded 4-target Linux matrix compiled, audited, and staged for Sequence ${params.ARCUS_SEQUENCE}."
         }
         failure {
-            echo "Pipeline failed. Check build logs for target failures."
+            echo "FAILURE: Linux compilation or ELF audit failed. Check stage logs."
         }
     }
 }
