@@ -1,7 +1,8 @@
-# Multi-Platform and Linux Build Specification for CortexKit & Fleet Modules
+# Multi-Platform Build Specification & 12-Target Fleet Standard
 
 **Status**: Ratified Design Requirement  
-**Target Modules**: `ck-uc-discussions`, `ck-mc`, `ck-claustrum`, and fleet Rust services  
+**Target Modules**: `ck-uc-discussions`, `ck-mc`, `ck-claustrum`, and fleet services  
+**Alignment Reference**: Upstream `omo` & `uc-studio` 12-Target Build Standard  
 **Owning Infrastructure**: Subconscious (in-tree descriptors), Cloudhome (Jenkins & BuildKit runners on `altos-worker-01`), Arcus (catalog & release distribution)  
 **Date**: November 2026
 
@@ -9,156 +10,110 @@
 
 ## 1. Architectural Strategy & Scope
 
-To achieve broad cross-platform operational reach, binaries in the CortexKit and UltraCreative fleet must support three tier-1 operating systems (**macOS/Darwin**, **Linux**, and **Windows**) across modern CPU architectures (**x86_64** and **aarch64**).
+To achieve complete operational coverage across modern developer workstations, headless cloud VMs, and legacy hardware, the fleet adopts the authoritative **12-target build standard** established by `omo` and `uc-studio`.
 
-For Linux specifically, compatibility requires addressing two distinct layers:
-1. **Low-Level Binary & C-Library Layer (ELF)**: Dictates whether an executable can link and load on a host OS without C runtime symbol crashes.
-2. **Distribution Packaging & Delivery Layer**: Dictates how operators, automated tools, and system init managers install, verify, and supervise the binary.
+This standard addresses three orthogonal layers:
+1. **Operating System Families**: macOS (Darwin), Linux, and Windows.
+2. **CPU Architecture & Instruction Set Tiers**:
+   - `aarch64` (ARM64) for Apple Silicon, modern Linux servers, and ARM Windows.
+   - `x86_64` (amd64) split into **AVX2 (`x86-64-v3`)** for performance and **Baseline (`x86-64-v2` / no-AVX2)** for legacy CPU and virtualization compatibility.
+3. **C-Library Linkage (ELF on Linux)**:
+   - Dynamic linking against an older `glibc` LTS baseline (`glibc 2.31`).
+   - Completely standalone, zero-dependency static linking via `musl`.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│                        Target Architectures                            │
-│                  x86_64 (amd64)  │  aarch64 (arm64)                    │
-└───────────────────────────────────┬────────────────────────────────────┘
-                                    │
-          ┌─────────────────────────┼─────────────────────────┐
-          ▼                         ▼                         ▼
-   ┌──────────────┐         ┌───────────────┐         ┌──────────────┐
-   │ macOS/Darwin │         │     Linux     │         │   Windows    │
-   │  arm64 / x64 │         │  glibc / musl │         │    x86_64    │
-   └──────────────┘         └───────┬───────┘         └──────────────┘
-                                    │
-        ┌───────────────────────────┼───────────────────────────┐
-        ▼                           ▼                           ▼
-┌───────────────┐           ┌───────────────┐           ┌───────────────┐
-│ System Pkgs   │           │ Static Archive│           │ OCI Container │
-│ .deb / .rpm   │           │ .tar.zst / gz │           │ Multi-Arch    │
-│ (systemd/apt) │           │ (zero-dep)    │           │ (CI / Daemon) │
-└───────────────┘           └───────────────┘           └───────────────┘
+│               UltraCreative 12-Target Fleet Matrix                     │
+├───────────────────┬────────────────────────────────┬───────────────────┤
+│    macOS (Darwin) │             Linux              │      Windows      │
+├───────────────────┼────────────────────────────────┼───────────────────┤
+│ • macOS ARM64     │ • Linux x64 (glibc)            │ • Windows x64     │
+│ • macOS x64       │ • Linux x64 (glibc, no-AVX2)   │ • Windows x64     │
+│ • macOS x64       │ • Linux ARM64 (glibc)          │   (no-AVX2)       │
+│   (no-AVX2)       │ • Linux x64 (musl)             │ • Windows ARM64   │
+│                   │ • Linux x64 (musl, no-AVX2)    │   (native / node) │
+│                   │ • Linux ARM64 (musl)           │                   │
+└───────────────────┴────────────────────────────────┴───────────────────┘
 ```
 
 ---
 
-## 2. Layer 1: Low-Level Binary & C-Library Layer (ELF)
+## 2. Microarchitecture Levels: AVX2 vs. Baseline (No-AVX2)
 
-All standard Linux executables use the **ELF** (Executable and Linkable Format). ELF binary incompatibility on Linux almost exclusively stems from C standard library mismatches.
+Modern x86_64 software often silently enables AVX2 instructions (Haswell/Zen+ baseline), which triggers fatal `Illegal instruction (SIGILL)` crashes on older CPUs, low-cost VPS instances, nested virtualization (e.g., cloud hypervisors lacking AVX2 flags), and legacy Macs.
 
-### 2.1 The glibc vs. musl Divide
-- **glibc (GNU C Library)**: The standard runtime across desktop, enterprise, and cloud distributions (Ubuntu, Debian, Fedora, RHEL, CentOS, openSUSE, Arch). Executables linked against glibc are dynamically resolved against the host system's `libc.so.6`.
-- **musl libc**: The lightweight standard runtime used by security-focused, embedded, and minimal container distributions (Alpine Linux, Void Linux).
-- **Incompatibility Rule**: A binary dynamically linked against glibc **cannot** run on a musl-based system, failing at load time with `No such file or directory` or dynamic interpreter refusal.
+The fleet explicitly splits all x86_64 targets into two discrete microarchitecture tiers:
 
-### 2.2 The "glibc Version Trap" (Forward Incompatibility)
-- **Invariant**: glibc guarantees **backward compatibility, not forward compatibility**. A binary compiled against glibc 2.38 cannot resolve symbols (such as `GLIBC_2.38`) when executed on a system running glibc 2.31 or 2.35.
-- **Requirement**: Dynamically linked Linux binaries must be compiled against an **older LTS baseline** (glibc 2.31, corresponding to Ubuntu 20.04 LTS / Debian 11 / AlmaLinux 8), guaranteeing execution on any newer host.
-- **musl Static Linking**: For Rust daemons and CLI tools, static compilation targeting `*-unknown-linux-musl` produces a completely self-contained binary with zero dynamic library dependencies. This guarantees universal execution across all Linux distributions regardless of host glibc or musl versions.
+| Tier | Microarchitecture Level | CPU Target Baseline | Compiler Flags (Rust / Zig) | Minimum Hardware Equivalent |
+|---|---|---|---|---|
+| **Standard (AVX2)** | `x86-64-v3` | Haswell, Excavator, Zen+ | `-C target-cpu=haswell` or `-C target-feature=+avx,+avx2,+fma` | Intel Core 4th Gen+ (2013), AMD Ryzen (2017) |
+| **Baseline (No-AVX2)** | `x86-64-v2` (or generic) | Nehalem, Westmere, Sandy Bridge | `-C target-cpu=generic` or `-C target-feature=-avx,-avx2,-fma` | Any 64-bit x86 CPU with SSE4.2 / POPCNT (2008+) |
 
----
-
-## 3. Layer 2: Packaging & Distribution Formats
-
-The fleet categorizes software packaging into three delivery tiers based on target consumption:
-
-### 3.1 Native System Packages (`.deb` and `.rpm`)
-- **Primary Audience**: System administrators, automated workstation setups (`ucs-setup`), server nodes (`altos-worker-01`, `nimbus`), and enterprise servers.
-- **Formats**:
-  - **`.deb` (Debian Package)**: Debian, Ubuntu, Linux Mint, Pop!_OS, Raspberry Pi OS.
-  - **`.rpm` (Red Hat Package Manager)**: RHEL, Fedora, AlmaLinux, Rocky Linux, openSUSE.
-- **Requirements**:
-  - Integrate daemon service definitions (`systemd` system/user units).
-  - Place binaries in standard filesystem hierarchy (`/usr/local/bin` or `/usr/bin`).
-  - Automated tooling: Generated via `cargo-deb` and `cargo-generate-rpm` or `nfpm`.
-
-### 3.2 Universal Archives (`.tar.zst` and `.tar.gz`)
-- **Primary Audience**: Standalone users, custom install scripts, Arcus package hydration, and offline nodes.
-- **Requirements**:
-  - Bundle the statically linked binary (`*-unknown-linux-musl` or LTS glibc baseline).
-  - Include shell completions (bash, zsh, fish) and man pages.
-  - Formatted as sequence-first Arcus bundles (`.tar.zst`) and universal `.tar.gz`.
-
-### 3.3 Multi-Arch OCI / Container Images
-- **Primary Audience**: Cloudhome Kubernetes workloads, Jenkins build agents, and automated test environments.
-- **Requirements**:
-  - Multi-platform manifests published for `linux/amd64` and `linux/arm64`.
-  - Minimal attack surface (scratch or Alpine base image with static musl binary).
-
-### 3.4 Desktop Sandboxes (Flatpak / AppImage / Snap)
-- **Applicability**: Reserved for interactive desktop GUI applications (such as Dashboard Tauri builds).
-- **Rule for Daemons**: Headless daemon services (`ck-uc-discussions`, `ck-mc`) and CLI tools must **not** be packaged as Flatpak or AppImage, as these formats introduce sandbox isolation boundaries that obstruct subc loopback sockets and supervisor signals.
-
----
-
-## 4. Concrete Target Matrix for Fleet Modules
-
-For `ck-uc-discussions` and companion fleet modules, the build pipeline targets seven primary binary variants:
-
-| Platform ID | Target Triple | C Library / Linkage | Primary Use Case |
-|---|---|---|---|
-| `darwin-arm64` | `aarch64-apple-darwin` | macOS Libsystem (Hardened Runtime) | Apple Silicon Macs (M1/M2/M3/M4) |
-| `darwin-x64` | `x86_64-apple-darwin` | macOS Libsystem (Hardened Runtime) | Intel Macs |
-| `linux-x64-gnu` | `x86_64-unknown-linux-gnu` | glibc >= 2.31 (dynamic) | Standard Linux desktops/servers (.deb/.rpm) |
-| `linux-x64-musl` | `x86_64-unknown-linux-musl` | musl (fully static) | Portable Linux x86_64 tarballs & Alpine |
-| `linux-arm64-gnu` | `aarch64-unknown-linux-gnu` | glibc >= 2.31 (dynamic) | ARM64 Linux servers & Raspberry Pi (.deb/.rpm) |
-| `linux-arm64-musl` | `aarch64-unknown-linux-musl` | musl (fully static) | Portable Linux aarch64 tarballs & containers |
-| `windows-x64` | `x86_64-pc-windows-msvc` | MSVC C++ Runtime | Windows 10/11 x86_64 workstations |
-
----
-
-## 5. Build Pipeline Contract (Jenkins & Cloudhome)
-
-### 5.1 Infrastructure Ownership
-- **Subconscious (Repository)**:
-  - Maintains `pipeline/Jenkinsfile` and Arcus packaging manifests (`packaging/arcus/`).
-  - Stamps build versions and canonical source SHAs into binary metadata.
-- **Cloudhome (`altos-worker-01`)**:
-  - Provides the Jenkins Kubernetes agent pool and BuildKit runners.
-  - Executes containerized multi-architecture cross-compilation using `cargo-zigbuild` or multi-platform BuildKit stages.
-  - Signs Darwin binaries (when coordinated with macOS runners) and generates `.deb`/`.rpm` artifacts.
-- **Arcus Gateway**:
-  - Ingests verified multi-target payloads and updates `CATALOG-1` channel metadata (`stable`/`latest`).
-
-### 5.2 Verification Gates
-Every multi-platform release candidate must pass three mandatory gates before promotion:
-1. **Compilation Gate**: Clean exit 0 with `--locked` dependencies across all 7 targets.
-2. **Binary Hygiene Gate**:
-   - macOS binaries must have hardened runtime enabled (`codesign --verify --strict`).
-   - Linux musl binaries must show `statically linked` via `file(1)`.
-   - Linux gnu binaries must not require symbols newer than `GLIBC_2.31`.
-3. **Execution Gate**: Native execution of `--version` and `--help` on real hardware or native container runners (no mock emulation).
-
-
----
-
-## 6. Empirical Cross-Compilation Verification & Upstream Findings
-
-On November 3, 2026, local cross-compilation was executed across the target matrix on Apple Silicon Mac (`Darwin 25G83 arm64`) using `cargo-zigbuild 0.19.8` and `zig 0.13.0`.
-
-### 6.1 Verified Target Receipts
-1. **`x86_64-apple-darwin` (Intel Mac)**:
-   - Output: `Mach-O 64-bit executable x86_64`
-   - Codesign: Verified with Apple Hardened Runtime (`flags=0x10002(adhoc,runtime)`, `Identifier=ck-uc-discussions`).
-2. **`x86_64-unknown-linux-gnu.2.31` (Linux glibc LTS Baseline)**:
-   - Output: `ELF 64-bit LSB pie executable, x86-64, dynamically linked, interpreter /lib64/ld-linux-x86-64.so.2, for GNU/Linux 2.0.0, stripped`
-   - Verified: Linked against glibc 2.31 symbol set, guaranteeing compatibility with Ubuntu 20.04+, Debian 11+, and RHEL 8+.
-3. **`x86_64-unknown-linux-musl` (Linux x86_64 Static)**:
-   - Output: `ELF 64-bit LSB executable, x86-64, statically linked, stripped`
-   - Verified: Fully standalone binary with zero dynamic library dependencies; portable across all Linux distributions and Alpine Linux.
-4. **`aarch64-unknown-linux-musl` (Linux ARM64 Static)**:
-   - Output: `ELF 64-bit LSB executable, ARM aarch64, statically linked, stripped`
-   - Verified: Zero-dependency ARM64 static binary for modern aarch64 servers and container environments.
-
-### 6.2 Upstream Defect Report: `subc-os` Windows Named Pipe (`E0658`)
-- **Affects**: Target `x86_64-pc-windows-gnu` / `x86_64-pc-windows-msvc`.
-- **Crate**: `subc-os = "0.1.25"` and `subc-os = "0.1.27"` on crates.io.
-- **Location**: `subc-os/src/named_pipe/windows.rs:167:52`
-- **Compiler Error**:
-  ```text
-  error[E0658]: use of unstable library feature `box_as_ptr`
-     --> subc-os-0.1.27/src/named_pipe/windows.rs:167:52
-      |
-  167 |   let descriptor_ptr: PSECURITY_DESCRIPTOR = Box::as_mut_ptr(&mut descriptor).cast();
-      |                                              ^^^^^^^^^^^^^^^
-      = note: see issue #129090 <https://github.com/rust-lang/rust/issues/129090>
+### Compilation Rules for No-AVX2 Variants
+- When compiling baseline variants, the build toolchain must explicitly disable AVX, AVX2, and FMA:
+  ```bash
+  # Rust / Cargo
+  RUSTFLAGS="-C target-cpu=generic -C target-feature=-avx,-avx2,-fma" cargo zigbuild ...
   ```
-- **Root Cause**: `Box::as_mut_ptr` is an unstable standard library method (tracking issue #129090) and is forbidden on stable `rustc` without nightly flags.
-- **Remediation Path**: Upstream `cortexkit/commons` (`subc-os`) must replace `Box::as_mut_ptr(&mut descriptor)` with `descriptor.as_mut() as *mut _` or `Box::into_raw(descriptor)`. Darwin and Linux targets do not exercise this module and are 100% functional.
+- Binary filenames and package manifests must clearly distinguish baseline builds (e.g., `ck-uc-discussions-x86_64-linux-no-avx2`).
+
+---
+
+## 3. The Linux C-Library Layer: glibc vs. musl
+
+All Linux variants use the ELF format under the hood, but C runtime linkage dictates portable execution:
+
+### 3.1 glibc Variants (Dynamic Linking)
+- **Forward-Incompatibility Invariant**: glibc is backward-compatible, never forward-compatible. Compiling on Ubuntu 24.04 leaks `GLIBC_2.38` symbols and will not run on Ubuntu 22.04 or Debian 12.
+- **LTS Baseline Requirement**: All dynamic Linux binaries must be compiled against **glibc 2.31** (Ubuntu 20.04 LTS / Debian 11 / AlmaLinux 8 baseline) using `cargo zigbuild --target <target>.2.31`.
+
+### 3.2 musl Variants (Static Linking)
+- **Zero-Dependency Invariant**: Targeting `*-unknown-linux-musl` produces fully statically linked ELF binaries.
+- **Portability**: Executes without external libc dependencies across Alpine Linux, minimal container images, immutable distros (NixOS, SteamOS, Talos), and standard glibc distributions.
+
+---
+
+## 4. Full 12-Target Authoritative Fleet Matrix
+
+The canonical matrix implemented across `subconscious`, `omo`, and `uc-studio`:
+
+| # | Fleet Target Identifier | Rust Target Triple | Feature / Linkage Profile | Primary Target Environment |
+|---|---|---|---|---|
+| 1 | `darwin-arm64` | `aarch64-apple-darwin` | Apple Silicon (M1–M4), Hardened Runtime | Modern macOS workstations |
+| 2 | `darwin-x64` | `x86_64-apple-darwin` | Intel Mac, `x86-64-v3` (AVX2), Hardened Runtime | Modern Intel Macs |
+| 3 | `darwin-x64-no-avx2` | `x86_64-apple-darwin` | Intel Mac, `x86-64-v2` (Baseline / no-AVX2) | Legacy Intel Macs, virtualization |
+| 4 | `linux-x64-gnu` | `x86_64-unknown-linux-gnu.2.31` | glibc >= 2.31, `x86-64-v3` (AVX2) | Modern Linux x86_64 desktops & servers |
+| 5 | `linux-x64-gnu-no-avx2`| `x86_64-unknown-linux-gnu.2.31` | glibc >= 2.31, `x86-64-v2` (Baseline / no-AVX2) | Older cloud VPS, legacy servers, KVM |
+| 6 | `linux-arm64-gnu` | `aarch64-unknown-linux-gnu.2.31` | glibc >= 2.31 | ARM64 Linux servers, Raspberry Pi OS |
+| 7 | `linux-x64-musl` | `x86_64-unknown-linux-musl` | musl, `x86-64-v3` (AVX2), Static | Alpine Linux, minimal containers, NixOS |
+| 8 | `linux-x64-musl-no-avx2`| `x86_64-unknown-linux-musl` | musl, `x86-64-v2` (Baseline / no-AVX2), Static | Universal fallback across all x86 Linux |
+| 9 | `linux-arm64-musl` | `aarch64-unknown-linux-musl` | musl, Static | ARM64 containers, Alpine, edge devices |
+| 10 | `windows-x64` | `x86_64-pc-windows-gnu` / `msvc` | Windows x86_64 PE, `x86-64-v3` (AVX2) | Modern Windows 10/11 x86_64 PCs |
+| 11 | `windows-x64-no-avx2` | `x86_64-pc-windows-gnu` / `msvc` | Windows x86_64 PE, `x86-64-v2` (Baseline / no-AVX2)| Older Windows PCs, Hyper-V, VMs |
+| 12 | `windows-arm64` | `aarch64-pc-windows-msvc` | Windows ARM64 (or x64 emulation fallback) | Windows on Snapdragon / Surface Pro |
+
+---
+
+## 5. System Packaging & Distribution Tiers
+
+Each of the 12 target binaries maps into the appropriate distribution channels:
+
+1. **Native Distro Packages (`.deb` & `.rpm`)**:
+   - Generated from `linux-x64-gnu` and `linux-arm64-gnu` using `cargo-deb` and `cargo-generate-rpm`.
+   - Embeds systemd service unit definitions for headless daemon management.
+2. **Universal Tarballs (`.tar.zst` & `.tar.gz`)**:
+   - Generated for all 12 variants containing the binary, shell completions, and licensing.
+   - Standard release format for Arcus sequence-first catalog distribution (`dist/<seq>/<pkg>/<ver>/`).
+3. **Multi-Arch OCI Container Images**:
+   - Multi-platform images published for `linux/amd64` and `linux/arm64` using the statically linked musl binaries.
+
+---
+
+## 6. Known Upstream Blockers & Compiler Exceptions
+
+### 6.1 Upstream Defect in `subc-os` (Windows Named Pipes)
+- **Affects**: Targets 10, 11, and 12 (`windows-x64`, `windows-x64-no-avx2`, `windows-arm64`).
+- **Location**: `subc-os` (0.1.25 through 0.1.27) `src/named_pipe/windows.rs:167:52`.
+- **Defect**: Direct un-gated call to `Box::as_mut_ptr`, triggering `error[E0658]: use of unstable library feature box_as_ptr (issue #129090)`.
+- **Status**: Compiling for Windows targets requires an upstream fix in `subc-os` (replacing `Box::as_mut_ptr` with `descriptor.as_mut() as *mut _` or `Box::into_raw`) or unstable compiler overrides.
+- **Impact**: All 9 macOS and Linux targets build cleanly with zero errors.

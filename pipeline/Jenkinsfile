@@ -1,5 +1,6 @@
 // pipeline/Jenkinsfile — Multi-Platform Linux Build & Packaging Pipeline for ck-uc-discussions
 // Integrates with Cloudhome Jenkins Kubernetes agent cloud on altos-worker-01
+// Implements authoritative 12-target fleet standard with AVX2 & baseline (no-AVX2) variants
 
 pipeline {
     agent {
@@ -10,6 +11,7 @@ pipeline {
         string(name: 'PACKAGE_VERSION', defaultValue: '0.1.2', description: 'Version to package and tag')
         string(name: 'ARCUS_SEQUENCE', defaultValue: '4', description: 'Monotonic sequence allocated from Arcus catalog')
         booleanParam(name: 'PACKAGE_DISTRO', defaultValue: true, description: 'Attempt .deb and .rpm generation if tools present')
+        booleanParam(name: 'BUILD_BASELINE_NO_AVX2', defaultValue: true, description: 'Compile generic x86-64-v2 baseline binaries without AVX2')
         booleanParam(name: 'RUN_ELF_AUDIT', defaultValue: true, description: 'Enforce ELF interpreter and glibc symbol inspection')
     }
 
@@ -17,6 +19,7 @@ pipeline {
         PACKAGE_VERSION = "${params.PACKAGE_VERSION}"
         ARCUS_SEQUENCE = "${params.ARCUS_SEQUENCE}"
         PACKAGE_DISTRO = "${params.PACKAGE_DISTRO}"
+        BUILD_BASELINE_NO_AVX2 = "${params.BUILD_BASELINE_NO_AVX2}"
         RUN_ELF_AUDIT = "${params.RUN_ELF_AUDIT}"
         CARGO_TERM_COLOR = 'always'
         RUSTFLAGS = '-D warnings'
@@ -48,13 +51,13 @@ pipeline {
             }
         }
 
-        stage('Compile Linux 4-Target Matrix') {
+        stage('Compile Linux Multi-Target Matrix') {
             parallel {
-                stage('Linux x86_64 Static (musl)') {
+                stage('Linux x86_64 Static (musl & no-AVX2)') {
                     steps {
                         sh '''
                             set -eu
-                            echo "==> Compiling x86_64-unknown-linux-musl (fully static)..."
+                            echo "==> 1. Compiling x86_64-unknown-linux-musl (Standard / AVX2)..."
                             cargo zigbuild --release --locked -p uc-discussions --target x86_64-unknown-linux-musl
                             
                             SRC="target/x86_64-unknown-linux-musl/release/ck-uc-discussions"
@@ -62,10 +65,8 @@ pipeline {
                             cp "$SRC" "$DST"
 
                             if [ "$RUN_ELF_AUDIT" = "true" ]; then
-                                echo "==> Auditing x86_64 musl ELF binary..."
                                 file "$DST"
                                 if command -v readelf >/dev/null 2>&1; then
-                                    # Verify no dynamic section in static musl binary
                                     if readelf -d "$DST" 2>&1 | grep -q 'DYNAMIC'; then
                                         echo "ERROR: x86_64-unknown-linux-musl contains dynamic section!" >&2
                                         exit 1
@@ -74,18 +75,30 @@ pipeline {
                                 fi
                             fi
 
-                            # Package portable static tarballs
                             tar -C target/x86_64-unknown-linux-musl/release -czvf \
                                 "artifacts/archives/ck-uc-discussions-${PACKAGE_VERSION}-linux-x86_64-musl.tar.gz" ck-uc-discussions
+
+                            if [ "$BUILD_BASELINE_NO_AVX2" = "true" ]; then
+                                echo "==> 2. Compiling x86_64-unknown-linux-musl Baseline (no-AVX2 / generic)..."
+                                RUSTFLAGS="-D warnings -C target-cpu=generic -C target-feature=-avx,-avx2,-fma" \
+                                cargo zigbuild --release --locked -p uc-discussions --target x86_64-unknown-linux-musl
+                                
+                                DST_BASE="artifacts/bin/ck-uc-discussions-x86_64-musl-no-avx2"
+                                cp "$SRC" "$DST_BASE"
+                                file "$DST_BASE"
+
+                                tar -C target/x86_64-unknown-linux-musl/release -czvf \
+                                    "artifacts/archives/ck-uc-discussions-${PACKAGE_VERSION}-linux-x86_64-musl-no-avx2.tar.gz" ck-uc-discussions
+                            fi
                         '''
                     }
                 }
 
-                stage('Linux x86_64 Dynamic (glibc 2.31 LTS)') {
+                stage('Linux x86_64 Dynamic (glibc 2.31 & no-AVX2)') {
                     steps {
                         sh '''
                             set -eu
-                            echo "==> Compiling x86_64-unknown-linux-gnu.2.31 (glibc LTS baseline)..."
+                            echo "==> 1. Compiling x86_64-unknown-linux-gnu.2.31 (Standard / AVX2)..."
                             cargo zigbuild --release --locked -p uc-discussions --target x86_64-unknown-linux-gnu.2.31
                             
                             SRC="target/x86_64-unknown-linux-gnu/release/ck-uc-discussions"
@@ -93,13 +106,8 @@ pipeline {
                             cp "$SRC" "$DST"
 
                             if [ "$RUN_ELF_AUDIT" = "true" ]; then
-                                echo "==> Auditing x86_64 glibc ELF binary..."
                                 file "$DST"
                                 if command -v readelf >/dev/null 2>&1; then
-                                    echo "  Dynamic dependencies:"
-                                    readelf -d "$DST" | grep NEEDED || true
-                                    echo "  Checking glibc symbol version ceilings:"
-                                    # Fail if any symbol requires GLIBC_2.32 or newer
                                     if readelf -sV "$DST" 2>&1 | grep -E 'GLIBC_2\.(3[2-9]|[4-9][0-9])' ; then
                                         echo "ERROR: Binary leaked symbols exceeding GLIBC_2.31 ceiling!" >&2
                                         exit 1
@@ -108,11 +116,22 @@ pipeline {
                                 fi
                             fi
 
-                            # Package portable glibc tarball
                             tar -C target/x86_64-unknown-linux-gnu/release -czvf \
                                 "artifacts/archives/ck-uc-discussions-${PACKAGE_VERSION}-linux-x86_64-gnu.tar.gz" ck-uc-discussions
 
-                            # Attempt distro packaging if tools installed in image
+                            if [ "$BUILD_BASELINE_NO_AVX2" = "true" ]; then
+                                echo "==> 2. Compiling x86_64-unknown-linux-gnu.2.31 Baseline (no-AVX2 / generic)..."
+                                RUSTFLAGS="-D warnings -C target-cpu=generic -C target-feature=-avx,-avx2,-fma" \
+                                cargo zigbuild --release --locked -p uc-discussions --target x86_64-unknown-linux-gnu.2.31
+                                
+                                DST_BASE="artifacts/bin/ck-uc-discussions-x86_64-linux-gnu-no-avx2"
+                                cp "$SRC" "$DST_BASE"
+                                file "$DST_BASE"
+
+                                tar -C target/x86_64-unknown-linux-gnu/release -czvf \
+                                    "artifacts/archives/ck-uc-discussions-${PACKAGE_VERSION}-linux-x86_64-gnu-no-avx2.tar.gz" ck-uc-discussions
+                            fi
+
                             if [ "$PACKAGE_DISTRO" = "true" ]; then
                                 if command -v cargo-deb >/dev/null 2>&1; then
                                     echo "==> Generating .deb package..."
@@ -131,7 +150,7 @@ pipeline {
                     steps {
                         sh '''
                             set -eu
-                            echo "==> Compiling aarch64-unknown-linux-musl (fully static)..."
+                            echo "==> Compiling aarch64-unknown-linux-musl (ARM64 static)..."
                             cargo zigbuild --release --locked -p uc-discussions --target aarch64-unknown-linux-musl
                             
                             SRC="target/aarch64-unknown-linux-musl/release/ck-uc-discussions"
@@ -139,7 +158,6 @@ pipeline {
                             cp "$SRC" "$DST"
 
                             if [ "$RUN_ELF_AUDIT" = "true" ]; then
-                                echo "==> Auditing aarch64 musl ELF binary..."
                                 file "$DST"
                             fi
 
@@ -153,7 +171,7 @@ pipeline {
                     steps {
                         sh '''
                             set -eu
-                            echo "==> Compiling aarch64-unknown-linux-gnu.2.31 (glibc LTS baseline)..."
+                            echo "==> Compiling aarch64-unknown-linux-gnu.2.31 (ARM64 glibc)..."
                             cargo zigbuild --release --locked -p uc-discussions --target aarch64-unknown-linux-gnu.2.31
                             
                             SRC="target/aarch64-unknown-linux-gnu/release/ck-uc-discussions"
@@ -161,12 +179,7 @@ pipeline {
                             cp "$SRC" "$DST"
 
                             if [ "$RUN_ELF_AUDIT" = "true" ]; then
-                                echo "==> Auditing aarch64 glibc ELF binary..."
                                 file "$DST"
-                                if command -v readelf >/dev/null 2>&1; then
-                                    echo "  Dynamic dependencies:"
-                                    readelf -d "$DST" | grep NEEDED || true
-                                fi
                             fi
 
                             tar -C target/aarch64-unknown-linux-gnu/release -czvf \
@@ -215,7 +228,7 @@ pipeline {
             archiveArtifacts artifacts: 'artifacts/**/*', fingerprint: true, allowEmptyArchive: false
         }
         success {
-            echo "SUCCESS: Bounded 4-target Linux matrix compiled, audited, and staged for Sequence ${params.ARCUS_SEQUENCE}."
+            echo "SUCCESS: Linux multi-platform matrix (including AVX2 and baseline no-AVX2) compiled, audited, and staged."
         }
         failure {
             echo "FAILURE: Linux compilation or ELF audit failed. Check stage logs."
