@@ -65,14 +65,7 @@ pipeline {
                             cp "$SRC" "$DST"
 
                             if [ "$RUN_ELF_AUDIT" = "true" ]; then
-                                file "$DST"
-                                if command -v readelf >/dev/null 2>&1; then
-                                    if readelf -l "$DST" 2>&1 | grep -q 'INTERP'; then
-                                        echo "ERROR: x86_64-unknown-linux-musl requested an interpreter! Must be static/static-PIE." >&2
-                                        exit 1
-                                    fi
-                                    echo "  [PASS] Verified zero interpreter dependencies (static/static-PIE)."
-                                fi
+                                ./fleet/ci/elf-audit.sh "$DST" static
                             fi
 
                             tar -C target/x86_64-unknown-linux-musl/release -czvf \
@@ -87,14 +80,7 @@ pipeline {
                                 cp "$SRC" "$DST_BASE"
 
                                 if [ "$RUN_ELF_AUDIT" = "true" ]; then
-                                    file "$DST_BASE"
-                                    if command -v readelf >/dev/null 2>&1; then
-                                        if readelf -l "$DST_BASE" 2>&1 | grep -q 'INTERP'; then
-                                            echo "ERROR: x86_64-unknown-linux-musl (no-AVX2) requested an interpreter!" >&2
-                                            exit 1
-                                        fi
-                                        echo "  [PASS] Verified zero interpreter dependencies on baseline no-AVX2."
-                                    fi
+                                    ./fleet/ci/elf-audit.sh "$DST_BASE" static
                                 fi
 
                                 tar -C target/x86_64-unknown-linux-musl/release -czvf \
@@ -116,14 +102,7 @@ pipeline {
                             cp "$SRC" "$DST"
 
                             if [ "$RUN_ELF_AUDIT" = "true" ]; then
-                                file "$DST"
-                                if command -v readelf >/dev/null 2>&1; then
-                                    if readelf -sV "$DST" 2>&1 | grep -E 'GLIBC_2\.(3[2-9]|[4-9][0-9])' ; then
-                                        echo "ERROR: Binary leaked symbols exceeding GLIBC_2.31 ceiling!" >&2
-                                        exit 1
-                                    fi
-                                    echo "  [PASS] Verified glibc <= 2.31 compatibility."
-                                fi
+                                ./fleet/ci/elf-audit.sh "$DST" 2.31
                             fi
 
                             tar -C target/x86_64-unknown-linux-gnu/release -czvf \
@@ -138,14 +117,7 @@ pipeline {
                                 cp "$SRC" "$DST_BASE"
 
                                 if [ "$RUN_ELF_AUDIT" = "true" ]; then
-                                    file "$DST_BASE"
-                                    if command -v readelf >/dev/null 2>&1; then
-                                        if readelf -sV "$DST_BASE" 2>&1 | grep -E 'GLIBC_2\.(3[2-9]|[4-9][0-9])' ; then
-                                            echo "ERROR: Baseline binary leaked symbols exceeding GLIBC_2.31 ceiling!" >&2
-                                            exit 1
-                                        fi
-                                        echo "  [PASS] Verified baseline glibc <= 2.31 compatibility."
-                                    fi
+                                    ./fleet/ci/elf-audit.sh "$DST_BASE" 2.31
                                 fi
 
                                 tar -C target/x86_64-unknown-linux-gnu/release -czvf \
@@ -178,14 +150,7 @@ pipeline {
                             cp "$SRC" "$DST"
 
                             if [ "$RUN_ELF_AUDIT" = "true" ]; then
-                                file "$DST"
-                                if command -v readelf >/dev/null 2>&1; then
-                                    if readelf -l "$DST" 2>&1 | grep -q 'INTERP'; then
-                                        echo "ERROR: aarch64-unknown-linux-musl requested an interpreter!" >&2
-                                        exit 1
-                                    fi
-                                    echo "  [PASS] Verified aarch64 zero interpreter dependencies."
-                                fi
+                                ./fleet/ci/elf-audit.sh "$DST" static
                             fi
 
                             tar -C target/aarch64-unknown-linux-musl/release -czvf \
@@ -206,14 +171,7 @@ pipeline {
                             cp "$SRC" "$DST"
 
                             if [ "$RUN_ELF_AUDIT" = "true" ]; then
-                                file "$DST"
-                                if command -v readelf >/dev/null 2>&1; then
-                                    if readelf -sV "$DST" 2>&1 | grep -E 'GLIBC_2\.(3[2-9]|[4-9][0-9])' ; then
-                                        echo "ERROR: aarch64 binary leaked symbols exceeding GLIBC_2.31 ceiling!" >&2
-                                        exit 1
-                                    fi
-                                    echo "  [PASS] Verified aarch64 glibc <= 2.31 compatibility."
-                                fi
+                                ./fleet/ci/elf-audit.sh "$DST" 2.31
                             fi
 
                             tar -C target/aarch64-unknown-linux-gnu/release -czvf \
