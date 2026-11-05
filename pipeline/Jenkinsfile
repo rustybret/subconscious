@@ -67,11 +67,11 @@ pipeline {
                             if [ "$RUN_ELF_AUDIT" = "true" ]; then
                                 file "$DST"
                                 if command -v readelf >/dev/null 2>&1; then
-                                    if readelf -d "$DST" 2>&1 | grep -q 'DYNAMIC'; then
-                                        echo "ERROR: x86_64-unknown-linux-musl contains dynamic section!" >&2
+                                    if readelf -l "$DST" 2>&1 | grep -q 'INTERP'; then
+                                        echo "ERROR: x86_64-unknown-linux-musl requested an interpreter! Must be static/static-PIE." >&2
                                         exit 1
                                     fi
-                                    echo "  [PASS] Clean static binary verified."
+                                    echo "  [PASS] Verified zero interpreter dependencies (static/static-PIE)."
                                 fi
                             fi
 
@@ -85,7 +85,17 @@ pipeline {
                                 
                                 DST_BASE="artifacts/bin/ck-uc-discussions-x86_64-musl-no-avx2"
                                 cp "$SRC" "$DST_BASE"
-                                file "$DST_BASE"
+
+                                if [ "$RUN_ELF_AUDIT" = "true" ]; then
+                                    file "$DST_BASE"
+                                    if command -v readelf >/dev/null 2>&1; then
+                                        if readelf -l "$DST_BASE" 2>&1 | grep -q 'INTERP'; then
+                                            echo "ERROR: x86_64-unknown-linux-musl (no-AVX2) requested an interpreter!" >&2
+                                            exit 1
+                                        fi
+                                        echo "  [PASS] Verified zero interpreter dependencies on baseline no-AVX2."
+                                    fi
+                                fi
 
                                 tar -C target/x86_64-unknown-linux-musl/release -czvf \
                                     "artifacts/archives/ck-uc-discussions-${PACKAGE_VERSION}-linux-x86_64-musl-no-avx2.tar.gz" ck-uc-discussions
@@ -126,7 +136,17 @@ pipeline {
                                 
                                 DST_BASE="artifacts/bin/ck-uc-discussions-x86_64-linux-gnu-no-avx2"
                                 cp "$SRC" "$DST_BASE"
-                                file "$DST_BASE"
+
+                                if [ "$RUN_ELF_AUDIT" = "true" ]; then
+                                    file "$DST_BASE"
+                                    if command -v readelf >/dev/null 2>&1; then
+                                        if readelf -sV "$DST_BASE" 2>&1 | grep -E 'GLIBC_2\.(3[2-9]|[4-9][0-9])' ; then
+                                            echo "ERROR: Baseline binary leaked symbols exceeding GLIBC_2.31 ceiling!" >&2
+                                            exit 1
+                                        fi
+                                        echo "  [PASS] Verified baseline glibc <= 2.31 compatibility."
+                                    fi
+                                fi
 
                                 tar -C target/x86_64-unknown-linux-gnu/release -czvf \
                                     "artifacts/archives/ck-uc-discussions-${PACKAGE_VERSION}-linux-x86_64-gnu-no-avx2.tar.gz" ck-uc-discussions
@@ -159,6 +179,13 @@ pipeline {
 
                             if [ "$RUN_ELF_AUDIT" = "true" ]; then
                                 file "$DST"
+                                if command -v readelf >/dev/null 2>&1; then
+                                    if readelf -l "$DST" 2>&1 | grep -q 'INTERP'; then
+                                        echo "ERROR: aarch64-unknown-linux-musl requested an interpreter!" >&2
+                                        exit 1
+                                    fi
+                                    echo "  [PASS] Verified aarch64 zero interpreter dependencies."
+                                fi
                             fi
 
                             tar -C target/aarch64-unknown-linux-musl/release -czvf \
@@ -180,6 +207,13 @@ pipeline {
 
                             if [ "$RUN_ELF_AUDIT" = "true" ]; then
                                 file "$DST"
+                                if command -v readelf >/dev/null 2>&1; then
+                                    if readelf -sV "$DST" 2>&1 | grep -E 'GLIBC_2\.(3[2-9]|[4-9][0-9])' ; then
+                                        echo "ERROR: aarch64 binary leaked symbols exceeding GLIBC_2.31 ceiling!" >&2
+                                        exit 1
+                                    fi
+                                    echo "  [PASS] Verified aarch64 glibc <= 2.31 compatibility."
+                                fi
                             fi
 
                             tar -C target/aarch64-unknown-linux-gnu/release -czvf \
