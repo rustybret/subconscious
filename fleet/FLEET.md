@@ -1,26 +1,42 @@
 # Fleet module sources
 
 What runs under the local `ck-subc`, where each binary comes from, and who builds it. Update this
-file in the same commit that changes a module's source. Verified 2026-11-02.
+file in the same commit that changes a module's source. Verified 2026-11-12.
 
-| Module | Version | Source | Built by |
-| --- | --- | --- | --- |
-| `ck-subc`, `ck` | 0.20.155 | CortexKit official release (`subc-core-v0.20.124`), signed | CortexKit |
-| `ck-subc-mcp` | 0.1.42 (`subc-core-v0.20.124`) | CortexKit official release | CortexKit |
-| `ck-insula` | 0.1.1 (upstream main `5aa93fae8`, unreleased) | `submodules/insula`, built unmodified. Official v0.1.1 release predates the published-crate migration and crash-looped on stock `ck-subc` 0.20.124 (`invalid envelope header: reserved flag bits set`). Deployed 2026-10-28: 1568 tests pass, isolated sandbox PASS, live healthy (`buildCommit 5aa93fae8083`). Backup: `~/.local/state/insula-backup-20261028-144154`. Return to official release once upstream publishes past v0.1.1. | us |
-| `ck-synapse` | 0.1.0-alpha.2 | CortexKit official release | CortexKit |
-| `ck-claustrum` | 0.2.0 (official release `v0.2.0`, published 2026-10-22) | CortexKit official release (`v0.2.0`, `ck-claustrum` and `ck-auth`), consumer enrollment, scoped grants, schema 18 forward migration. Deployed 2026-10-25; vault schema 18 active, credentials preserved (backup: `~/.local/state/claustrum-backup-20261025-0.2.0-pre`). Running binary matches official CortexKit release. | CortexKit |
-| `ck-mc` | 0.49.35 (upstream tag `v0.49.35`, `ba17c98db`) | Upstream publishes no current binary. Built unmodified from tag on this Mac (MC_BUILD_SHA=ba17c98db4a6c9aefc35c22f7f29a8f38c017828, adhoc codesign hardened-runtime). Placed 2026-11-02 with `place-ck-mc.sh --require-epochs-unchanged` (context 95/95, store 63/63, all four epochs unchanged); `orw-probe.sh` `UP_TO_DATE`. Plugin pin `@cortexkit/opencode-magic-context@latest` (0.49.35). Rollback binaries in `~/.local/share/cortexkit/bin/staging/`. | us (Darwin build/placement), Cloudhome (Arcus multi-arch packaging) |
-| `ck-entorhinal` | 0.1.46 (submodule commit `84677e1`) | Upstream `origin/main` (`submodules/entorhinal`), unmodified. Built & deployed 2026-10-25; verified `ck-entorhinal 0.1.46` serving `project-identity/v1` and `agent-identity/v1` under `ck-subc` (backup: `~/.local/state/cortexkit-backup-20261025-entorhinal-0.1.20/`). | us |
-| `aft` | 0.62.0 (official CortexKit release, signed) | CortexKit official release (`ck-aft 0.62.0`), running at `~/.local/share/cortexkit/bin/ck-aft` supervised by `ck-subc` 0.20.124 (PID 1753, SHA256 `02a486175a4d…`). Plugin is published `@cortexkit/aft-opencode@0.63.5`. Fork retired in favor of upstream config equivalency. | CortexKit |
-| `ck-uc-discussions` | 0.1.2 (room closure provenance, schema v4, inbox; Arcus package `uc-discussions` seq 3) | `modules/uc-discussions/` (running at `~/.local/bin/ck-uc-discussions` under stock `ck-subc 0.20.124`) | us |
-| `ck-fusiform`, `ck-models` | 0.1.0 (`fusiform-protocol` 0.30.0 on crates.io; catalog version 1792525097774) | `submodules/fusiform` (`ck models` CLI) | us |
-| `ck-astrocyte` | 0.1.0 | `submodules/astrocyte` (AI usage & spend ledger) | us |
-| `lore-thalamus` | n/a | Lore, **deprecated**; left running, never updated (session identity for non-OpenCode harnesses; no published equivalent) | n/a |
-| `lore-broca`, `lore-wake`, `lore-mcp-gateway` | n/a | **Retired 2026-10-17** (operator-approved): broca unused with `transform_mode: ts`, wake replaced by `project_room` + `ck-uc-discussions`, mcp-gateway had no clients. Binaries archived in `~/.local/state/lore-retired-20261017-073526/` | n/a |
+## Setup-managed (CortexKit official releases)
 
-Daemon configuration that replaces our retired patches:
+Installed and upgraded by `ck setup <component>` / `ck upgrade` from the signed index
+`https://cortexkit.io/releases/v1/index.json`; recorded in `~/.local/share/cortexkit/installer-manifest.json`.
+Never hand-place these: `ck setup` refuses binaries it did not install.
 
-- `XDG_RUNTIME_DIR=$HOME/.local/share/cortexkit/run` in `~/Library/LaunchAgents/cortexkit.subc.plist`, so the stock
-  daemon writes its connection file there and not to the macOS temp directory.
-- `route_bind_relay_timeout_ms: 450000` for `aft` in `~/.config/cortexkit/subc.jsonc`.
+| Module | Version | Notes |
+| --- | --- | --- |
+| `ck-subc`, `ck`, `ck-subc-mcp` | 0.21.3 (`subc-core-v0.21.3`; `ck-subc-mcp` reports 0.2.2) | Cut over 2026-11-11. `ck` was placed by hand from the verified release (`ck upgrade` does not replace the CLI); the manifest still records `ck` 0.20.83. |
+| `ck-claustrum`, `ck-auth` | 0.3.0 (`119f56b2`) | Installed 2026-11-12 with `ck setup claustrum --key-path ~/.config/cortexkit/claustrum.key` (key file custody unchanged). Vault schema 18 -> 32; 0.3.0 mints `kem:secret-deposit:1`. Audit chain intact, stranded 0. Pre-upgrade copy: `~/.local/state/setup-migration-20261111-203127/claustrum-pre-0.3.0/`. |
+| `ck-insula` | 0.2.1 (`135b0b374e9c`) | Replaced our 0.1.1 source build 2026-11-12. Reads logins from the vault: grants `reserved:insula` read on categories `llm-provider` and `browser-session`. |
+| `ck-aft` | 0.64.0 | Plugin `@cortexkit/aft-opencode@0.64.0`. Runs at the daemon's default 12 s route.bind relay timeout. |
+| `ck-synapse` (+ `opctl`, workers) | 0.1.0-alpha.2 | Reinstalled from the release 2026-11-12 (the previous binaries were not the release bytes). |
+
+## Built by us (no upstream release)
+
+| Module | Version | Source |
+| --- | --- | --- |
+| `ck-mc` | 0.49.52 (`1f2dca0e6`) | Unmodified upstream tag `v0.49.52`, built on this Mac with `MC_BUILD_SHA` set, ad-hoc signed `--identifier ck-mc` hardened runtime, placed 2026-11-11 with `place-ck-mc.sh --require-epochs-unchanged` (epochs unchanged; context 95/95, store 63/63). Plugin pin `@cortexkit/opencode-magic-context@0.49.52`; `orw-probe.sh` `UP_TO_DATE`. Rollback in `~/.local/share/cortexkit/bin/staging/`. Linux builds: Cloudhome. **Blocks `ck upgrade`**: it sits at a setup-managed name without setup ownership, so `ck upgrade --check` refuses until it moves. |
+| `ck-entorhinal` | 0.1.46 (`84677e1`) | `submodules/entorhinal`, unmodified upstream. The submodule pointer is ahead of the deployed build. |
+| `ck-fusiform`, `ck-models` | 0.1.0 | `submodules/fusiform` (`ck models` CLI). |
+| `ck-astrocyte` | 0.1.0 | `submodules/astrocyte` (AI usage and spend ledger). |
+| `ck-uc-discussions` | 0.1.2 (Arcus package `uc-discussions` seq 3) | `modules/uc-discussions/`, at `~/.local/bin/ck-uc-discussions`. |
+
+## Retired
+
+- `lore-thalamus`: retired 2026-11-12 (operator-approved); removed from `subc.jsonc`, binary archived in
+  `~/.local/state/setup-migration-20261111-203127/archive/`. That completes Lore's removal from the fleet.
+- `lore-broca`, `lore-wake`, `lore-mcp-gateway`: retired 2026-10-17; archived in `~/.local/state/lore-retired-20261017-073526/`.
+
+## Daemon configuration
+
+Stock since 2026-11-12: the launchd plist is setup's own definition (no `XDG_RUNTIME_DIR`), so the daemon writes its
+connection file to `$TMPDIR/subc-<uid>.connection.json`. Clients auto-discover it; nothing may pin
+`~/.local/share/cortexkit/run/subc-connection.json` (ck on macOS checks that path first, so a stale file there
+breaks discovery). No module carries `reserved` except claustrum, magic-context, uc-discussions and entorhinal, and no
+module overrides `route_bind_relay_timeout_ms`.
