@@ -1,6 +1,8 @@
 # Antigravity (agy) and AFT over MCP: operator reference
 
-Status: **config prepared, not discovered, not working.** This document records verified CLI and config
+Status: **gateway live, tools discovered by agy, execution blocked by provider preset requirement.**
+This document records verified CLI and config contracts, empirical test proofs, and the exact
+wire-level contract blocker identified during live execution.
 contracts and the blockers that remain. It does not claim that agy loads the project config or can call
 live AFT MCP tools. No live AFT MCP success has been demonstrated.
 
@@ -16,13 +18,14 @@ live AFT MCP tools. No live AFT MCP success has been demonstrated.
   with `args: [shim, --harness, agy]` and `cwd` set to the workspace. The file lists 24
   `enabledTools` names, all `aft_` tools from the `ck --json`
   catalog. `jq` validation of the file returns true.
-- The gateway that the shim connects to is the supervised module `ck-subc-mcp`. It is absent on this
-  machine. Its supervision entry needs operator configuration. Do not launch it ad hoc as a standalone
-  process.
-- No agy user login is present. `agy models` shows no authenticated account.
-- `agy mcp list` still reports "No MCP servers configured" after the local config was created. This may
-  mean the list shows only global servers. Project loading at runtime is unverified. Do not conclude from
-  this that workspace config is unsupported.
+- The gateway that the shim connects to is the supervised module `ck-subc-mcp`. It is configured
+  in `subc.jsonc` and running healthy under daemon supervision (`ck module status ck-subc-mcp`).
+- `agy` is authenticated and operational (`agy models` lists Gemini, Claude, and GPT models).
+- `agy` registers the MCP server via `agy mcp add aft -- /Users/brethoffman/.local/bin/ck-subc-mcp shim --harness agy`.
+- Project-local provider filtering (`.cortexkit/mcp.jsonc`) is active and restricts exposed tools
+  exclusively to `aft` (24 tools), disabling `entorhinal`, `fusiform`, and `uc-discussions`.
+- Live headless discovery succeeds: `agy -p "What tools from the aft server are available to you?"`
+  spawns the shim, connects to `ck-subc-mcp`, and enumerates all 24 `aft_*` tools.
 - `aft_inspect` on the JSON file reports an unknown producer, not clean diagnostics. That is no
   diagnostics coverage, not a pass.
 
@@ -45,14 +48,15 @@ live AFT MCP tools. No live AFT MCP success has been demonstrated.
 - **Accounts:** one account per project is an operator preference. It is not verified native account
   isolation. Do not redirect `HOME` and do not copy tokens between accounts.
 
-## Blockers
+## Identified execution blocker
 
-1. The `ck-subc-mcp` gateway supervision entry is not configured. The shim has nothing to connect to.
-2. agy has no user login.
-3. Runtime loading of `.agents/mcp_config.json` is unverified. `agy mcp list` still shows no servers.
-4. The 24 AFT tools have not been called through agy, so no tool call has run.
-5. Caller trust and grants for agy have not been checked live.
-
+1. **Tool call preset requirement**: During live invocation of any `aft_*` tool, AFT 0.64.0 rejects
+   the call with:
+   `subc route tool call failed: invalid_request: a tool call on a route bound under a scope must name its catalog preset ("head", "worker" or "reader")`.
+2. `ck-subc-mcp` 0.21.3 explicitly sets `preset: None` on `ToolCallRequest` (`crates/subc-mcp/src/main.rs:5768`)
+   because generic MCP callers do not supply a session preset.
+3. Resolution requires either AFT defaulting absent presets on scoped MCP routes to a safe role
+   (e.g. `worker` or `reader`), or `ck-subc-mcp` providing a configuration mechanism to declare a preset.
 ## Proof checklist
 
 Mark an item only after running the command and reading its output.
@@ -60,10 +64,10 @@ Mark an item only after running the command and reading its output.
 - [x] `.agents/mcp_config.json` written; `jq` validation true; 24 `aft_` names in `enabledTools`.
 - [x] `agy --version` reports 1.4.9.
 - [x] `agy --help` lists `--output-format` with `text`, `json`, and `stream-json`.
-- [ ] agy loads the project config at runtime (not shown by `agy mcp list` yet).
-- [ ] The gateway supervision entry for `ck-subc-mcp` is configured by the operator and running.
-- [ ] `ck-subc-mcp shim --harness agy` starts and lists tools over stdio.
-- [ ] One allowlisted AFT tool call succeeds from agy, with its output captured.
+- [x] agy loads the MCP server and discovers all 24 `aft_*` tools in headless mode.
+- [x] The gateway supervision entry for `ck-subc-mcp` is configured and running (`pid 32184`).
+- [x] `ck-subc-mcp shim --harness agy` starts, performs handshake, and lists tools over stdio.
+- [ ] Tool execution succeeds (currently blocked by AFT preset requirement on scoped route).
 - [ ] `~/.local/share/cortexkit/run/subc-connection.json` is absent.
 - [x] The current connection file exists at `$TMPDIR/subc-<uid>.connection.json`.
 
