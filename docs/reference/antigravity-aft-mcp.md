@@ -53,10 +53,14 @@ live AFT MCP tools. No live AFT MCP success has been demonstrated.
 1. **Tool call preset requirement**: During live invocation of any `aft_*` tool, AFT 0.64.0 rejects
    the call with:
    `subc route tool call failed: invalid_request: a tool call on a route bound under a scope must name its catalog preset ("head", "worker" or "reader")`.
-2. `ck-subc-mcp` 0.21.3 explicitly sets `preset: None` on `ToolCallRequest` (`crates/subc-mcp/src/main.rs:5768`)
-   because generic MCP callers do not supply a session preset.
-3. Resolution requires either AFT defaulting absent presets on scoped MCP routes to a safe role
-   (e.g. `worker` or `reader`), or `ck-subc-mcp` providing a configuration mechanism to declare a preset.
+2. **AFT 0.64 invariant (verified)**: In `crates/aft/src/subc/tool_provider.rs` (`resolve_caller_role` L4150-4167),
+   AFT intentionally enforces that any route stamped with a daemon scope must name its catalog preset.
+   Preset `None` on a scoped route is deliberately rejected as `invalid_request` with no config override.
+   On unscoped routes, `None` falls back to `Head` for legacy callers, but scoped routes cannot fall back.
+3. **Gateway contract**: `ck-subc-mcp` 0.21.3 explicitly sets `preset: None` on `ToolCallRequest` (`crates/subc-mcp/src/main.rs:5768`).
+   To resolve this, `ck-subc-mcp` must either provide a configuration mechanism to declare a preset
+   (e.g., `"worker"` or `"reader"`) on outgoing `ToolCallRequest`s, or bind routes unscoped when the MCP host
+   cannot name a preset. This is tracked on the gateway/Subconscious roadmap.
 ## Proof checklist
 
 Mark an item only after running the command and reading its output.
