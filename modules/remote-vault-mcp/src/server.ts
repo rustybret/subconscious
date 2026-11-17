@@ -8,8 +8,9 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { z } from "zod";
 
-import { authenticateRequest, sendUnauthorized, validateBindInterface, redactSecret } from "./auth.js";
+import { authenticateRequest, sendUnauthorized, validateBindInterface } from "./auth.js";
 import { VaultService } from "./claustrum.js";
+import { AftBridge } from "./aft.js";
 
 export interface ServerOptions {
   host?: string;
@@ -18,6 +19,30 @@ export interface ServerOptions {
   envFile?: string;
   allowLoopback?: boolean;
   vaultService?: VaultService;
+  aftBridge?: AftBridge;
+  enableAft?: boolean;
+}
+
+function jsonSchemaToZodShape(schema: any): Record<string, z.ZodTypeAny> {
+  if (!schema || typeof schema !== "object" || !schema.properties) {
+    return {};
+  }
+  const shape: Record<string, z.ZodTypeAny> = {};
+  const required = new Set(Array.isArray(schema.required) ? schema.required : []);
+
+  for (const [key, prop] of Object.entries<any>(schema.properties)) {
+    let field: z.ZodTypeAny;
+    if (prop.type === "string") field = z.string();
+    else if (prop.type === "number" || prop.type === "integer") field = z.number();
+    else if (prop.type === "boolean") field = z.boolean();
+    else if (prop.type === "array") field = z.array(z.any());
+    else field = z.any();
+
+    if (prop.description) field = field.describe(prop.description);
+    if (!required.has(key)) field = field.optional();
+    shape[key] = field;
+  }
+  return shape;
 }
 
 export async function loadBearerToken(envFile?: string): Promise<string> {
@@ -45,7 +70,7 @@ export async function loadBearerToken(envFile?: string): Promise<string> {
   throw new Error(`VAULT_MCP_BEARER_TOKEN not found in environment or "${filePath}"`);
 }
 
-export function createVaultMcpServer(vault: VaultService): McpServer {
+export function createVaultMcpServer(vault: VaultService, aft?: AftBridge): McpServer {
   const server = new McpServer({
     name: "cortexkit-vault",
     version: "0.1.0",
@@ -134,6 +159,32 @@ export function createVaultMcpServer(vault: VaultService): McpServer {
       }
     }
   );
+  // AFT Tools Bridge
+  if (aft) {
+    for (const tool of aft.getTools()) {
+      const toolName = `aft_${tool.name}`;
+      const shape = jsonSchemaToZodShape(tool.schema);
+      server.tool(
+        toolName,
+        tool.description,
+        shape,
+        async (args: any) => {
+          try {
+            const reply: any = await aft.invokeTool(tool.name, args || {});
+            return {
+              isError: Boolean(reply.isError),
+              content: reply.content || [{ type: "text", text: JSON.stringify(reply, null, 2) }],
+            };
+          } catch (err) {
+            return {
+              isError: true,
+              content: [{ type: "text", text: `AFT tool "${tool.name}" failed: ${String(err)}` }],
+            };
+          }
+        }
+      );
+    }
+  }
 
   return server;
 }
@@ -143,6 +194,7 @@ export async function startServer(options: ServerOptions = {}): Promise<{
   host: string;
   port: number;
   vaultService: VaultService;
+  aftBridge?: AftBridge;
   close: () => Promise<void>;
 }> {
   const host = options.host || process.env.VAULT_MCP_BIND_HOST || "10.44.0.10";
@@ -160,6 +212,17 @@ export async function startServer(options: ServerOptions = {}): Promise<{
   const vault = options.vaultService || new VaultService();
   await vault.init();
 
+  let aft: AftBridge | undefined = options.aftBridge;
+  if (!aft && options.enableAft !== false) {
+    try {
+      aft = new AftBridge();
+      await aft.init();
+      console.log(`AFT bridge active: exposed ${aft.getTools().length} tools over SubC with preset: head.`);
+    } catch (err) {
+      console.warn(`AFT bridge initialization skipped: ${String(err)}`);
+      aft = undefined;
+    }
+  }
   // Map of active Streamable HTTP sessions
   const streamableSessions = new Map<string, { transport: StreamableHTTPServerTransport; server: McpServer }>();
 
@@ -206,7 +269,7 @@ export async function startServer(options: ServerOptions = {}): Promise<{
         if (sid) streamableSessions.delete(sid);
       };
 
-      instanceServer = createVaultMcpServer(vault);
+      instanceServer = createVaultMcpServer(vault, aft);
       await instanceServer.connect(transport);
       await transport.handleRequest(req, res);
       return;
@@ -216,7 +279,7 @@ export async function startServer(options: ServerOptions = {}): Promise<{
     if (url.pathname === "/sse" && req.method === "GET") {
       const sseTransport = new SSEServerTransport("/messages", res);
       sseTransports.set(sseTransport.sessionId, sseTransport);
-      const sseServer = createVaultMcpServer(vault);
+      const sseServer = createVaultMcpServer(vault, aft);
       await sseServer.connect(sseTransport);
       return;
     }
@@ -250,9 +313,11 @@ export async function startServer(options: ServerOptions = {}): Promise<{
     host,
     port: actualPort,
     vaultService: vault,
+    aftBridge: aft,
     close: async () => {
       await new Promise<void>((resolve) => httpServer.close(() => resolve()));
       await vault.close();
+      if (aft) await aft.close();
     },
   };
 }

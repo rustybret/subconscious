@@ -223,4 +223,81 @@ describe("Remote Vault MCP Server Integration Tests", () => {
     expect(text).toContain("apikey:deepseek");
     expect(text).toContain("token");
   });
+
+  it("advertises AFT tools on tools/list", async () => {
+    const res = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${testBearer}`,
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        "mcp-session-id": activeSessionId,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 5,
+        method: "tools/list",
+        params: {},
+      }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain("aft_read");
+    expect(text).toContain("aft_status");
+    expect(text).toContain("aft_glob");
+    expect(text).toContain("aft_search");
+  });
+
+  it("executes aft_status over SubC with preset: head", async () => {
+    const res = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${testBearer}`,
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        "mcp-session-id": activeSessionId,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 6,
+        method: "tools/call",
+        params: {
+          name: "aft_status",
+          arguments: {},
+        },
+      }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain("AFT");
+    expect(text).not.toContain("invalid_request");
+  });
+
+  it("executes aft_read on README.md over SubC with preset: head", async () => {
+    const res = await fetch(`${baseUrl}/mcp`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${testBearer}`,
+        "Content-Type": "application/json",
+        Accept: "application/json, text/event-stream",
+        "mcp-session-id": activeSessionId,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 7,
+        method: "tools/call",
+        params: {
+          name: "aft_read",
+          arguments: {
+            path: "README.md",
+            limit: 3,
+          },
+        },
+      }),
+    });
+    expect(res.status).toBe(200);
+    const text = await res.text();
+    expect(text).toContain("subconscious");
+    expect(text).not.toContain("invalid_request");
+  });
 });

@@ -2,7 +2,7 @@
 
 Status: **Implemented, deployed, and live-verified.**
 
-This service exposes CortexKit's credential vault (`ck-claustrum`) over private WireGuard mesh networks to in-cluster machines (e.g. `altos-worker-01`, `altos-worker-02`, cloud pods). It allows headless CLI agents (`agy`) and OpenCode instances to consume fresh, centrally-refreshed access tokens or proxy API requests without holding OAuth refresh tokens, preventing OAuth token-reuse collisions.
+This service exposes CortexKit's credential vault (`ck-claustrum`) and Agent File Tools (`ck-aft`) over private WireGuard mesh networks to in-cluster machines (e.g. `altos-worker-01`, `altos-worker-02`, cloud pods) and local agent CLIs (`agy`). It solves cross-machine credential access without raw OAuth refresh token copying, completely preventing token-reuse collisions, while simultaneously bridging all 24 published AFT tools with automatic `preset: "head"` injection over SubC.
 
 ---
 
@@ -36,14 +36,18 @@ This service exposes CortexKit's credential vault (`ck-claustrum`) over private 
 
 ## 2. Tool Surface
 
-The server exposes three tools:
+The server exposes 27 tools across two suites:
 
+### Suite A: Vault & Credential Tools
 | Tool | Signature | Purpose |
 | :--- | :--- | :--- |
 | **`list_providers`** | `list_providers()` | Non-secret inventory of active providers (`anthropic`, `openai`, `deepseek`, etc.). |
 | **`get_provider_token`** | `get_provider_token(provider, minTtlSeconds?)` | **Direct Token Dispenser**: Returns short-lived access token and remaining lifetime in seconds. |
 | **`call_api`** | `call_api(provider, endpoint, method, payload?, headers?)` | **Zero-Leak Proxy**: Executes authenticated request directly from the primary node. Client never sees the token. |
 
+### Suite B: AFT File Tools & Terminal Suite (24 Tools)
+All 24 tools from unmodified `ck-aft 0.65.0` are discovered dynamically and exposed as `aft_*` (`aft_read`, `aft_write`, `aft_edit`, `aft_glob`, `aft_grep`, `aft_search`, `aft_outline`, `aft_zoom`, `aft_inspect`, `aft_bash`, `aft_status`, etc.).
+On invocation, the server routes calls over an open SubC Channel 0 route with `preset: "head"` automatically injected, satisfying AFT 0.64+ invariants without forking AFT.
 ---
 
 ## 3. Worker Configuration
