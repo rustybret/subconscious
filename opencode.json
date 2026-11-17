@@ -1,2 +1,6 @@
 {
-  "$schema": "https://opencode.ai/config.json", "instructions": ["fleet/FLEET.md"] }
+    "$schema": "file:///Users/brethoffman/.config/opencode/plugins/omo-opencode-plugin/assets/opencode.schema.json",
+ "instructions": ["fleet/FLEET.md"],
+"permission": {
+  "external_directory": "allow"
+} }
