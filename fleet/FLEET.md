@@ -1,7 +1,8 @@
 # Fleet module sources
 
 What runs under the local `ck-subc`, where each binary comes from, and who builds it. Update this
-file in the same commit that changes a module's source. Verified 2026-11-12.
+file in the same commit that changes a module's source. Verified 2026-11-22 (`ck module list`, `ck catalog`,
+`ck upgrade --check`).
 
 ## Setup-managed (CortexKit official releases)
 
@@ -13,8 +14,8 @@ Never hand-place these: `ck setup` refuses binaries it did not install.
 | --- | --- | --- |
 | `ck-subc`, `ck`, `ck-subc-mcp` | 0.21.3 (`subc-core-v0.21.3`; `ck-subc-mcp` reports 0.2.2) | Cut over 2026-11-11; `ck` re-placed by `ck upgrade` 2026-11-12 so setup records it. `ck upgrade --check` reports everything up to date. |
 | `ck-claustrum`, `ck-auth` | 0.3.0 (`119f56b2`) | Installed 2026-11-12 with `ck setup claustrum --key-path ~/.config/cortexkit/claustrum.key` (key file custody unchanged). Vault schema 18 -> 32; 0.3.0 mints `kem:secret-deposit:1`. Audit chain intact, stranded 0. Pre-upgrade copy: `~/.local/state/setup-migration-20261111-203127/claustrum-pre-0.3.0/`. |
-| `ck-insula` | 0.2.1 (`135b0b374e9c`) | Replaced our 0.1.1 source build 2026-11-12. Reads logins from the vault: grants `reserved:insula` read on categories `llm-provider` and `browser-session`. |
-| `ck-aft` | 0.64.0 | Plugin `@cortexkit/aft-opencode@0.64.0`. Runs at the daemon's default 12 s route.bind relay timeout. |
+| `ck-insula` | 0.4.0 (`e87a49a6c1ca`) | Replaced our 0.1.1 source build 2026-11-12; upgraded 0.3.1 -> 0.4.0 by `ck upgrade` 2026-11-22. Reads logins from the vault: grants `reserved:insula` read on categories `llm-provider` and `browser-session`. |
+| `ck-aft` | 0.66.0 | Plugin `@cortexkit/aft-opencode@0.66.0` (the malformed `cortexkit/aft@0.66.0` entry was corrected 2026-11-21). Runs at the daemon's default 12 s route.bind relay timeout. |
 | `ck-synapse` (+ `opctl`, workers) | 0.1.0-alpha.2 | Reinstalled from the release 2026-11-12 (the previous binaries were not the release bytes). |
 
 ## Built by us (no upstream release)
@@ -24,7 +25,7 @@ Never hand-place these: `ck setup` refuses binaries it did not install.
 | `ck-entorhinal` | 0.1.46 (`84677e1`) | `submodules/entorhinal`, unmodified upstream. The submodule pointer is ahead of the deployed build. |
 | `ck-fusiform`, `ck-models` | 0.1.0 | `submodules/fusiform` (`ck models` CLI). |
 | `ck-astrocyte` | 0.1.0 | `submodules/astrocyte` (AI usage and spend ledger). |
-| `ck-uc-discussions` | source 0.2.0-alpha.1 (deployed 0.1.2; Arcus package `uc-discussions` seq 3) | `modules/uc-discussions/`, deployed at `~/.local/bin/ck-uc-discussions`. |
+| `ck-uc-discussions` | source and deployed 0.2.0-alpha.1 (Arcus-published 0.1.2, pkg `uc-discussions` seq 3) | `modules/uc-discussions/`, deployed at `~/.local/bin/ck-uc-discussions` (sha256 `b2fd43db...`) since 2026-11-22. S1 adds the author-membership check and `discussions.capabilities`; built locally from `c5a329d8` and not yet re-packaged for Arcus. |
 
 ## Retired
 
@@ -42,5 +43,6 @@ Never hand-place these: `ck setup` refuses binaries it did not install.
 Stock since 2026-11-12: the launchd plist is setup's own definition (no `XDG_RUNTIME_DIR`), so the daemon writes its
 connection file to `$TMPDIR/subc-<uid>.connection.json`. Clients auto-discover it; nothing may pin
 `~/.local/share/cortexkit/run/subc-connection.json` (ck on macOS checks that path first, so a stale file there
-breaks discovery). No module carries `reserved` except claustrum, uc-discussions and entorhinal, and no
-module overrides `route_bind_relay_timeout_ms`.
+breaks discovery). A symlink at that path pointing at the live `$TMPDIR` file is in place for Anthropic-auth
+discovery; it must stay a symlink, never a copied file. No module carries `reserved` except claustrum,
+uc-discussions and entorhinal, and no module overrides `route_bind_relay_timeout_ms`.
