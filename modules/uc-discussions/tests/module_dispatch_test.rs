@@ -67,6 +67,7 @@ fn manifest_declares_all_management_surface_operations() {
             "rooms.grant_stage",
             "rooms.close",
             "rooms.get",
+            "discussions.capabilities",
             "council.stage",
             "council.evaluate",
             "council.reconcile",
@@ -144,6 +145,13 @@ fn room_dispatch_allocates_monotonic_post_sequences() {
             "reply_to_post_id": null
         }),
     ));
+    let _: Value = response(dispatch(
+        &handler,
+        json!({
+            "op": "rooms.join",
+            "params": {"room_id": room.room_id, "member_id": "bob", "role": "participant"}
+        }),
+    ));
     let second: PostRoomResponse = response(dispatch(
         &handler,
         json!({
@@ -161,6 +169,61 @@ fn room_dispatch_allocates_monotonic_post_sequences() {
     assert_eq!(first.seq, 1);
     assert_eq!(second.seq, 2);
     assert!(second.seq > first.seq);
+}
+
+#[test]
+fn rooms_post_skip_membership_check() {
+    let handler = DiscussionsHandler::default();
+    let room: CreateRoomResponse = response(dispatch(
+        &handler,
+        json!({
+            "op": "rooms.create",
+            "params": {"topic": "T", "goal": "G", "stage": "S", "creator": "creator"}
+        }),
+    ));
+
+    match dispatch(
+        &handler,
+        json!({
+            "op": "rooms.post",
+            "params": {"room_id": room.room_id, "author": "outsider", "post_type": "note", "content": "not admitted"}
+        }),
+    ) {
+        HandlerOutcome::Error { code, .. } => assert_eq!(code, "not_room_member"),
+        other => panic!("expected not_room_member, got {other:?}"),
+    }
+
+    let _: Value = response(dispatch(
+        &handler,
+        json!({
+            "op": "rooms.join",
+            "params": {"room_id": room.room_id, "member_id": "joined", "role": "participant"}
+        }),
+    ));
+    for author in ["joined", "creator"] {
+        let _: PostRoomResponse = response(dispatch(
+            &handler,
+            json!({
+                "op": "rooms.post",
+                "params": {"room_id": room.room_id, "author": author, "post_type": "note", "content": "admitted"}
+            }),
+        ));
+    }
+}
+
+#[test]
+fn capabilities_omit_receipts() {
+    let handler = DiscussionsHandler::default();
+    let capabilities: Value = response(dispatch(
+        &handler,
+        json!({"op": "discussions.capabilities", "params": {}}),
+    ));
+    assert_eq!(capabilities["protocol"], "uc-discussions/2");
+    let values = capabilities["capabilities"].as_array().expect("capabilities array");
+    assert!(values.iter().any(|value| value == "membership_enforced"));
+    assert!(!values.iter().any(|value| value == "receipts"));
+    assert!(!values.iter().any(|value| value == "delivery_intents"));
+    assert!(!values.iter().any(|value| value == "delivery_claims"));
 }
 
 #[test]

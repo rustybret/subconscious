@@ -183,8 +183,12 @@ impl RoomsService {
                 params![req.room_id, req.author],
                 |row| row.get::<_, Option<i64>>(0),
             )
-            .optional()?;
-        if let Some(Some(expected)) = bound_incarnation {
+            .optional()?
+            .ok_or_else(|| ServiceError::NotRoomMember {
+                room_id: req.room_id.clone(),
+                member_id: req.author.clone(),
+            })?;
+        if let Some(expected) = bound_incarnation {
             if req.incarnation != Some(expected) {
                 return Err(ServiceError::StaleIncarnation {
                     room_id: req.room_id.clone(),
@@ -909,6 +913,15 @@ mod tests {
     fn post_sequences_are_monotonic_across_authors() {
         let service = service();
         let room = create_room(&service);
+        for member_id in ["bob", "carol"] {
+            service
+                .join_room(JoinRoomRequest {
+                    room_id: room.room_id.clone(),
+                    member_id: member_id.to_owned(),
+                    role: "participant".to_owned(),
+                })
+                .expect("join room before posting");
+        }
 
         let first = post(&service, &room.room_id, "alice", "ship now");
         let second = post(&service, &room.room_id, "bob", "wait for metrics");

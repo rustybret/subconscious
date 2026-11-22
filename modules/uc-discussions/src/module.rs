@@ -18,6 +18,7 @@ use subc_protocol::{
     ModuleHelloAckBody, Principal,
 };
 
+use crate::protocol::discussions::{CapabilitiesRequest, CapabilitiesResponse};
 use crate::protocol::host::{HostFeedLivenessRequest, HostRegisterSessionRequest};
 use crate::service::{host::HostService, inbox::InboxService};
 use crate::{
@@ -67,6 +68,7 @@ pub fn manifest() -> ModuleManifest {
                 mutate("rooms.grant_stage"),
                 mutate("rooms.close"),
                 query("rooms.get"),
+                query("discussions.capabilities"),
                 mutate("council.stage"),
                 mutate("council.evaluate"),
                 mutate("council.reconcile"),
@@ -177,6 +179,15 @@ impl DiscussionsHandler {
         };
 
         match operation.as_str() {
+            "discussions.capabilities" => {
+                dispatch_typed(params, |_request: CapabilitiesRequest| {
+                    Ok::<_, ServiceError>(CapabilitiesResponse {
+                        protocol: "uc-discussions/2".to_owned(),
+                        capabilities: vec!["membership_enforced".to_owned()],
+                        module_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    })
+                })
+            }
             "peer.enqueue_message" => dispatch_typed(params, |request: EnqueueMessageRequest| {
                 state.peer.enqueue_message(request)
             }),

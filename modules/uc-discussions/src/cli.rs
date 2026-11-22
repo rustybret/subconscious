@@ -28,7 +28,7 @@ commands:
   list                      list active rooms
   room <room_id>            inspect a room: members, stages, outcome, and posts
   council <council_id>      inspect an Athena council deliberation and roster
-  post <room_id> <content>  post a turn to an active room
+  post <room_id> <content>  post a turn to an active room; the author must be a room member
 
 options:
   --subc <path>             daemon connection file
@@ -39,6 +39,9 @@ options:
   --json                    print raw JSON response
   -V, --version             print version
   -h, --help                print help
+  --                        end of options: later arguments are positional (content may start with -)
+
+Unknown options are errors. Read content from a file with: post <room_id> \"$(cat file)\"
 ";
 
 #[derive(Default, Debug)]
@@ -56,42 +59,53 @@ struct ParsedArgs {
     help: bool,
 }
 
-fn parse_cli_args<I: IntoIterator<Item = String>>(args: I) -> ParsedArgs {
+/// Parses the command line. An unknown flag, or a flag missing its value, is an
+/// error: treating it as a positional argument once stored `--body` as a room post.
+/// After `--`, every argument is positional, so content may start with `-`.
+fn parse_cli_args<I: IntoIterator<Item = String>>(args: I) -> Result<ParsedArgs, String> {
+    fn value_for(flag: &str, iter: &mut impl Iterator<Item = String>) -> Result<String, String> {
+        iter.next()
+            .filter(|value| !value.starts_with("--"))
+            .ok_or_else(|| format!("{flag} requires a value"))
+    }
+
     let mut parsed = ParsedArgs::default();
     let mut iter = args.into_iter().skip(1);
+    let mut positional_only = false;
 
     while let Some(arg) = iter.next() {
+        if positional_only {
+            if parsed.command.is_none() {
+                parsed.command = Some(arg);
+            } else {
+                parsed.subcommand_args.push(arg);
+            }
+            continue;
+        }
         match arg.as_str() {
+            "--" => positional_only = true,
             "--ck-domain" => parsed.ck_domain = true,
             "-V" | "--version" => parsed.version = true,
             "-h" | "--help" => parsed.help = true,
             "--json" => parsed.json = true,
-            "--store" => {
-                if let Some(val) = iter.next() {
-                    parsed.store_path = Some(PathBuf::from(val));
-                }
-            }
-            "--subc" => {
-                if let Some(val) = iter.next() {
-                    parsed._subc_path = Some(PathBuf::from(val));
-                }
-            }
-            "--author" => {
-                if let Some(val) = iter.next() {
-                    parsed.author = Some(val);
-                }
-            }
-            "--type" => {
-                if let Some(val) = iter.next() {
-                    parsed.post_type = Some(val);
-                }
-            }
+            "--store" => parsed.store_path = Some(PathBuf::from(value_for("--store", &mut iter)?)),
+            "--subc" => parsed._subc_path = Some(PathBuf::from(value_for("--subc", &mut iter)?)),
+            "--author" => parsed.author = Some(value_for("--author", &mut iter)?),
+            "--type" => parsed.post_type = Some(value_for("--type", &mut iter)?),
             "--incarnation" => {
-                if let Some(val) = iter.next() {
-                    parsed.incarnation = val.parse::<i64>().ok();
-                }
+                let value = value_for("--incarnation", &mut iter)?;
+                parsed.incarnation = Some(
+                    value
+                        .parse::<i64>()
+                        .map_err(|_| format!("--incarnation must be an integer, got '{value}'"))?,
+                );
             }
-            cmd if !cmd.starts_with('-') && parsed.command.is_none() => {
+            flag if flag.starts_with('-') && flag.len() > 1 => {
+                return Err(format!(
+                    "unknown option '{flag}'. Run 'ck discussions --help' for usage."
+                ));
+            }
+            cmd if parsed.command.is_none() => {
                 parsed.command = Some(cmd.to_owned());
             }
             other => {
@@ -99,7 +113,7 @@ fn parse_cli_args<I: IntoIterator<Item = String>>(args: I) -> ParsedArgs {
             }
         }
     }
-    parsed
+    Ok(parsed)
 }
 
 pub fn default_store_path() -> PathBuf {
@@ -114,7 +128,7 @@ pub fn default_store_path() -> PathBuf {
 }
 
 pub fn run_cli<I: IntoIterator<Item = String>>(args: I) -> Result<bool, Box<dyn Error>> {
-    let parsed = parse_cli_args(args);
+    let parsed = parse_cli_args(args)?;
 
     if parsed.ck_domain {
         println!("{DOMAIN_HEADLINE}");
@@ -417,7 +431,7 @@ mod tests {
             "--incarnation".to_owned(),
             "42".to_owned(),
         ];
-        let parsed = parse_cli_args(args);
+        let parsed = parse_cli_args(args).expect("valid args parse");
         assert_eq!(parsed.incarnation, Some(42));
 
         let args_invalid = vec![
@@ -426,12 +440,39 @@ mod tests {
             "--incarnation".to_owned(),
             "not-a-number".to_owned(),
         ];
-        let parsed_invalid = parse_cli_args(args_invalid);
-        assert_eq!(parsed_invalid.incarnation, None);
+        let error = parse_cli_args(args_invalid).expect_err("a non-integer incarnation is refused");
+        assert!(error.contains("--incarnation"), "{error}");
 
         let args_omitted = vec!["ck-discussions".to_owned(), "post".to_owned()];
-        let parsed_omitted = parse_cli_args(args_omitted);
+        let parsed_omitted = parse_cli_args(args_omitted).expect("omitted flag parses");
         assert_eq!(parsed_omitted.incarnation, None);
+    }
+
+    #[test]
+    fn parse_cli_args_refuses_flag_without_value_and_allows_dash_content_after_separator() {
+        let missing = vec![
+            "ck-discussions".to_owned(),
+            "post".to_owned(),
+            "room-1".to_owned(),
+            "--type".to_owned(),
+            "--author".to_owned(),
+            "alice".to_owned(),
+        ];
+        let error = parse_cli_args(missing).expect_err("--type must take a value, not the next flag");
+        assert!(error.contains("--type requires a value"), "{error}");
+
+        let separated = vec![
+            "ck-discussions".to_owned(),
+            "post".to_owned(),
+            "--author".to_owned(),
+            "alice".to_owned(),
+            "--".to_owned(),
+            "room-1".to_owned(),
+            "- first point".to_owned(),
+        ];
+        let parsed = parse_cli_args(separated).expect("content after -- parses");
+        assert_eq!(parsed.author.as_deref(), Some("alice"));
+        assert_eq!(parsed.subcommand_args, vec!["room-1", "- first point"]);
     }
 
     #[test]

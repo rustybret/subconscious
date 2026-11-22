@@ -2,6 +2,13 @@
 
 Arcus package `uc-discussions` (binary `ck-uc-discussions`). Versions are display-only; the Arcus sequence orders releases.
 
+## 0.2.0-alpha.1 (unreleased)
+
+- `rooms.post` now requires the author to be a room member and returns `not_room_member` before allocating a post sequence.
+- Added `discussions.capabilities` reporting protocol `uc-discussions/2` and `membership_enforced`.
+- `ck discussions` refuses unknown options and options missing their value instead of posting them as content (previously `--body` was stored as a room post). `--` ends options. A non-integer `--incarnation` is now an error.
+- Operator CLI posts now require the `--author` to be a room member.
+
 ## 0.1.2 (unreleased)
 
 - Room Closure Provenance & Metadata:

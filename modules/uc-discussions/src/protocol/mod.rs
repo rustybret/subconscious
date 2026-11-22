@@ -4,6 +4,7 @@ pub mod council;
 pub mod peer;
 pub mod host;
 pub mod rooms;
+pub mod discussions;
 
 #[cfg(test)]
 mod tests {

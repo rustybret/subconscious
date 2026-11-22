@@ -103,6 +103,53 @@ fn cli_subcommands_status_and_list() {
     fs::remove_dir_all(&root).expect("remove sandbox");
 }
 
+/// Mutation control `cli_unknown_flag_becomes_content`: an unrecognized flag such as
+/// `--body` must be refused, not stored as the post's content.
+#[test]
+fn cli_post_rejects_unknown_flags() {
+    let root = std::env::temp_dir().join(format!("uc-discussions-cli-flag-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&root).expect("create CLI sandbox");
+    let store_path = root.join("test-store.db");
+    let room_id = {
+        let storage = uc_discussions::Storage::open_path(&store_path).expect("open test store");
+        let service = uc_discussions::service::rooms::RoomsService::new(storage);
+        service
+            .create_room(uc_discussions::protocol::rooms::CreateRoomRequest {
+                creator: "test-creator".to_owned(),
+                topic: "Flags".to_owned(),
+                goal: "Reject unknown flags".to_owned(),
+                stage: "proposal".to_owned(),
+            })
+            .expect("create test room")
+            .room_id
+    };
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ck-uc-discussions"))
+        .args([
+            "--store",
+            store_path.to_str().unwrap(),
+            "post",
+            &room_id,
+            "--body",
+            "real contract text",
+            "--author",
+            "test-creator",
+        ])
+        .output()
+        .expect("run post");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    let storage = uc_discussions::Storage::open_path(&store_path).expect("reopen test store");
+    let room = uc_discussions::service::rooms::RoomsService::new(storage)
+        .get_room(uc_discussions::protocol::rooms::GetRoomRequest { room_id: room_id.clone() })
+        .expect("get room");
+    fs::remove_dir_all(&root).expect("remove sandbox");
+
+    assert!(!output.status.success(), "unknown flag must fail the command");
+    assert!(stderr.contains("--body"), "error must name the flag: {stderr}");
+    assert!(room.posts.is_empty(), "nothing may be posted: {:?}", room.posts);
+}
+
 #[tokio::test]
 async fn health_reports_storage_initialization_failure() {
     // Given a handler whose daemon supplied an invalid storage descriptor.
