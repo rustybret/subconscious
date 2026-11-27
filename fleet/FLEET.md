@@ -14,8 +14,8 @@ Never hand-place these: `ck setup` refuses binaries it did not install.
 | --- | --- | --- |
 | `ck-subc`, `ck`, `ck-subc-mcp` | 0.21.3 (`subc-core-v0.21.3`; `ck-subc-mcp` reports 0.2.2) | Cut over 2026-11-11; `ck` re-placed by `ck upgrade` 2026-11-12 so setup records it. `ck upgrade --check` reports everything up to date. |
 | `ck-claustrum`, `ck-auth` | 0.3.0 (`119f56b2`) | Installed 2026-11-12 with `ck setup claustrum --key-path ~/.config/cortexkit/claustrum.key` (key file custody unchanged). Vault schema 18 -> 32; 0.3.0 mints `kem:secret-deposit:1`. Audit chain intact, stranded 0. Pre-upgrade copy: `~/.local/state/setup-migration-20261111-203127/claustrum-pre-0.3.0/`. |
-| `ck-insula` | 0.4.0 (`e87a49a6c1ca`) | Replaced our 0.1.1 source build 2026-11-12; upgraded 0.3.1 -> 0.4.0 by `ck upgrade` 2026-11-22. Reads logins from the vault: grants `reserved:insula` read on categories `llm-provider` and `browser-session`. |
-| `ck-aft` | 0.66.0 | Plugin `@cortexkit/aft-opencode@0.66.0` (the malformed `cortexkit/aft@0.66.0` entry was corrected 2026-11-21). Runs at the daemon's default 12 s route.bind relay timeout. |
+| `ck-insula` | 0.4.4 | Replaced our 0.1.1 source build 2026-11-12; upgraded 0.3.1 -> 0.4.0 by `ck upgrade` 2026-11-22, then 0.4.0 -> 0.4.4 on 2026-11-27. Reads logins from the vault: grants `reserved:insula` read on categories `llm-provider` and `browser-session`. |
+| `ck-aft` | 0.68.1 (module binary); plugin `@cortexkit/aft-opencode@0.67.1` | Plugin spec corrected from `cortexkit/aft@0.66.0` on 2026-11-21. Module upgraded 0.66.0 -> 0.67.1 -> 0.68.1 by `ck upgrade` through 2026-11-27; `ck upgrade` does not rewrite the npm plugin spec. Runs at the daemon's default 12 s route.bind relay timeout. |
 | `ck-synapse` (+ `opctl`, workers) | 0.1.0-alpha.2 | Reinstalled from the release 2026-11-12 (the previous binaries were not the release bytes). |
 
 ## Built by us (no upstream release)
@@ -40,9 +40,12 @@ Never hand-place these: `ck setup` refuses binaries it did not install.
 
 ## Daemon configuration
 
-Stock since 2026-11-12: the launchd plist is setup's own definition (no `XDG_RUNTIME_DIR`), so the daemon writes its
-connection file to `$TMPDIR/subc-<uid>.connection.json`. Clients auto-discover it; nothing may pin
-`~/.local/share/cortexkit/run/subc-connection.json` (ck on macOS checks that path first, so a stale file there
-breaks discovery). A symlink at that path pointing at the live `$TMPDIR` file is in place for Anthropic-auth
-discovery; it must stay a symlink, never a copied file. No module carries `reserved` except claustrum,
+Since 2026-11-27: 314track added `XDG_RUNTIME_DIR=/Users/brethoffman/.local/share/cortexkit/run` to
+`~/Library/LaunchAgents/cortexkit.subc.plist` after the daemon lost its `$TMPDIR` connection file. The daemon now
+writes `~/.local/share/cortexkit/run/subc-connection.json` (regular file, mode 0600); clients auto-discover it,
+and `~/.zshrc` exports `CLAUSTRUM_SUBC_CONNECTION` and `OPENCODE_ANTHROPIC_AUTH_CLAUSTRUM_CONNECTION_FILE`
+point there. This plist change deviates from setup's stock definition and is under review in uc-discussions
+room `room-b8adf64c-bed0-4aa6-972c-3cd31d2f243a`. A stale file at the old `$TMPDIR` path would still break
+discovery, so do not recreate one. No module carries `reserved` except claustrum, uc-discussions and
+entorhinal, and no module overrides `route_bind_relay_timeout_ms`.
 uc-discussions and entorhinal, and no module overrides `route_bind_relay_timeout_ms`.
