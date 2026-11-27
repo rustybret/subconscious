@@ -100,7 +100,7 @@ In worker `~/.config/opencode/opencode.json`:
   VAULT_MCP_BIND_PORT=8765
   VAULT_MCP_BEARER_TOKEN=<64-hex-bearer-token>
   VAULT_ENROLLMENT_TOKEN_FILE=/Users/brethoffman/.config/cortexkit/remote-vault-mcp-enrollment.json
-  SUBC_CONNECTION_FILE=/var/folders/9f/hp9ydfwn7wxcm48907jlpm3c0000gn/T/subc-501.connection.json
+  SUBC_CONNECTION_FILE=/Users/brethoffman/.local/share/cortexkit/run/subc-connection.json
   ```
 - **LaunchAgent Plist**: `~/Library/LaunchAgents/com.cortexkit.vault-mcp.plist`
 - **Logs**:
@@ -114,6 +114,13 @@ In worker `~/.config/opencode/opencode.json`:
   # Status
   launchctl list | grep vault-mcp
   ```
+
+**Restart after any supervised module upgrade.** The AFT bridge opens one SubC route at startup and keeps the
+handle. When a module such as `aft` is drain-restarted by `ck upgrade`, that handle goes stale and tool calls fail
+with `StaleRouteHandleError: route handle (1, 1) is not live on the current connection`. Restart this service
+after the module upgrade completes so it re-opens routes against the current connection. The same applies to any
+daemon restart. A quick check is a `tools/call` of `aft_status`: it must report the running AFT version rather
+than a stale-handle error.
 
 ---
 
